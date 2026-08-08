@@ -1,0 +1,96 @@
+name: CI & Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # Never let two deploys race for the same Worker.
+  group: fufut-api-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Auth policy tests
+        run: npm test
+      - name: Build (validates imports and bindings)
+        run: npx wrangler deploy --dry-run --outdir=dist
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  # Refuse to deploy over a Worker that does not match this repo. Production was
+  # previously deployed from a laptop, which is how an entire rewrite dropped
+  # every auth check with no diff and no review.
+  drift:
+    needs: test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: node scripts/check-drift.mjs
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  deploy:
+    needs: [test, drift]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+
+      # Staging shares production's D1/KV/R2, so this exercises real data
+      # without touching the production Worker.
+      - name: Deploy to staging
+        run: npx wrangler deploy -c wrangler.staging.toml
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Smoke test staging
+        run: node scripts/smoke.mjs https://fufut-api-staging.fufutcoffee.workers.dev
+
+      - name: Deploy to production
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      # The failure mode that caused the incident is an API that answers
+      # unauthenticated. Unit tests cannot see it; only a live assertion can.
+      - name: Smoke test production
+        run: node scripts/smoke.mjs https://fufut-api.fufutcoffee.workers.dev
+
+      - name: Roll back if production smoke failed
+        if: failure()
+        run: |
+          echo "::error::Production smoke test failed after deploy."
+          echo "Roll back: Cloudflare dashboard -> Workers -> fufut-api -> Deployments,"
+          echo "or re-upload fufut-api-src/backup/fufut-api-DEPLOYED-20260808.multipart"
+          exit 1
