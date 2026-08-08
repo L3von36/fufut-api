@@ -1,0 +1,43 @@
+name = "fufut-api"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# Bindings and cron mirror the deployed Worker exactly, read from the live
+# script on 2026-08-08. Changing any id repoints production data.
+
+[[d1_databases]]
+binding = "DB"
+database_name = "fufut-db"
+database_id = "9baede26-e135-4f8d-bcbe-43751290dbb5"
+
+[[r2_buckets]]
+binding = "IMAGES_R2"
+bucket_name = "fufut-images"
+
+[[kv_namespaces]]
+binding = "CONTENT_KV"
+id = "d591041eadfe4b69bbdd608e706c7f88"
+
+[[kv_namespaces]]
+binding = "MENU_KV"
+id = "72ed1b11297048a4b17f702091c06baa"
+
+[[kv_namespaces]]
+binding = "ORDERS_KV"
+id = "3d1056ebcd05439e911585c6f942fafa"
+
+[[kv_namespaces]]
+binding = "RESERVATIONS_KV"
+id = "686a682f961c45a9882b407f84e71b62"
+
+[[kv_namespaces]]
+binding = "REVIEWS_KV"
+id = "d2bf07f27482429aa3482d31527c1f6c"
+
+[[kv_namespaces]]
+binding = "GALLERY_KV"
+id = "8a05f5eecd7e477b92825d22df3ee67c"
+
+# Matches the deployed schedule (every minute) — checkScheduledPublish().
+[triggers]
+crons = ["* * * * *"]
