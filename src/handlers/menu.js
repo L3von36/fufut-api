@@ -12,6 +12,182 @@ function isCategorized(data) {
   return data && !Array.isArray(data) && Array.isArray(data.categories);
 }
 
+/**
+ * Menu item identity.
+ *
+ * The KV menu blob was historically saved without per-item ids (the client never
+ * sent them, and /api/menus/save passed items straight through). categorizedToFlat
+ * then emitted `id: ""` for every item, so the POS cart — which matches lines by
+ * `menuItemId === item.id` — treated all 45 items as the same product: adding a
+ * macchiato to a cart holding a coffee merged into the coffee's line and billed at
+ * the coffee's price.
+ *
+ * Ids are derived *deterministically* from category + name rather than randomly.
+ * That matters because the same blob is read on every request: a random id would
+ * differ between the read that renders the menu and the read that follows, so a
+ * cart line could never match its item. A deterministic seed is stable even before
+ * the self-healing write below has landed.
+ *
+ * Once seeded, the id is persisted into KV and reused verbatim, so a later rename
+ * does not change an item's identity.
+ */
+function stableItemId(categoryName, itemName, occurrence) {
+  // FNV-1a over the category+name pair. Short, stable, ASCII-safe, and does not
+  // depend on crypto being seeded the same way across isolates.
+  const seed = `${categoryName || ""}|${itemName || ""}`;
+  let h = 2166136261;
+  for (let i = 0; i < seed.length; i++) {
+    h ^= seed.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  const hex = (h >>> 0).toString(16).padStart(8, "0");
+  // Two items can legitimately share a name (the menu has two "Fut Special Gebeta"
+  // at different prices). The occurrence index keeps those distinct.
+  return occurrence > 0 ? `MI${hex}-${occurrence}` : `MI${hex}`;
+}
+
+/**
+ * Ensure every item in a categorized menu blob carries a non-empty id.
+ * Returns the blob plus whether anything had to be filled in, so callers can
+ * decide to persist the repair.
+ */
+function ensureMenuIds(cat) {
+  let changed = false;
+  if (!isCategorized(cat)) return { data: cat, changed };
+  const used = new Set();
+  for (const c of cat.categories || []) {
+    for (const item of c.items || []) {
+      if (item.id) {
+        used.add(item.id);
+        continue;
+      }
+      let occurrence = 0;
+      let candidate = stableItemId(c.name, item.name, occurrence);
+      while (used.has(candidate)) {
+        occurrence++;
+        candidate = stableItemId(c.name, item.name, occurrence);
+      }
+      item.id = candidate;
+      used.add(candidate);
+      changed = true;
+    }
+  }
+  return { data: cat, changed };
+}
+
+/**
+ * Backfill ids onto an existing menu blob, preferring the ids D1 already holds.
+ *
+ * The D1 `menu_items` mirror was populated by earlier syncMenuToD1 runs, which
+ * minted a random `MI<uuid>` for each id-less KV item and stored it only in D1.
+ * So D1 has ids for all 45 items and KV has none, and the two sets are unrelated.
+ *
+ * Minting fresh deterministic ids into KV would leave those two id sets
+ * competing: the next /api/menus/save would find none of D1's ids in the blob and
+ * delete-then-reinsert every row. Matching on category+name and adopting the id
+ * D1 already stores keeps the two stores agreeing and makes the next sync a no-op.
+ *
+ * Only items with no match fall back to a freshly derived id.
+ *
+ * `force` re-aligns ids that are already present. /api/menu is public and the
+ * website polls it, so the lazy KV self-heal usually wins the race after a deploy
+ * and writes *deterministic* ids before an operator can call this. Those ids are
+ * correct but differ from D1's, leaving the two stores disagreeing. Running with
+ * force replaces them with D1's ids so the mirror lines up again, which makes the
+ * ordering of deploy vs. repair stop mattering.
+ *
+ * Existing ids are snapshotted and cleared before matching, so an id already sat
+ * on one item cannot block the item that should legitimately adopt it. Anything
+ * D1 has no row for keeps the id it came in with rather than being churned.
+ */
+async function backfillMenuIdsFromD1(env, catData, { force = false } = {}) {
+  const report = { total: 0, alreadyHadId: 0, adopted: 0, realigned: 0, unchanged: 0, kept: 0, minted: 0 };
+  if (!isCategorized(catData)) return report;
+
+  let rows = [];
+  try {
+    const { results } = await d1Query(
+      env,
+      "SELECT mi.id AS id, mi.name AS name, c.name AS category FROM menu_items mi LEFT JOIN categories c ON c.id = mi.category_id"
+    );
+    rows = results || [];
+  } catch {
+    rows = [];
+  }
+
+  // category|name -> queue of ids. A queue rather than a single value because
+  // the menu genuinely carries two dishes sharing a name.
+  const pools = new Map();
+  for (const r of rows) {
+    const key = `${r.category || ""}|${r.name || ""}`;
+    if (!pools.has(key)) pools.set(key, []);
+    pools.get(key).push(r.id);
+  }
+
+  // Snapshot what each item arrived with. Under force everything is cleared so
+  // that matching is not blocked by an id already sitting on another item.
+  const previous = new Map();
+  for (const c of catData.categories || []) {
+    for (const item of c.items || []) {
+      previous.set(item, item.id || "");
+      if (force) item.id = "";
+    }
+  }
+
+  const used = new Set();
+  for (const c of catData.categories || []) {
+    for (const item of c.items || []) {
+      if (item.id) used.add(item.id);
+    }
+  }
+
+  for (const c of catData.categories || []) {
+    for (const item of c.items || []) {
+      report.total++;
+      if (item.id) {
+        report.alreadyHadId++;
+        continue;
+      }
+      const pool = pools.get(`${c.name || ""}|${item.name || ""}`);
+      let adopted = null;
+      while (pool && pool.length) {
+        const candidate = pool.shift();
+        if (candidate && !used.has(candidate)) {
+          adopted = candidate;
+          break;
+        }
+      }
+      const prior = previous.get(item) || "";
+      if (adopted) {
+        item.id = adopted;
+        used.add(adopted);
+        if (!prior) report.adopted++;
+        else if (prior === adopted) report.unchanged++;
+        else report.realigned++;
+        continue;
+      }
+      // D1 has no row for this item. Keep whatever id it already had rather than
+      // churning it; only a genuinely id-less item gets a derived one.
+      if (prior && !used.has(prior)) {
+        item.id = prior;
+        used.add(prior);
+        report.kept++;
+        continue;
+      }
+      let occurrence = 0;
+      let minted = stableItemId(c.name, item.name, occurrence);
+      while (used.has(minted)) {
+        occurrence++;
+        minted = stableItemId(c.name, item.name, occurrence);
+      }
+      item.id = minted;
+      used.add(minted);
+      report.minted++;
+    }
+  }
+  return report;
+}
+
 function categorizedToFlat(cat) {
   const out = [];
   for (const c of cat.categories || []) {
@@ -210,6 +386,17 @@ async function handleMenu(pathname, method, request, env, ctx) {
       if (data.categories.length > 0) {
         ctx.waitUntil(kvSaveMenu(env, data));
       }
+    } else {
+      // Self-heal legacy blobs that predate per-item ids.
+      //
+      // Deliberately KV-only: syncMenuToD1 ends by DELETEing any menu_items row
+      // whose id is absent from the blob, and the existing D1 rows carry older
+      // randomly-minted ids that will not match the deterministic ones. Calling
+      // it from here would make a GET delete and re-insert all 45 rows and reset
+      // their sort_order. /api/menu reads from KV, so the KV write alone fixes
+      // the blank-id bug; D1 is reconciled by the next /api/menus/save.
+      const { changed } = ensureMenuIds(data);
+      if (changed) ctx.waitUntil(kvSaveMenu(env, data));
     }
     return json(data);
   }
@@ -220,6 +407,11 @@ async function handleMenu(pathname, method, request, env, ctx) {
       if (data.categories.length > 0) {
         ctx.waitUntil(kvSaveMenu(env, data));
       }
+    } else {
+      // KV-only for the same reason as /api/menus above: a read must not trigger
+      // syncMenuToD1's DELETE pass.
+      const { changed } = ensureMenuIds(data);
+      if (changed) ctx.waitUntil(kvSaveMenu(env, data));
     }
     return json(categorizedToFlat(data));
   }
@@ -237,6 +429,10 @@ async function handleMenu(pathname, method, request, env, ctx) {
         }))
       }))
     };
+    // Assign ids before the blob is stored, so KV and D1 agree from the outset.
+    // syncMenuToD1 also mints ids for id-less items, but only ever wrote them to
+    // D1 — the KV copy stayed id-less, which is how the blank-id state persisted.
+    ensureMenuIds(catPayload);
     const totalItems = catPayload.categories.reduce((s, c) => s + (c.items || []).length, 0);
     await kvSaveMenu(env, catPayload);
     ctx.waitUntil(syncMenuToD1(env, catPayload));
@@ -378,4 +574,4 @@ async function handleMenu(pathname, method, request, env, ctx) {
   }
   return null;
 }
-export { parseJsonSafe, isCategorized, categorizedToFlat, kvGetMenu, kvSaveMenu, d1GetMenuCategorized, syncMenuToD1, syncItemToD1, handleMenu };
+export { parseJsonSafe, isCategorized, stableItemId, ensureMenuIds, backfillMenuIdsFromD1, categorizedToFlat, kvGetMenu, kvSaveMenu, d1GetMenuCategorized, syncMenuToD1, syncItemToD1, handleMenu };

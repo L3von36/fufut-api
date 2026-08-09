@@ -1,0 +1,23 @@
+-- Add the order-notes column.
+--
+-- The POS checkout collects order-level notes (placeheld "no onions on
+-- everything") for allergies and prep instructions. The client serializes the
+-- field, but the orders table had no column to hold it, so every note was
+-- discarded before it could reach the kitchen — a food-safety-adjacent gap, not
+-- just a missing feature.
+--
+-- Apply to production:
+--   wrangler d1 execute fufut-db --remote --file=migrations/001-orders-notes.sql
+--
+-- Apply to a local dev database:
+--   wrangler d1 execute fufut-db --local --file=migrations/001-orders-notes.sql
+--
+-- Safe to run once. D1/SQLite has no "ADD COLUMN IF NOT EXISTS", so a second run
+-- fails with "duplicate column name: notes" — that error means it is already
+-- applied and can be ignored.
+--
+-- The POST /api/orders handler writes `notes` and falls back to the pre-migration
+-- column list if this has not been applied yet, so ordering keeps working in
+-- either order. Once this is applied the fallback simply stops being exercised.
+
+ALTER TABLE orders ADD COLUMN notes TEXT;

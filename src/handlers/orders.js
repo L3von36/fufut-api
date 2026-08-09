@@ -26,11 +26,35 @@ async function handleOrders(pathname, method, url, request, env) {
     try {
       const id = data.id || "O" + crypto.randomUUID().slice(0, 7);
       const items = typeof data.items === "string" ? data.items : JSON.stringify(data.items || []);
-      await d1Run(
-        env,
-        "INSERT INTO orders (id, items, total, payment, type, table_id, customer, status, email) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [id, items, Number(data.total) || 0, data.payment || null, data.order_type || data.type || null, data.tableNum || data.table_number || data.table_id || null, data.name || data.customer || null, data.status || "new", data.email || ""]
-      );
+      const tableId = data.tableNum || data.table_number || data.table_id || null;
+      const notes = typeof data.notes === "string" ? data.notes.trim() : "";
+      const base = [id, items, Number(data.total) || 0, data.payment || null, data.order_type || data.type || null, tableId, data.name || data.customer || null, data.status || "new", data.email || ""];
+      // The POS checkout has an order-notes field intended for allergies and prep
+      // instructions ("no dairy - allergy"). It was serialized into the payload but
+      // the orders table had no column for it, so it was silently dropped before
+      // reaching the kitchen.
+      //
+      // The write is attempted with `notes` and retried without it if the column is
+      // not present yet. That keeps order creation working either side of the
+      // `ALTER TABLE orders ADD COLUMN notes TEXT` migration, so deploy order
+      // cannot take ordering offline.
+      try {
+        await d1Run(
+          env,
+          "INSERT INTO orders (id, items, total, payment, type, table_id, customer, status, email, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          [...base, notes]
+        );
+      } catch (e) {
+        // SQLite reports exactly: "table orders has no column named notes".
+        // Match only that shape — a broader test would swallow unrelated write
+        // failures and silently drop the note instead of surfacing the error.
+        if (!/has no column named|no such column/i.test(String(e && e.message))) throw e;
+        await d1Run(
+          env,
+          "INSERT INTO orders (id, items, total, payment, type, table_id, customer, status, email) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          base
+        );
+      }
       return json({ ok: true, id });
     } catch (e) {
       return json({ ok: false, error: String(e.message || e) }, 500);
@@ -73,6 +97,10 @@ async function handleOrders(pathname, method, url, request, env) {
     if (data.email !== void 0) {
       fields.push("email = ?");
       values.push(data.email);
+    }
+    if (data.notes !== void 0) {
+      fields.push("notes = ?");
+      values.push(typeof data.notes === "string" ? data.notes.trim() : "");
     }
     if (fields.length === 0) return json({ ok: false, error: "No fields to update" }, 400);
     values.push(id);
