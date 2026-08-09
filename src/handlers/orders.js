@@ -6,7 +6,23 @@ import {
   deriveOrderStatus,
   itemDurations,
   averageByCategory,
+  ITEM_FLOW,
+  flowIndex,
 } from '../lib/timing.js';
+
+/**
+ * Order statuses map onto line statuses. "fulfilled" is the order-level word
+ * this codebase already uses for a completed order; on a line it means the dish
+ * reached the guest, which is "served".
+ */
+const ORDER_TO_ITEM_STATUS = {
+  new: 'new',
+  preparing: 'preparing',
+  ready: 'ready',
+  served: 'served',
+  fulfilled: 'served',
+  completed: 'served',
+};
 
 function mapOrderRow(o) {
   const tn = o.table_id || o.table_number || o.tableNum || null;
@@ -167,6 +183,21 @@ async function handleOrders(pathname, method, url, request, env) {
     return json({ ok: true, from, to, sampled: rows.length, categories: averageByCategory(rows) });
   }
 
+  // GET /api/orders/items/active - every line on the board in one request.
+  // The kitchen screen refreshes on a timer and on every SSE event; fetching
+  // lines per order would fan one refresh out into a request per ticket.
+  // Declared before the /:id/items route so "items" is not read as an order id.
+  if (m === "GET" && sub === "/items/active") {
+    const { results } = await d1Query(
+      env,
+      `SELECT oi.* FROM order_items oi
+         JOIN orders o ON o.id = oi.order_id
+        WHERE o.status NOT IN ('completed', 'cancelled', 'fulfilled')
+        ORDER BY oi.order_id, oi.line_no`
+    );
+    return json((results || []).map((i) => Object.assign({}, i, { durations: itemDurations(i) })));
+  }
+
   // GET /api/orders/:id/items
   if (m === "GET" && /^\/[^/]+\/items$/.test(sub)) {
     const orderId = sub.split("/")[1];
@@ -283,6 +314,29 @@ async function handleOrders(pathname, method, url, request, env) {
     values.push(id);
     const { meta } = await d1Run(env, `UPDATE orders SET ${fields.join(", ")} WHERE id = ?`, values);
     if (!meta.changes) return json({ ok: false, error: "Order not found" }, 404);
+
+    // Advancing the whole order has to advance its lines too. Without this the
+    // order would read "ready" while every line still reads "new", and the next
+    // per-item tap would recompute the order straight back to "preparing".
+    // Only lines behind the new state move, so a line already served is never
+    // dragged backwards.
+    if (data.status !== void 0) {
+      const target = ORDER_TO_ITEM_STATUS[String(data.status).toLowerCase()];
+      if (target) {
+        const behind = ITEM_FLOW.slice(0, flowIndex(target)).map((s) => `'${s}'`).join(", ");
+        const stamp = stampColumnFor(target);
+        const setClause = stamp
+          ? `status = ?, ${stamp} = COALESCE(${stamp}, ?)`
+          : `status = ?`;
+        const args = stamp ? [target, nowIso, id] : [target, id];
+        await d1Run(
+          env,
+          `UPDATE order_items SET ${setClause} WHERE order_id = ? AND status IN (${behind})`,
+          args
+        );
+      }
+    }
+
     return json({ ok: true, updated_at: nowIso });
   }
   if (m === "DELETE" && sub.startsWith("/")) {
