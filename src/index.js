@@ -26,6 +26,7 @@ import { handleGallery } from './handlers/gallery.js';
 import { handleUpload } from './handlers/upload.js';
 import { handleMigration } from './handlers/migration.js';
 import { handleResources } from './handlers/resources.js';
+import { handleTables } from './handlers/tables.js';
 import { handleSSE } from './handlers/sse.js';
 import {
   handleStaffLogin,
@@ -57,7 +58,7 @@ async function serveImage(env, pathname) {
 }
 
 /** Dispatch to the original handlers, in the original order. */
-async function route(pathname, method, url, request, env, ctx) {
+async function route(pathname, method, url, request, env, ctx, auth) {
   const upper = method.toUpperCase();
 
   if (pathname === '/api/auth/login' && upper === 'POST') return handleStaffLogin(request, env);
@@ -81,13 +82,19 @@ async function route(pathname, method, url, request, env, ctx) {
     if (r !== null) return r;
   }
   if (pathname.startsWith('/api/reservations')) {
-    const r = await handleReservations(pathname, method, request, env);
+    const r = await handleReservations(pathname, method, request, env, auth);
     if (r !== null) return r;
   }
   if (pathname.startsWith('/api/reviews')) {
     const r = await handleReviews(pathname, method, request, env);
     if (r !== null) return r;
   }
+
+  // Must precede handleResources: it enriches GET /api/tables with the current
+  // reservation hold, and gates seating a reserved table. It returns null to
+  // fall through whenever the generic handler should do the actual write.
+  const tables = await handleTables(pathname, method, url, request, env, auth);
+  if (tables !== null) return tables;
 
   const resources = await handleResources(pathname, method, url, request, env);
   if (resources !== null) return resources;
@@ -115,7 +122,7 @@ export default {
     const decision = await authorize(request, env, pathname, method.toUpperCase());
     if (!decision.ok) return decision.response;
 
-    const response = await route(pathname, method, url, request, env, ctx);
+    const response = await route(pathname, method, url, request, env, ctx, decision.auth);
 
     // Staff listings carry colleague phone numbers and emails. Time Clock and
     // Shifts need names, so redact contact details rather than blocking.
