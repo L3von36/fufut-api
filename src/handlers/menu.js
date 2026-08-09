@@ -377,7 +377,7 @@ async function syncItemToD1(env, action, item) {
   }
 }
 
-async function handleMenu(pathname, method, request, env, ctx) {
+async function handleMenu(pathname, method, request, env, ctx, auth) {
   const m = method.toUpperCase();
   if (m === "GET" && pathname === "/api/menus") {
     let data = await kvGetMenu(env);
@@ -474,6 +474,57 @@ async function handleMenu(pathname, method, request, env, ctx) {
     }
     return json({ ok: true, id: data.id });
   }
+  // ── 86ing a dish ────────────────────────────────────────────────────────
+  // Separate from the general item update on purpose. Running out mid-service
+  // is a kitchen fact, not a commercial decision, so the head chef must be able
+  // to stop the POS selling a dish without being handed price, cost or margin.
+  //
+  // This endpoint reads ONLY `available`. Being structurally unable to touch
+  // anything else is what makes the grant safe: a crafted request cannot reprice
+  // the menu, so the restriction does not depend on the UI hiding a field.
+  if (m === "PUT" && pathname.match(/^\/api\/menu\/[^/]+\/availability$/)) {
+    const id = pathname.split("/")[3];
+    const data = await readBody(request);
+    if (!data || typeof data.available !== "boolean") {
+      return json({ ok: false, error: "available must be true or false" }, 400);
+    }
+
+    const stored = await kvGetMenu(env);
+    if (!isCategorized(stored)) return json({ ok: false, error: "Menu data not found" }, 404);
+
+    const actor = auth ? String(auth.name || auth.staffId || auth.id || auth.email || "unknown") : "unknown";
+    const nowIso = new Date().toISOString();
+    let hit = null;
+
+    for (const cat of stored.categories) {
+      const item = cat.items.find((i) => i.id === id);
+      if (!item) continue;
+      item.available = data.available;
+      // Two people can change this - a chef 86s a dish, a manager may put it
+      // back - so who did it and when is recorded rather than left to guesswork.
+      item.availabilityChangedBy = actor;
+      item.availabilityChangedAt = nowIso;
+      hit = { item, category: cat.name };
+      break;
+    }
+
+    if (!hit) return json({ ok: false, error: "Menu item not found" }, 404);
+
+    await kvSaveMenu(env, stored);
+    // The item's real category must be passed: syncItemToD1 falls back to
+    // "Other" when none is given and writes category_id unconditionally, so a
+    // partial update would quietly move the dish into another category.
+    ctx.waitUntil(syncItemToD1(env, "update", { id, available: data.available, category: hit.category }));
+
+    return json({
+      ok: true,
+      id,
+      available: data.available,
+      changedBy: actor,
+      changedAt: nowIso,
+    });
+  }
+
   if (m === "PUT" && pathname.match(/^\/api\/menu\/[^/]+$/)) {
     const id = pathname.split("/").pop();
     const data = await readBody(request);

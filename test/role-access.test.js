@@ -120,6 +120,37 @@ describe('assistant chef', () => {
   });
 });
 
+describe('86ing a dish', () => {
+  const AVAIL = '/api/menu/MI123/availability';
+
+  it('is its own resource, distinct from the menu', () => {
+    expect(resourceForPath(AVAIL)).toBe('menu-availability');
+    expect(resourceForPath('/api/menu/MI123')).toBe('menu');
+    expect(resourceForPath('/api/menu')).toBe('menu');
+  });
+
+  // Running out mid-service is a kitchen fact, so the chef must be able to stop
+  // the POS selling a dish.
+  it('is allowed to the head chef and the manager', () => {
+    expect(roleMayAccess('head-chef', AVAIL, PUT)).toBe(true);
+    expect(roleMayAccess('manager', AVAIL, PUT)).toBe(true);
+  });
+
+  // The point of the split: the grant must not widen into repricing.
+  it('does not give the head chef the menu itself', () => {
+    expect(roleMayAccess('head-chef', '/api/menu/MI123', PUT)).toBe(false);
+    expect(roleMayAccess('head-chef', '/api/menu', POST)).toBe(false);
+    expect(roleMayAccess('head-chef', '/api/menu/MI123', DELETE)).toBe(false);
+    expect(roleMayAccess('head-chef', '/api/menus/save', POST)).toBe(false);
+  });
+
+  it('is refused to every other role', () => {
+    for (const r of ['assistant-chef', 'head-waiter', 'cashier', 'cleaner', 'delivery-staff']) {
+      expect(roleMayAccess(r, AVAIL, PUT)).toBe(false);
+    }
+  });
+});
+
 describe('stock control follows the head chef', () => {
   it('lets the head chef change stock, which is the duty the role is defined by', () => {
     expect(roleMayAccess('head-chef', '/api/inventory', GET)).toBe(true);

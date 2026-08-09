@@ -90,7 +90,9 @@ const ROLE_ACCESS = {
 
   'head-chef': {
     read: ['orders', 'inventory', 'waste', 'expenses'],
-    write: ['orders', 'inventory', 'waste'],
+    // menu-availability lets them 86 a dish that has run out. The menu itself
+    // stays manager-only, so pricing is untouched.
+    write: ['orders', 'inventory', 'waste', 'menu-availability'],
   },
   // Reads stock, does not own it. Monitoring levels, ordering supplies and
   // controlling food cost belong to the head chef; an assistant executes
@@ -132,6 +134,11 @@ export function resourceForPath(pathname) {
   if (parts[0] !== 'api' || parts.length < 2) return null;
 
   const head = parts[1];
+  // Marking a dish unavailable is its own resource, so the head chef can 86
+  // something without being granted the menu - which is where price, cost and
+  // margin live. The endpoint itself reads only `available`, so this grant
+  // cannot widen into repricing.
+  if (head === 'menu' && parts[3] === 'availability') return 'menu-availability';
   if (head === 'menus') return 'menu';
   if (head === 'save-content') return 'content';
   if (head === 'events') return parts[2] === 'kitchen' ? 'orders' : 'tables';

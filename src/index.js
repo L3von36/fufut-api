@@ -99,7 +99,7 @@ async function route(pathname, method, url, request, env, ctx, auth) {
   const resources = await handleResources(pathname, method, url, request, env);
   if (resources !== null) return resources;
 
-  const menu = await handleMenu(pathname, method, request, env, ctx);
+  const menu = await handleMenu(pathname, method, request, env, ctx, auth);
   if (menu !== null) return menu;
 
   const gallery = await handleGallery(pathname, method, request, env, ctx);
