@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { roleMayAccess, resourceForPath } from '../src/auth.js';
+import { roleMayAccess, resourceForPath, actorName } from '../src/auth.js';
 
 const GET = 'GET';
 const POST = 'POST';
@@ -117,6 +117,36 @@ describe('assistant chef', () => {
     expect(roleMayAccess('assistant-chef', '/api/inventory', PUT)).toBe(false);
     expect(roleMayAccess('assistant-chef', '/api/inventory', POST)).toBe(false);
     expect(roleMayAccess('assistant-chef', '/api/inventory', DELETE)).toBe(false);
+  });
+});
+
+// Regression: every audited action - releasing a table, overriding a booking,
+// 86ing a dish - recorded the literal string "unknown", because the helper read
+// auth.name / auth.id / auth.email and getAuthUser returns none of those. A
+// wrong name in an audit trail is worse than a blank one, because it reads as
+// an answer.
+describe('actorName', () => {
+  it('names the person from the session', () => {
+    expect(actorName({ staff_id: 'S2', firstName: 'Selam', lastName: 'Wondimu' })).toBe('Selam Wondimu');
+  });
+
+  it('copes with a partial name', () => {
+    expect(actorName({ staff_id: 'S2', firstName: 'Selam' })).toBe('Selam');
+    expect(actorName({ staff_id: 'S2', lastName: 'Wondimu' })).toBe('Wondimu');
+  });
+
+  it('falls back to the staff id rather than inventing a name', () => {
+    expect(actorName({ staff_id: 'S2' })).toBe('S2');
+  });
+
+  it('never returns the fields it used to read by mistake', () => {
+    // auth.name and auth.email are not on the session object at all.
+    expect(actorName({ staff_id: 'S7', name: 'ignored', email: 'ignored@x' })).toBe('S7');
+  });
+
+  it('handles a missing session', () => {
+    expect(actorName(null)).toBe('unknown');
+    expect(actorName(undefined)).toBe('unknown');
   });
 });
 

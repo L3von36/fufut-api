@@ -1,5 +1,6 @@
 import { d1Query, d1Run, json, readBody } from '../lib/db.js';
 import { holdsTable, blocksSeating, ACTIVE_STATUSES, GRACE_MIN, SEATING_LEAD_MIN } from '../lib/booking.js';
+import { actorName } from '../auth.js';
 
 const ACTIVE_LIST = ACTIVE_STATUSES.map((s) => `'${s}'`).join(', ');
 
@@ -14,10 +15,6 @@ function isManager(auth) {
   return String(role || '').toLowerCase() === 'manager';
 }
 
-function actorName(auth) {
-  if (!auth) return 'unknown';
-  return String(auth.name || auth.staffId || auth.id || auth.email || 'unknown');
-}
 
 /** Active, unresolved bookings, so callers can ask which still hold a table. */
 async function activeReservations(env) {

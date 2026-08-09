@@ -85,7 +85,10 @@ async function handleLogout(request, env) {
 async function getAuthUser(request, env) {
   var token = getSessionToken(request);
   if (!token) return null;
-  var r = await d1Query(env, "SELECT s.staff_id, s.role as sessionRole, st.status FROM sessions s JOIN staff st ON s.staff_id = st.id WHERE s.token = ? AND s.expires_at > datetime('now')", [token]);
+  // firstName/lastName are selected so audit trails can name a person rather
+  // than a staff id: "released by Selam Wondimu" is answerable months later,
+  // "released by S2" needs a second lookup.
+  var r = await d1Query(env, "SELECT s.staff_id, s.role as sessionRole, st.status, st.firstName, st.lastName FROM sessions s JOIN staff st ON s.staff_id = st.id WHERE s.token = ? AND s.expires_at > datetime('now')", [token]);
   if (!r.results.length || r.results[0].status !== "active") return null;
   return r.results[0];
 }

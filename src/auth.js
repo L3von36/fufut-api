@@ -145,6 +145,20 @@ export function resourceForPath(pathname) {
   return head;
 }
 
+/**
+ * Who to record against an audited action.
+ *
+ * getAuthUser returns { staff_id, sessionRole, firstName, lastName }, so the
+ * obvious-looking `auth.name` / `auth.id` are all undefined. Every audit field
+ * written before this existed recorded the string "unknown", which is worse
+ * than recording nothing because it looks like an answer.
+ */
+export function actorName(auth) {
+  if (!auth) return 'unknown';
+  const full = [auth.firstName, auth.lastName].filter(Boolean).join(' ').trim();
+  return full || String(auth.staff_id || 'unknown');
+}
+
 /** Session housekeeping is never role-gated; it is how a role is known at all. */
 function isSessionRoute(pathname) {
   return pathname === '/api/auth/me' || pathname === '/api/auth/logout';

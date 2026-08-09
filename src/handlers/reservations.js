@@ -1,4 +1,5 @@
 import { d1Query, d1Run, json, readBody } from '../lib/db.js';
+import { actorName } from '../auth.js';
 import {
   computeWindow,
   normaliseDuration,
@@ -16,10 +17,6 @@ function isManager(auth) {
   return String(role || '').toLowerCase() === 'manager';
 }
 
-function actorName(auth) {
-  if (!auth) return 'unknown';
-  return String(auth.name || auth.staffId || auth.id || auth.email || 'unknown');
-}
 
 /**
  * Resolve whatever the client sent into a real table id.

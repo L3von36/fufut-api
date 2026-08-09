@@ -1,4 +1,5 @@
 import { d1Query, d1Run, json, readBody } from '../lib/db.js';
+import { actorName } from '../auth.js';
 
 function parseJsonSafe(str) {
   try {
@@ -492,7 +493,7 @@ async function handleMenu(pathname, method, request, env, ctx, auth) {
     const stored = await kvGetMenu(env);
     if (!isCategorized(stored)) return json({ ok: false, error: "Menu data not found" }, 404);
 
-    const actor = auth ? String(auth.name || auth.staffId || auth.id || auth.email || "unknown") : "unknown";
+    const actor = actorName(auth);
     const nowIso = new Date().toISOString();
     let hit = null;
 
