@@ -28,6 +28,21 @@ export const DEFAULT_DURATION_MIN = 90;
  */
 export const GRACE_MIN = 15;
 
+/**
+ * How long before a booking the table stops accepting walk-ins.
+ *
+ * Without this, a booking held its table from the moment it was taken, so a
+ * 21:00 reservation made in the morning cost the floor that table for the whole
+ * day - one evening cover wiping out a lunch and an afternoon on a 90-minute
+ * turn. An hour is enough to clear, reset and lay a table while leaving the
+ * rest of the day sellable.
+ *
+ * This applies only to seating. It deliberately does NOT relax double-booking:
+ * a second reservation for the same table and time is still refused however far
+ * off it is, because that is a promise to a guest rather than a use of the room.
+ */
+export const SEATING_LEAD_MIN = 60;
+
 const ACTIVE_STATUSES = ['new', 'confirmed'];
 
 /**
@@ -145,14 +160,19 @@ export function holdsTable(reservation, nowMs, graceMin = GRACE_MIN) {
 }
 
 /**
- * The subset of holds that should block a walk-in *right now*. Identical to
- * holdsTable, but named separately at the call site because the two questions
- * ("can this be double-booked" vs "can I seat someone") read the same field for
- * different reasons and will diverge if a pre-service setup window is ever
- * added.
+ * Should this booking stop a walk-in being seated *right now*?
+ *
+ * Narrower than holdsTable on purpose, and this is the difference that matters:
+ * a booking that exists is worth showing on the floor plan all day, but it only
+ * takes the table out of service once the lead time is reached. Showing and
+ * blocking are different questions and were previously answered the same way,
+ * which made every future booking an all-day blockade.
  */
-export function blocksSeating(reservation, nowMs, graceMin = GRACE_MIN) {
-  return holdsTable(reservation, nowMs, graceMin);
+export function blocksSeating(reservation, nowMs, graceMin = GRACE_MIN, leadMin = SEATING_LEAD_MIN) {
+  if (!holdsTable(reservation, nowMs, graceMin)) return false;
+  const start = Date.parse(reservation.start_at);
+  if (!Number.isFinite(start)) return false;
+  return nowMs >= start - leadMin * 60000;
 }
 
 /** Bookings whose grace has expired and which nobody has marked yet. */

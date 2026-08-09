@@ -1,5 +1,5 @@
 import { d1Query, d1Run, json, readBody } from '../lib/db.js';
-import { holdsTable, ACTIVE_STATUSES, GRACE_MIN } from '../lib/booking.js';
+import { holdsTable, blocksSeating, ACTIVE_STATUSES, GRACE_MIN, SEATING_LEAD_MIN } from '../lib/booking.js';
 
 const ACTIVE_LIST = ACTIVE_STATUSES.map((s) => `'${s}'`).join(', ');
 
@@ -63,6 +63,10 @@ async function listTablesWithHolds(env) {
   return (tables || []).map((t) => {
     const hold = holdByTable.get(t.id);
     return Object.assign({}, t, {
+      // A booking is shown all day, but blocksNow says whether it is actually
+      // taking the table out of service yet. The floor plan needs both: "this
+      // is spoken for at 21:00" is useful at lunchtime, but it must not read
+      // as "you cannot use this table".
       reservedHold: hold
         ? {
             id: hold.id,
@@ -70,6 +74,7 @@ async function listTablesWithHolds(env) {
             guests: hold.guests,
             startAt: hold.start_at,
             endAt: hold.end_at,
+            blocksNow: blocksSeating(hold, nowMs),
           }
         : null,
     });
@@ -122,8 +127,10 @@ async function handleTables(pathname, method, url, request, env, auth) {
     );
 
     const nowMs = Date.now();
-    const hold = (results || []).find((r) => holdsTable(r, nowMs));
-    if (!hold) return null; // nothing holds it - proceed as normal
+    // blocksSeating, not holdsTable: a booking later today is shown on the floor
+    // plan but must not stop the table being used until its lead time.
+    const hold = (results || []).find((r) => blocksSeating(r, nowMs));
+    if (!hold) return null; // nothing blocks it - proceed as normal
 
     if (!isManager(auth)) {
       return json(
@@ -138,6 +145,7 @@ async function handleTables(pathname, method, url, request, env, auth) {
             endAt: hold.end_at,
           },
           graceMinutes: GRACE_MIN,
+          leadMinutes: SEATING_LEAD_MIN,
         },
         409
       );

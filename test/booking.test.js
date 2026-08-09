@@ -11,6 +11,7 @@ import {
   SHOP_UTC_OFFSET_MIN,
   DEFAULT_DURATION_MIN,
   GRACE_MIN,
+  SEATING_LEAD_MIN,
 } from '../src/lib/booking.js';
 
 describe('parseTimeToMinutes', () => {
@@ -157,10 +158,35 @@ describe('holdsTable / blocksSeating', () => {
     expect(holdsTable({ ...base, start_at: '7:00 AM', end_at: '' }, at('2026-08-11T14:30:00.000Z'))).toBe(false);
   });
 
-  it('blocksSeating agrees with holdsTable', () => {
-    for (const t of ['2026-08-11T09:00:00.000Z', '2026-08-11T15:14:00.000Z', '2026-08-11T15:16:00.000Z']) {
-      expect(blocksSeating(base, at(t))).toBe(holdsTable(base, at(t)));
-    }
+  // Showing and blocking are deliberately different questions. A booking made
+  // in the morning for 18:00 is worth showing all day, but blocking the table
+  // from the moment it was taken cost the floor a whole service.
+  it('does not block seating until the lead time, though it still shows as held', () => {
+    const sixHoursBefore = at('2026-08-11T09:00:00.000Z');
+    expect(holdsTable(base, sixHoursBefore)).toBe(true);
+    expect(blocksSeating(base, sixHoursBefore)).toBe(false);
+  });
+
+  it('blocks seating once inside the lead time', () => {
+    // Default lead is 60 minutes, so 14:00 blocks and 13:59 does not.
+    expect(blocksSeating(base, at('2026-08-11T13:59:00.000Z'))).toBe(false);
+    expect(blocksSeating(base, at('2026-08-11T14:00:00.000Z'))).toBe(true);
+    expect(blocksSeating(base, at('2026-08-11T15:00:00.000Z'))).toBe(true);
+  });
+
+  it('respects a custom lead time', () => {
+    expect(blocksSeating(base, at('2026-08-11T13:30:00.000Z'), GRACE_MIN, 120)).toBe(true);
+    expect(blocksSeating(base, at('2026-08-11T13:30:00.000Z'), GRACE_MIN, 30)).toBe(false);
+  });
+
+  it('stops blocking once the grace period lapses, like the hold itself', () => {
+    expect(blocksSeating(base, at('2026-08-11T15:14:00.000Z'))).toBe(true);
+    expect(blocksSeating(base, at('2026-08-11T15:16:00.000Z'))).toBe(false);
+  });
+
+  it('never blocks when nothing holds the table', () => {
+    expect(blocksSeating({ ...base, status: 'cancelled' }, at('2026-08-11T15:00:00.000Z'))).toBe(false);
+    expect(blocksSeating(null, at('2026-08-11T15:00:00.000Z'))).toBe(false);
   });
 
   it('handles a missing reservation', () => {
@@ -196,5 +222,6 @@ describe('constants', () => {
     expect(SHOP_UTC_OFFSET_MIN).toBe(180); // Ethiopia, UTC+3, no DST
     expect(DEFAULT_DURATION_MIN).toBe(90);
     expect(GRACE_MIN).toBe(15);            // industry norm
+    expect(SEATING_LEAD_MIN).toBe(60);     // enough to clear and lay a table
   });
 });
