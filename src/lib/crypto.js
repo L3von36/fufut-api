@@ -21,7 +21,17 @@ async function sha256(message) {
  * PBKDF2 is used rather than bcrypt or Argon2 because it is what WebCrypto
  * offers inside a Worker, and it is a large improvement on a bare digest.
  */
-const PBKDF2_ITERATIONS = 210000;
+/**
+ * 100,000 is the platform ceiling, not a preference: Workers rejects anything
+ * higher with "Pbkdf2 failed: iteration counts above 100000 are not supported".
+ * Asking for more does not degrade, it throws, so this cannot be raised without
+ * moving off WebCrypto entirely.
+ *
+ * The stored format carries its own iteration count, so if that ceiling ever
+ * lifts, new hashes can use a higher number and existing ones keep verifying at
+ * the count they were made with.
+ */
+const PBKDF2_ITERATIONS = 100000;
 const PBKDF2_PREFIX = "pbkdf2";
 
 function toHex(buffer) {

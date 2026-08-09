@@ -32,8 +32,11 @@ describe('hashPassword', () => {
     expect(await verifyPassword('wrong horse 9', h)).toBe(false);
   });
 
-  it('uses an iteration count worth having', () => {
-    expect(PBKDF2_ITERATIONS).toBeGreaterThanOrEqual(100000);
+  // Workers refuses anything above 100,000 outright - it throws rather than
+  // clamping - so this is both the floor worth having and the platform ceiling.
+  // Raising it breaks every password operation in production.
+  it('sits exactly at the platform maximum', () => {
+    expect(PBKDF2_ITERATIONS).toBe(100000);
   });
 });
 
