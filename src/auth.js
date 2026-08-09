@@ -92,9 +92,13 @@ const ROLE_ACCESS = {
     read: ['orders', 'inventory', 'waste', 'expenses'],
     write: ['orders', 'inventory', 'waste'],
   },
+  // Reads stock, does not own it. Monitoring levels, ordering supplies and
+  // controlling food cost belong to the head chef; an assistant executes
+  // against those counts, and two people adjusting the same figures is how a
+  // stock take stops reconciling.
   'assistant-chef': {
     read: ['orders', 'inventory'],
-    write: ['orders', 'inventory'],
+    write: ['orders'],
   },
   'head-waiter': {
     read: ['orders', 'tables', 'reservations'],

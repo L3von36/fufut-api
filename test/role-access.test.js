@@ -109,6 +109,30 @@ describe('assistant chef', () => {
     expect(roleMayAccess('assistant-chef', '/api/expenses', GET)).toBe(false);
     expect(roleMayAccess('assistant-chef', '/api/waste', GET)).toBe(false);
   });
+
+  // Stock control is the head chef's duty. An assistant works against the
+  // counts rather than setting them, so they read the figures and no more.
+  it('reads stock but may not change it', () => {
+    expect(roleMayAccess('assistant-chef', '/api/inventory', GET)).toBe(true);
+    expect(roleMayAccess('assistant-chef', '/api/inventory', PUT)).toBe(false);
+    expect(roleMayAccess('assistant-chef', '/api/inventory', POST)).toBe(false);
+    expect(roleMayAccess('assistant-chef', '/api/inventory', DELETE)).toBe(false);
+  });
+});
+
+describe('stock control follows the head chef', () => {
+  it('lets the head chef change stock, which is the duty the role is defined by', () => {
+    expect(roleMayAccess('head-chef', '/api/inventory', GET)).toBe(true);
+    expect(roleMayAccess('head-chef', '/api/inventory', PUT)).toBe(true);
+    expect(roleMayAccess('head-chef', '/api/inventory', POST)).toBe(true);
+  });
+
+  it('grants stock writes to nobody else outside the manager', () => {
+    for (const r of ['head-waiter', 'cashier', 'cleaner', 'delivery-staff', 'assistant-chef']) {
+      expect(roleMayAccess(r, '/api/inventory', PUT)).toBe(false);
+    }
+    expect(roleMayAccess('manager', '/api/inventory', PUT)).toBe(true);
+  });
 });
 
 describe('head waiter', () => {
