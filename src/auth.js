@@ -63,7 +63,21 @@ const MANAGER_ONLY = [
   { method: 'POST', prefix: '/api/staff' },
   { method: 'PUT', prefix: '/api/staff' },
   { method: 'DELETE', prefix: '/api/staff' },
+  // Issuing somebody else a new password is an account takeover in one call.
+  { method: 'POST', exact: '/api/auth/reset-password' },
 ];
+
+/**
+ * Reachable while an account is required to change its password. Everything
+ * else is refused until it does, so the requirement is enforced here rather
+ * than left to the client to honour - a stale tab or a direct API call would
+ * otherwise carry on working on a credential the manager just handed out.
+ */
+const PASSWORD_CHANGE_ALLOWED = new Set([
+  '/api/auth/change-password',
+  '/api/auth/logout',
+  '/api/auth/me',
+]);
 
 /**
  * Endpoints any signed-in member of staff may reach, whatever their role.
@@ -159,9 +173,18 @@ export function actorName(auth) {
   return full || String(auth.staff_id || 'unknown');
 }
 
-/** Session housekeeping is never role-gated; it is how a role is known at all. */
+/**
+ * Session housekeeping is never role-gated; it is how a role is known at all.
+ * Changing your own password belongs here too: no role's resource list contains
+ * `auth`, so without this the matrix would refuse the one action a person with a
+ * pending password change is required to perform - locking out every account.
+ */
 function isSessionRoute(pathname) {
-  return pathname === '/api/auth/me' || pathname === '/api/auth/logout';
+  return (
+    pathname === '/api/auth/me' ||
+    pathname === '/api/auth/logout' ||
+    pathname === '/api/auth/change-password'
+  );
 }
 
 /**
@@ -221,6 +244,23 @@ export async function authorize(request, env, pathname, method) {
     return {
       ok: false,
       response: json({ ok: false, error: 'Manager access required' }, 403),
+    };
+  }
+
+  // An account carrying a manager-issued password may do exactly one thing:
+  // replace it. Checked before the role matrix, because the requirement applies
+  // whatever the role.
+  if (auth.must_change_password === 1 && !PASSWORD_CHANGE_ALLOWED.has(pathname)) {
+    return {
+      ok: false,
+      response: json(
+        {
+          ok: false,
+          error: 'You must change your password before continuing',
+          mustChangePassword: true,
+        },
+        403
+      ),
     };
   }
 

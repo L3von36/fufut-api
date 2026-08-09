@@ -27,11 +27,14 @@ import { handleUpload } from './handlers/upload.js';
 import { handleMigration } from './handlers/migration.js';
 import { handleResources } from './handlers/resources.js';
 import { handleTables } from './handlers/tables.js';
+import { handleStaff } from './handlers/staff.js';
 import { handleSSE } from './handlers/sse.js';
 import {
   handleStaffLogin,
   handleSessionCheck,
   handleLogout,
+  handleResetPassword,
+  handleChangePassword,
 } from './handlers/session.js';
 
 const CORS_PREFLIGHT = {
@@ -64,6 +67,8 @@ async function route(pathname, method, url, request, env, ctx, auth) {
   if (pathname === '/api/auth/login' && upper === 'POST') return handleStaffLogin(request, env);
   if (pathname === '/api/auth/me' && upper === 'GET') return handleSessionCheck(request, env);
   if (pathname === '/api/auth/logout' && upper === 'POST') return handleLogout(request, env);
+  if (pathname === '/api/auth/reset-password' && upper === 'POST') return handleResetPassword(request, env);
+  if (pathname === '/api/auth/change-password' && upper === 'POST') return handleChangePassword(request, env);
   if (pathname === '/api/upload' && upper === 'POST') return handleUpload(request, env);
   if (pathname.startsWith('/api/images/') && upper === 'GET') return serveImage(env, pathname);
 
@@ -95,6 +100,12 @@ async function route(pathname, method, url, request, env, ctx, auth) {
   // fall through whenever the generic handler should do the actual write.
   const tables = await handleTables(pathname, method, url, request, env, auth);
   if (tables !== null) return tables;
+
+  // Must precede handleResources: that handler writes any column it is given,
+  // so a request carrying password_hash would set it directly. Creation and
+  // editing of staff are handled here; GET and DELETE fall through.
+  const staff = await handleStaff(pathname, method, request, env);
+  if (staff !== null) return staff;
 
   const resources = await handleResources(pathname, method, url, request, env);
   if (resources !== null) return resources;

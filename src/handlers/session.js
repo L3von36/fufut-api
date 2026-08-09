@@ -1,4 +1,10 @@
-import { verifyPassword } from '../lib/crypto.js';
+import {
+  verifyPassword,
+  hashPassword,
+  isLegacyHash,
+  generateTempPassword,
+  passwordProblem,
+} from '../lib/crypto.js';
 import { d1Query, d1Run, json, now, readBody } from '../lib/db.js';
 
 function getSessionToken(request) {
@@ -49,14 +55,122 @@ async function handleStaffLogin(request, env) {
   }
   var valid = await verifyPassword(data.password, staff.password_hash);
   if (!valid) return json({ ok: false, error: "Invalid password" }, 401);
+
+  // A correct password is the only moment the plaintext is available, so it is
+  // the only moment a legacy hash can be upgraded. Done after verification and
+  // without blocking the response.
+  if (isLegacyHash(staff.password_hash)) {
+    try {
+      const upgraded = await hashPassword(data.password);
+      await d1Run(env, "UPDATE staff SET password_hash = ? WHERE id = ?", [upgraded, staff.id]);
+    } catch (e) {
+      console.error("[HASH UPGRADE]", e); // never block a sign-in over this
+    }
+  }
+
   var token = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
   var expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1e3).toISOString();
   await d1Run(env, "INSERT INTO sessions (token, staff_id, role, expires_at) VALUES (?,?,?,?)", [token, staff.id, staff.role, expiresAt]);
   var user = stripPwd(staff);
-  return new Response(JSON.stringify({ ok: true, user, role: staff.role }), {
-    status: 200,
-    headers: { "Content-Type": "application/json", "Cache-Control": "no-store", "Set-Cookie": makeSessionCookie(token) }
+  return new Response(
+    JSON.stringify({
+      ok: true,
+      user,
+      role: staff.role,
+      // The client uses this to send the person straight to a change-password
+      // screen. It is not the enforcement - authorize() refuses everything else
+      // until the password is changed - but without it the UI would drop them
+      // onto a dashboard that then refuses every request.
+      mustChangePassword: staff.must_change_password === 1,
+    }),
+    {
+      status: 200,
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-store", "Set-Cookie": makeSessionCookie(token) }
+    }
+  );
+}
+
+/**
+ * A manager issues a new temporary password for someone who has forgotten
+ * theirs, or who is being taken off a shared one.
+ *
+ * The generated password is returned exactly once, in this response, for the
+ * manager to hand over in person. It is never stored in plaintext and cannot be
+ * retrieved again - a second reset is the only way back. `must_change_password`
+ * is set, so the person cannot keep using what the manager knows.
+ */
+async function handleResetPassword(request, env) {
+  const data = await readBody(request);
+  const staffId = data && (data.staffId || data.id);
+  if (!staffId) return json({ ok: false, error: "staffId required" }, 400);
+
+  const { results } = await d1Query(env, "SELECT id, firstName, lastName FROM staff WHERE id = ?", [String(staffId)]);
+  if (!results || !results.length) return json({ ok: false, error: "Staff not found" }, 404);
+
+  const temporary = generateTempPassword();
+  const hash = await hashPassword(temporary);
+  await d1Run(
+    env,
+    "UPDATE staff SET password_hash = ?, must_change_password = 1, password_set_at = ? WHERE id = ?",
+    [hash, new Date().toISOString(), String(staffId)]
+  );
+
+  // Every existing session for that person is ended, so a reset actually locks
+  // out whoever was using the old credential rather than leaving them signed in.
+  await d1Run(env, "DELETE FROM sessions WHERE staff_id = ?", [String(staffId)]);
+
+  return json({
+    ok: true,
+    staffId: String(staffId),
+    temporaryPassword: temporary,
+    mustChangePassword: true,
+    note: "Give this to the member of staff in person. It is shown once and cannot be retrieved again.",
   });
+}
+
+/**
+ * Anyone signed in changing their own password. Requires the current one, so a
+ * borrowed unlocked tablet cannot be used to take an account over.
+ */
+async function handleChangePassword(request, env) {
+  const auth = await getAuthUser(request, env);
+  if (!auth) return json({ ok: false, error: "Authentication required" }, 401);
+
+  const data = await readBody(request);
+  const currentPassword = data && data.currentPassword;
+  const newPassword = data && data.newPassword;
+  if (!currentPassword || !newPassword) {
+    return json({ ok: false, error: "currentPassword and newPassword are required" }, 400);
+  }
+
+  const problem = passwordProblem(newPassword);
+  if (problem) return json({ ok: false, error: problem }, 400);
+
+  const { results } = await d1Query(env, "SELECT id, password_hash FROM staff WHERE id = ?", [auth.staff_id]);
+  const staff = results && results[0];
+  if (!staff || !staff.password_hash) return json({ ok: false, error: "Account not found" }, 404);
+
+  const valid = await verifyPassword(currentPassword, staff.password_hash);
+  if (!valid) return json({ ok: false, error: "Current password is incorrect" }, 401);
+
+  if (await verifyPassword(newPassword, staff.password_hash)) {
+    return json({ ok: false, error: "New password must be different from the current one" }, 400);
+  }
+
+  const hash = await hashPassword(newPassword);
+  await d1Run(
+    env,
+    "UPDATE staff SET password_hash = ?, must_change_password = 0, password_set_at = ? WHERE id = ?",
+    [hash, new Date().toISOString(), staff.id]
+  );
+
+  // Other sessions are ended, but the one making the change is kept: signing
+  // somebody out of the screen they just used to comply is a good way to have
+  // them write the new password down instead.
+  const token = getSessionToken(request);
+  await d1Run(env, "DELETE FROM sessions WHERE staff_id = ? AND token <> ?", [staff.id, token || ""]);
+
+  return json({ ok: true, mustChangePassword: false });
 }
 
 async function handleSessionCheck(request, env) {
@@ -88,8 +202,19 @@ async function getAuthUser(request, env) {
   // firstName/lastName are selected so audit trails can name a person rather
   // than a staff id: "released by Selam Wondimu" is answerable months later,
   // "released by S2" needs a second lookup.
-  var r = await d1Query(env, "SELECT s.staff_id, s.role as sessionRole, st.status, st.firstName, st.lastName FROM sessions s JOIN staff st ON s.staff_id = st.id WHERE s.token = ? AND s.expires_at > datetime('now')", [token]);
+  var r = await d1Query(env, "SELECT s.staff_id, s.role as sessionRole, st.status, st.firstName, st.lastName, st.must_change_password FROM sessions s JOIN staff st ON s.staff_id = st.id WHERE s.token = ? AND s.expires_at > datetime('now')", [token]);
   if (!r.results.length || r.results[0].status !== "active") return null;
   return r.results[0];
 }
-export { getSessionToken, makeSessionCookie, clearSessionCookie, stripPwd, handleStaffLogin, handleSessionCheck, handleLogout, getAuthUser };
+export {
+  getSessionToken,
+  makeSessionCookie,
+  clearSessionCookie,
+  stripPwd,
+  handleStaffLogin,
+  handleSessionCheck,
+  handleLogout,
+  handleResetPassword,
+  handleChangePassword,
+  getAuthUser,
+};
