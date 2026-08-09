@@ -157,7 +157,16 @@ async function handleOrders(pathname, method, url, request, env) {
           base
         );
       }
-      const tracking = await insertOrderItems(env, id, data.items, new Date().toISOString());
+      // orderItems is the structured cart the POS already sends alongside the
+      // human-readable items string; it is preferred because it carries the
+      // menu id, the unit price and the modifiers. Falling back to items keeps
+      // tracking working for any client that only posts the summary.
+      const tracking = await insertOrderItems(
+        env,
+        id,
+        data.orderItems || data.order_items || data.items,
+        new Date().toISOString()
+      );
       return json({ ok: true, id, items: tracking.inserted, warning: tracking.warning || undefined });
     } catch (e) {
       return json({ ok: false, error: String(e.message || e) }, 500);

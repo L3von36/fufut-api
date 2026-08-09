@@ -114,6 +114,33 @@ export function averageByCategory(items) {
 }
 
 /**
+ * Read the flat order summary the POS writes to orders.items.
+ *
+ * Shapes seen in production: "1xMacchiato, 1xFut breakfast Gebeta" and
+ * "2x Latte [oat-milk, vanilla] (extra hot), 1x Espresso". Splitting on a comma
+ * alone would break every dish whose name contains one, so the split is made
+ * only where a comma is followed by the next "<qty>x" marker.
+ */
+export function parseFlatItems(flat) {
+  const text = String(flat == null ? '' : flat).trim();
+  if (!text) return [];
+
+  return text
+    .split(/,\s*(?=\d+\s*x)/i)
+    .map((chunk) => {
+      const m = chunk.trim().match(/^(\d+)\s*x\s*(.+)$/i);
+      if (!m) return null;
+      const name = m[2]
+        .replace(/\[[^\]]*\]/g, '')  // modifier list
+        .replace(/\([^)]*\)/g, '')   // line note
+        .trim();
+      if (!name) return null;
+      return { name, qty: Number(m[1]) || 1 };
+    })
+    .filter(Boolean);
+}
+
+/**
  * Turn whatever the POS posted into line rows.
  *
  * The cart sends a `modifiers` array and prices as either basePrice or price
@@ -128,7 +155,13 @@ export function normaliseLines(items) {
     try {
       list = JSON.parse(list);
     } catch {
-      return [];
+      // Not JSON. The POS also stores a human-readable summary of the order
+      // ("1xMacchiato, 1xFut breakfast Gebeta"), and that string is what
+      // reached this function for real orders, producing no tracking rows at
+      // all. Parsing it is a last resort: it recovers the dish and the
+      // quantity, which is enough to time the line, but it cannot recover the
+      // menu id or the price.
+      list = parseFlatItems(list);
     }
   }
   if (!Array.isArray(list)) return [];

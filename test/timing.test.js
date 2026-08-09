@@ -171,8 +171,31 @@ describe('normaliseLines', () => {
     expect(normaliseLines([null, {}, { name: '   ' }, 'junk'])).toEqual([]);
   });
 
+  // Regression: this is the string real orders actually carried, and treating
+  // it as unparseable meant live orders produced no tracking rows at all - the
+  // kitchen had nothing to mark and every timing stayed empty.
+  it('parses the flat summary the POS writes to orders.items', () => {
+    const lines = normaliseLines('1xMacchiato, 1xFut breakfast Gebeta');
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toMatchObject({ name: 'Macchiato', qty: 1 });
+    expect(lines[1]).toMatchObject({ name: 'Fut breakfast Gebeta', qty: 1 });
+  });
+
+  it('keeps dish names that contain a comma intact', () => {
+    const lines = normaliseLines('1xPineapple, MANGO and ORANGE Juice, 2xTEA');
+    expect(lines).toHaveLength(2);
+    expect(lines[0].name).toBe('Pineapple, MANGO and ORANGE Juice');
+    expect(lines[1]).toMatchObject({ name: 'TEA', qty: 2 });
+  });
+
+  it('strips modifiers and notes from the flat form', () => {
+    const lines = normaliseLines('2x Latte [oat-milk, vanilla] (extra hot), 1x Espresso');
+    expect(lines[0]).toMatchObject({ name: 'Latte', qty: 2 });
+    expect(lines[1]).toMatchObject({ name: 'Espresso', qty: 1 });
+  });
+
   it('survives malformed input', () => {
-    expect(normaliseLines('not json')).toEqual([]);
+    expect(normaliseLines('just some prose')).toEqual([]);
     expect(normaliseLines(null)).toEqual([]);
     expect(normaliseLines({ name: 'not an array' })).toEqual([]);
   });
