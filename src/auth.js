@@ -14,13 +14,22 @@
  *     reviews as an anonymous customer. Those must stay open or online booking
  *     and ordering break. Everything else requires a session.
  *
- *  2. Per-role *read* restrictions are deliberately NOT applied yet. Several
- *     POS pages legitimately read data outside their role's permission list —
- *     Cashier's Time Clock reads `staff`, Head Chef's Reports reads `expenses`,
- *     Head Chef's Orders reads `menu`. Gating reads by the frontend's
- *     ROLE_PERMISSIONS would break those working pages. Closing the public hole
- *     is the urgent fix; tightening per-role reads needs the permission model
- *     reworked first (see FIX-PROMPT.md Task 5).
+ *  2. Per-role access IS now enforced, by resource rather than by screen. The
+ *     earlier note here said gating reads by the frontend's ROLE_PERMISSIONS
+ *     would break working pages, and it would: Cashier's Time Clock reads
+ *     `staff`, Head Chef's Reports reads `expenses`, Head Chef's Orders reads
+ *     `menu`, and Cleaner's Dashboard reads `tables`. None of those resources
+ *     appear in the corresponding role's screen list.
+ *
+ *     So the matrix below is not derived from ROLE_PERMISSIONS. It was built by
+ *     reading what each screen actually fetches and taking the union per role,
+ *     which is why it grants reads that look surprising. Every one of them is
+ *     load-bearing; removing one blanks a page.
+ *
+ *     Until this existed, any signed-in member of staff could read every
+ *     endpoint. A chef session returned 200 for /api/staff, /api/expenses,
+ *     /api/cashdrawer and /api/tables - screens the UI carefully hides from
+ *     them. Hiding a link was the only thing standing in the way.
  */
 
 import { json } from './lib/db.js';
@@ -55,6 +64,101 @@ const MANAGER_ONLY = [
   { method: 'PUT', prefix: '/api/staff' },
   { method: 'DELETE', prefix: '/api/staff' },
 ];
+
+/**
+ * Endpoints any signed-in member of staff may reach, whatever their role.
+ * Session housekeeping, plus the shared catalogue and CMS reads that the app
+ * chrome needs on every screen.
+ */
+const ANY_STAFF_READ = new Set(['menu', 'content', 'gallery', 'reviews']);
+
+/**
+ * Resource access per role.
+ *
+ * `read` covers GET; `write` covers POST, PUT, PATCH and DELETE. A resource
+ * absent from both lists is refused. Manager is deliberately unrestricted -
+ * every screen in the application is theirs.
+ *
+ * The reads that look wrong are the ones to leave alone:
+ *   head-chef  -> expenses   Reports fetches expenses unconditionally
+ *   cashier    -> staff      Time Clock lists who is on shift
+ *   cleaner    -> tables     their Dashboard counts tables needing attention
+ *   every POS role -> menu   order screens render dish names and prices
+ */
+const ROLE_ACCESS = {
+  manager: { read: '*', write: '*' },
+
+  'head-chef': {
+    read: ['orders', 'inventory', 'waste', 'expenses'],
+    write: ['orders', 'inventory', 'waste'],
+  },
+  'assistant-chef': {
+    read: ['orders', 'inventory'],
+    write: ['orders', 'inventory'],
+  },
+  'head-waiter': {
+    read: ['orders', 'tables', 'reservations'],
+    write: ['orders', 'tables', 'reservations'],
+  },
+  cashier: {
+    read: ['orders', 'tables', 'reservations', 'expenses', 'staff', 'timeclock', 'cashdrawer'],
+    write: ['orders', 'tables', 'reservations', 'timeclock', 'cashdrawer'],
+  },
+  'delivery-staff': {
+    read: ['delivery'],
+    write: ['delivery'],
+  },
+  cleaner: {
+    read: ['waste', 'tables'],
+    write: ['waste'],
+  },
+};
+
+/**
+ * The resource a path acts on.
+ *
+ * Several paths do not name their resource in the obvious way: /api/menus and
+ * /api/menus/save are the menu, /api/save-content is content, and the SSE
+ * streams are gated as the data they push rather than as a resource of their
+ * own, so a cleaner cannot subscribe to the kitchen feed and receive orders
+ * they may not fetch.
+ */
+export function resourceForPath(pathname) {
+  const parts = String(pathname || '').split('/').filter(Boolean);
+  if (parts[0] !== 'api' || parts.length < 2) return null;
+
+  const head = parts[1];
+  if (head === 'menus') return 'menu';
+  if (head === 'save-content') return 'content';
+  if (head === 'events') return parts[2] === 'kitchen' ? 'orders' : 'tables';
+  return head;
+}
+
+/** Session housekeeping is never role-gated; it is how a role is known at all. */
+function isSessionRoute(pathname) {
+  return pathname === '/api/auth/me' || pathname === '/api/auth/logout';
+}
+
+/**
+ * Decide whether `role` may perform `method` on `pathname`.
+ * Unknown roles and unlisted resources are refused rather than allowed: a
+ * default-allow here is what let every session read everything.
+ */
+export function roleMayAccess(role, pathname, method) {
+  const key = String(role || '').toLowerCase().replace(/\s+/g, '-');
+  const access = ROLE_ACCESS[key];
+  if (!access) return false;
+  if (access.read === '*' && access.write === '*') return true;
+
+  const resource = resourceForPath(pathname);
+  if (!resource) return false;
+
+  const reading = String(method || '').toUpperCase() === 'GET';
+  if (reading && ANY_STAFF_READ.has(resource)) return true;
+
+  const allowed = reading ? access.read : access.write;
+  return Array.isArray(allowed) && allowed.includes(resource);
+}
 
 function matches(rules, pathname, method) {
   return rules.some((r) => {
@@ -92,6 +196,27 @@ export async function authorize(request, env, pathname, method) {
     return {
       ok: false,
       response: json({ ok: false, error: 'Manager access required' }, 403),
+    };
+  }
+
+  // Signing out and checking who you are must never depend on what you may
+  // reach, or a role with a narrow matrix could not end its own session.
+  if (isSessionRoute(pathname)) {
+    return { ok: true, auth };
+  }
+
+  if (!roleMayAccess(role, pathname, method)) {
+    return {
+      ok: false,
+      response: json(
+        {
+          ok: false,
+          error: `Your role does not have access to this data`,
+          role: role || null,
+          resource: resourceForPath(pathname),
+        },
+        403
+      ),
     };
   }
 

@@ -66,9 +66,28 @@ describe('protected surface', () => {
     }
   );
 
-  it('allows an authenticated staff member through', async () => {
-    const d = await decide('/api/orders', 'GET', { staff_id: 'S1', sessionRole: 'Cleaner' });
+  it('allows an authenticated staff member through to their own resources', async () => {
+    const d = await decide('/api/waste', 'GET', { staff_id: 'S1', sessionRole: 'Cleaner' });
     expect(d.ok).toBe(true);
+  });
+
+  // Previously this same call succeeded: a session was all it took, so a
+  // cleaner could read every order in the business. Role access is now checked
+  // per resource, and orders are not a cleaner's.
+  it('refuses an authenticated staff member a resource outside their role', async () => {
+    const d = await decide('/api/orders', 'GET', { staff_id: 'S1', sessionRole: 'Cleaner' });
+    expect(d.ok).toBe(false);
+    expect(d.response.status).toBe(403);
+  });
+
+  it('lets any role end its own session, whatever else it may not reach', async () => {
+    for (const path of ['/api/auth/me', '/api/auth/logout']) {
+      const d = await decide(path, path.endsWith('logout') ? 'POST' : 'GET', {
+        staff_id: 'S1',
+        sessionRole: 'Cleaner',
+      });
+      expect(d.ok).toBe(true);
+    }
   });
 
   it('reads SSE as protected', async () => {
