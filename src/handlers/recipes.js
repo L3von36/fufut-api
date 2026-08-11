@@ -23,6 +23,7 @@ import { writeAudit } from '../lib/audit.js';
 import { actorName } from '../auth.js';
 import { isKnownUnit, areCompatible, unitCatalogue } from '../lib/units.js';
 import { recipeCost, menuItemMargin, productionCapacity } from '../lib/inventory.js';
+import { inferQuantities } from '../lib/infer.js';
 
 async function loadInventoryMap(env) {
   const { results } = await d1Query(env, 'SELECT * FROM inventory');
@@ -356,6 +357,128 @@ async function archiveRecipe(env, auth, id) {
   return json({ ok: true, archived: true });
 }
 
+/**
+ * GET /api/recipes/infer?inventory_id=…
+ *
+ * Works out what each dish is actually using, from what the shelf did.
+ *
+ * ── Why consumption is measured from counts, not from the ledger ────────────
+ *
+ * The obvious implementation — sum the `sale` movements — is circular: those
+ * movements were *generated* from the recipes, so it would return the recipe it
+ * was given. The only independent evidence is the physical count:
+ *
+ *     consumed = counted(t0) + purchases − waste − counted(t1)
+ *
+ * which is why this needs stock counts and cannot be run off sales alone.
+ */
+async function inferRecipe(env, url) {
+  const inventoryId = url.searchParams.get('inventory_id') || url.searchParams.get('inventoryId');
+  if (!inventoryId) return json({ ok: false, error: 'inventory_id required' }, 400);
+
+  const { results: items } = await d1Query(env, 'SELECT * FROM inventory WHERE id = ?', [inventoryId]);
+  const item = items && items[0];
+  if (!item) return json({ ok: false, error: 'Inventory item not found' }, 404);
+
+  // Counts of this item, oldest first. Consecutive pairs become the periods.
+  const { results: counts } = await d1Query(
+    env,
+    `SELECT sci.counted_qty, sc.completed_at
+       FROM stock_count_items sci JOIN stock_counts sc ON sc.id = sci.count_id
+      WHERE sci.inventory_id = ? AND sc.status = 'posted' AND sc.completed_at IS NOT NULL
+      ORDER BY sc.completed_at`,
+    [inventoryId]
+  );
+
+  if (!counts || counts.length < 2) {
+    return json({
+      ok: false,
+      item: { id: item.id, name: item.name, unit: item.unit },
+      reason: `Needs at least two posted stock counts of ${item.name}; have ${(counts || []).length}. Each pair of counts is one observation.`,
+      countsAvailable: (counts || []).length,
+    });
+  }
+
+  // Dishes whose recipes reference this item. Without any recipes there is
+  // nothing to infer *for* — inference refines a set of dishes, it cannot
+  // discover which dishes use an ingredient.
+  const { results: users } = await d1Query(
+    env,
+    `SELECT DISTINCT r.menu_item_id AS id, m.name
+       FROM recipe_items ri
+       JOIN recipes r ON r.id = ri.recipe_id
+       LEFT JOIN menu_items m ON m.id = r.menu_item_id
+      WHERE ri.inventory_id = ? AND r.status = 'active' AND r.menu_item_id IS NOT NULL`,
+    [inventoryId]
+  );
+  const dishes = (users || []).map((u) => u.id);
+  const dishNames = new Map((users || []).map((u) => [u.id, u.name]));
+
+  if (!dishes.length) {
+    return json({
+      ok: false,
+      item: { id: item.id, name: item.name, unit: item.unit },
+      reason: `No active recipe uses ${item.name}, so there are no dishes to attribute its consumption to. Add a draft recipe naming the dishes first — inference refines quantities, it cannot discover which dishes use an ingredient.`,
+    });
+  }
+
+  const periods = [];
+  for (let i = 1; i < counts.length; i++) {
+    const from = counts[i - 1].completed_at;
+    const to = counts[i].completed_at;
+
+    const [{ results: flow }, { results: sold }] = await Promise.all([
+      d1Query(
+        env,
+        `SELECT
+           SUM(CASE WHEN type = 'purchase' THEN qty ELSE 0 END) AS purchased,
+           SUM(CASE WHEN type = 'waste'    THEN -qty ELSE 0 END) AS wasted
+         FROM stock_movements
+        WHERE inventory_id = ? AND at > ? AND at <= ?`,
+        [inventoryId, from, to]
+      ),
+      d1Query(
+        env,
+        `SELECT oi.menu_item_id AS id, SUM(oi.qty) AS qty
+           FROM order_items oi JOIN orders o ON o.id = oi.order_id
+          WHERE o.voided_at IS NULL AND o.status <> 'cancelled'
+            AND oi.status <> 'cancelled'
+            AND oi.created_at > ? AND oi.created_at <= ?
+          GROUP BY oi.menu_item_id`,
+        [from, to]
+      ),
+    ]);
+
+    const f = (flow && flow[0]) || {};
+    const opening = Number(counts[i - 1].counted_qty) || 0;
+    const closing = Number(counts[i].counted_qty) || 0;
+    const purchased = Number(f.purchased) || 0;
+    const wasted = Number(f.wasted) || 0;
+
+    // Waste is subtracted, so it is not attributed to any dish. It left the
+    // shelf without being sold, and folding it into a per-dish quantity is
+    // exactly how waste gets redefined as recipe.
+    periods.push({
+      label: `${String(from).slice(0, 10)} → ${String(to).slice(0, 10)}`,
+      consumed: opening + purchased - wasted - closing,
+      sales: Object.fromEntries((sold || []).map((s) => [s.id, Number(s.qty) || 0])),
+    });
+  }
+
+  const result = inferQuantities({ periods, dishes, unit: item.unit });
+
+  return json({
+    ok: result.ok,
+    item: { id: item.id, name: item.name, unit: item.unit },
+    periods: periods.map((p) => ({ period: p.label, consumed: Math.round(p.consumed * 1000) / 1000 })),
+    ...result,
+    estimates: (result.estimates || []).map((e) => ({
+      ...e,
+      dish: dishNames.get(e.menuItemId) || e.menuItemId,
+    })),
+  });
+}
+
 export async function handleRecipes(pathname, method, url, request, env, auth) {
   const m = method.toUpperCase();
 
@@ -369,6 +492,9 @@ export async function handleRecipes(pathname, method, url, request, env, auth) {
   const sub = pathname.replace(/^\/api\/recipes/, '');
 
   if (m === 'GET' && sub === '') return listRecipes(env, url);
+  // Declared before /:id so "infer" is not read as a recipe id — the same
+  // ordering trap the kitchen's /items/active route has.
+  if (m === 'GET' && sub === '/infer') return inferRecipe(env, url);
   if (m === 'POST' && sub === '') return createRecipe(request, env, auth);
 
   const cap = sub.match(/^\/([^/]+)\/capacity$/);
