@@ -215,6 +215,38 @@ for (const role of ['cashier', 'head-chef', 'head-waiter']) {
 }
 
 /**
+ * The canonical form of a role: lowercase, hyphenated.
+ *
+ * Both permission matrices key on this form, and `roleMayAccess` has always
+ * normalised before looking up — so "Head Chef" and "head-chef" have always
+ * granted the same access. What that tolerance hid is that the *stored* values
+ * drifted: production held "Cashier", "Head Chef" and "Manager" in title case
+ * alongside a lone lowercase "cleaner".
+ *
+ * That mattered in one place. The backoffice role dropdown offers canonical
+ * values, so `<select>` bound to a title-case role matched no option and
+ * rendered blank for every existing member of staff — which looks exactly like
+ * a missing feature, and which silently rewrote the value to canonical form for
+ * anybody who did use it. Normalising on write means the two can no longer
+ * disagree.
+ */
+export const ROLES = [
+  'manager',
+  'head-chef',
+  'assistant-chef',
+  'head-waiter',
+  'cashier',
+  'delivery-staff',
+  'cleaner',
+  'accountant',
+];
+
+export function canonicalRole(role) {
+  const key = String(role || '').trim().toLowerCase().replace(/[\s_]+/g, '-');
+  return ROLES.includes(key) ? key : null;
+}
+
+/**
  * The resource a path acts on.
  *
  * Several paths do not name their resource in the obvious way: /api/menus and

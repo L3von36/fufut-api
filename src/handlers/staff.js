@@ -1,5 +1,6 @@
 import { d1Query, d1Run, json, now, readBody } from '../lib/db.js';
 import { hashPassword, generateTempPassword, passwordProblem } from '../lib/crypto.js';
+import { canonicalRole, ROLES } from '../auth.js';
 
 /**
  * Staff accounts.
@@ -30,6 +31,26 @@ function pick(data) {
   return out;
 }
 
+/**
+ * Normalise the role and refuse one that is not real.
+ *
+ * Two failures this closes. Roles were stored in whatever case the client sent,
+ * so production accumulated "Cashier" beside "cleaner"; the matrices normalise
+ * on read so access still worked, but the backoffice dropdown matched neither
+ * and rendered blank. And nothing validated the value at all — a typo, or a
+ * role that exists in no matrix, produced an account that `roleMayAccess`
+ * refuses everything, which presents as a person who can log in and see nothing.
+ */
+function normaliseRole(fields) {
+  if (fields.role === undefined) return null;
+  const canonical = canonicalRole(fields.role);
+  if (!canonical) {
+    return `"${fields.role}" is not a role. Use one of: ${ROLES.join(', ')}`;
+  }
+  fields.role = canonical;
+  return null;
+}
+
 async function handleStaff(pathname, method, request, env) {
   const m = method.toUpperCase();
   const parts = pathname.split('/').filter(Boolean);
@@ -57,6 +78,8 @@ async function handleStaff(pathname, method, request, env) {
 
     const id = data.id || 'S' + crypto.randomUUID().slice(0, 7);
     const fields = pick(data);
+    const roleProblem = normaliseRole(fields);
+    if (roleProblem) return json({ ok: false, error: roleProblem }, 400);
     fields.id = id;
     fields.created = now();
     fields.password_hash = await hashPassword(initial);
@@ -110,6 +133,8 @@ async function handleStaff(pathname, method, request, env) {
     }
 
     const fields = pick(data);
+    const roleProblem = normaliseRole(fields);
+    if (roleProblem) return json({ ok: false, error: roleProblem }, 400);
     if (!Object.keys(fields).length) return json({ ok: false, error: 'No fields to update' }, 400);
 
     const setClause = Object.keys(fields).map((c) => `${c} = ?`).join(', ');
