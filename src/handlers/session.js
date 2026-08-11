@@ -91,13 +91,23 @@ async function handleStaffLogin(request, env) {
 }
 
 /**
- * A manager issues a new temporary password for someone who has forgotten
- * theirs, or who is being taken off a shared one.
+ * A manager issues a new password for someone who has forgotten theirs, or who
+ * is being taken off a shared one.
  *
- * The generated password is returned exactly once, in this response, for the
- * manager to hand over in person. It is never stored in plaintext and cannot be
- * retrieved again - a second reset is the only way back. `must_change_password`
- * is set, so the person cannot keep using what the manager knows.
+ * Two ways, because the generated one is not always workable in practice. A
+ * random string has to be relayed verbally across a noisy floor and typed on a
+ * tablet by somebody who may not read Latin script fluently; more than one
+ * business has ended up writing those on a wall. So a manager may supply
+ * `newPassword` instead, and it must clear exactly the bar the person's own
+ * password would.
+ *
+ * The security property is the same either way: `must_change_password` is set,
+ * so whatever the manager knows works exactly once. Nothing is stored in
+ * plaintext, and every existing session for that person is ended.
+ *
+ * A generated password is returned once, in this response, and cannot be
+ * retrieved again — a second reset is the only way back. The caller must show
+ * it to the manager; discarding it locks the account until the next reset.
  */
 async function handleResetPassword(request, env) {
   const data = await readBody(request);
@@ -107,7 +117,13 @@ async function handleResetPassword(request, env) {
   const { results } = await d1Query(env, "SELECT id, firstName, lastName FROM staff WHERE id = ?", [String(staffId)]);
   if (!results || !results.length) return json({ ok: false, error: "Staff not found" }, 404);
 
-  const temporary = generateTempPassword();
+  const chosen = data && data.newPassword;
+  if (chosen) {
+    const problem = passwordProblem(chosen);
+    if (problem) return json({ ok: false, error: problem }, 400);
+  }
+
+  const temporary = chosen || generateTempPassword();
   const hash = await hashPassword(temporary);
   await d1Run(
     env,
@@ -122,9 +138,15 @@ async function handleResetPassword(request, env) {
   return json({
     ok: true,
     staffId: String(staffId),
-    temporaryPassword: temporary,
+    // Echoed back only when this endpoint invented it. One the manager chose is
+    // already known to them, and returning it would put a password they typed
+    // into a response body and a log for no benefit.
+    temporaryPassword: chosen ? undefined : temporary,
+    generated: !chosen,
     mustChangePassword: true,
-    note: "Give this to the member of staff in person. It is shown once and cannot be retrieved again.",
+    note: chosen
+      ? "The member of staff must change this the first time they sign in."
+      : "Give this to the member of staff in person. It is shown once and cannot be retrieved again.",
   });
 }
 
