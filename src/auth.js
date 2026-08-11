@@ -177,7 +177,13 @@ const ROLE_ACCESS = {
     write: ['delivery', 'payments', 'tips', 'upload'],
   },
   cleaner: {
-    read: ['waste', 'tables'],
+    // `inventory` is read-only and is what makes their waste worth logging.
+    // Waste that does not name a stock item cannot reduce stock — the Waste
+    // screen falls back to free text without it, so a cleaner clearing a
+    // spoiled tray would record the event and leave the shelf overstated,
+    // which is the exact discrepancy the ledger exists to remove.
+    // Reading stock is not adjusting it; they still hold no inventory write.
+    read: ['waste', 'tables', 'inventory'],
     write: ['waste'],
   },
 
