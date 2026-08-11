@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { roleMayAccess, resourceForPath, actorName } from '../src/auth.js';
+import { roleMayAccess, resourceForPath, actorName, isPrivateImage } from '../src/auth.js';
 
 const GET = 'GET';
 const POST = 'POST';
@@ -238,11 +238,180 @@ describe('cashier', () => {
 });
 
 describe('delivery staff', () => {
-  it('reaches only deliveries', () => {
+  it('reaches deliveries', () => {
     expect(roleMayAccess('delivery-staff', '/api/delivery', GET)).toBe(true);
     expect(roleMayAccess('delivery-staff', '/api/delivery', PUT)).toBe(true);
-    for (const p of ['/api/orders', '/api/tables', '/api/staff', '/api/expenses']) {
+  });
+
+  // A delivery job is a pointer at an order. Without the order the driver has
+  // no items, no total and no way to know whether it is already paid, which is
+  // why the Delivery screen showed an address and nothing else.
+  it('reads the order behind the job', () => {
+    expect(roleMayAccess('delivery-staff', '/api/orders', GET)).toBe(true);
+  });
+
+  // Money taken on the doorstep has to be recordable where it is taken;
+  // otherwise it is written on a hand and typed in later, which is how a round
+  // reconciles short.
+  it('records payments and tips it collects', () => {
+    expect(roleMayAccess('delivery-staff', '/api/payments', POST)).toBe(true);
+    expect(roleMayAccess('delivery-staff', '/api/tips', POST)).toBe(true);
+  });
+
+  it('is still refused everything to do with the business', () => {
+    for (const p of ['/api/tables', '/api/staff', '/api/expenses', '/api/inventory', '/api/audit']) {
       expect(roleMayAccess('delivery-staff', p, GET)).toBe(false);
+    }
+  });
+
+  // Recording is not verifying. The driver reports what they took; the till
+  // checks it. That separation is enforced in the handler, not here, but the
+  // driver must not be able to change the order itself either.
+  it('cannot rewrite the order', () => {
+    expect(roleMayAccess('delivery-staff', '/api/orders', PUT)).toBe(false);
+  });
+});
+
+describe('payment evidence', () => {
+  it('lets the till and the driver attach a screenshot', () => {
+    expect(roleMayAccess('cashier', '/api/upload', POST)).toBe(true);
+    expect(roleMayAccess('delivery-staff', '/api/upload', POST)).toBe(true);
+  });
+
+  it('does not hand the upload endpoint to everyone', () => {
+    for (const role of ['cleaner', 'assistant-chef', 'head-waiter']) {
+      expect(roleMayAccess(role, '/api/upload', POST)).toBe(false);
+    }
+  });
+
+  /**
+   * A transfer screenshot shows an account number, a name and an amount. It
+   * lives in the same R2 bucket as menu photos, and /api/images/ is public so
+   * the website can render those — so without this it would inherit that.
+   *
+   * Keys are unguessable, but "hard to guess" is not an access control: the key
+   * travels in payloads, logs and screenshots of the till.
+   */
+  it('treats a payment image as the payment record it belongs to', () => {
+    expect(resourceForPath('/api/images/payments/1234-abcd-slip.jpg')).toBe('payments');
+    expect(roleMayAccess('cashier', '/api/images/payments/x.jpg', GET)).toBe(true);
+    expect(roleMayAccess('cleaner', '/api/images/payments/x.jpg', GET)).toBe(false);
+  });
+
+  it('leaves menu and gallery images public', () => {
+    expect(isPrivateImage('/api/images/menu/macchiato.jpg')).toBe(false);
+    expect(isPrivateImage('/api/images/uploads/hero.png')).toBe(false);
+  });
+
+  it('recognises a private key even when it is percent-encoded', () => {
+    expect(isPrivateImage('/api/images/payments%2Fslip.jpg')).toBe(true);
+  });
+
+  it('refuses to call a key public when it cannot be decoded', () => {
+    // A malformed escape cannot be shown to be safe, so it is not treated as such.
+    expect(isPrivateImage('/api/images/%E0%A4%A')).toBe(true);
+  });
+});
+
+describe('the accountant', () => {
+  it('reads the whole financial picture', () => {
+    for (const p of ['/api/reports/financial', '/api/payments', '/api/purchases', '/api/payroll', '/api/tips']) {
+      expect(roleMayAccess('accountant', p, GET)).toBe(true);
+    }
+  });
+
+  /**
+   * An accountant who can edit the sales, payments or payroll they are
+   * reconciling is not reconciling anything. Recording a bill that arrived is
+   * bookkeeping and is the one exception.
+   */
+  it('changes almost nothing', () => {
+    expect(roleMayAccess('accountant', '/api/expenses', POST)).toBe(true);
+    for (const p of ['/api/orders', '/api/payments', '/api/payroll', '/api/purchases', '/api/staff']) {
+      expect(roleMayAccess('accountant', p, POST)).toBe(false);
+    }
+  });
+
+  // The tax bands are theirs to advise on; a manager applies them, so the
+  // decision and its audit entry stay with the person answerable for it.
+  it('cannot change the tax bands it advises on', () => {
+    expect(roleMayAccess('accountant', '/api/settings', PUT)).toBe(false);
+  });
+
+  it('has no reach into service operations', () => {
+    expect(roleMayAccess('accountant', '/api/tables', PUT)).toBe(false);
+    expect(roleMayAccess('accountant', '/api/menu', POST)).toBe(false);
+  });
+});
+
+describe('HR and payroll', () => {
+  it('keeps colleague attendance and pay away from the floor', () => {
+    // The matrix is resource-level, not row-level: granting a waiter `leave`
+    // would show them everybody's, not just their own.
+    for (const role of ['head-waiter', 'cashier', 'head-chef', 'delivery-staff', 'cleaner']) {
+      expect(roleMayAccess(role, '/api/payroll', GET)).toBe(false);
+      expect(roleMayAccess(role, '/api/leave', GET)).toBe(false);
+      expect(roleMayAccess(role, '/api/adjustments', GET)).toBe(false);
+    }
+  });
+
+  it('lets the manager and the accountant see it', () => {
+    for (const role of ['manager', 'accountant']) {
+      expect(roleMayAccess(role, '/api/attendance', GET)).toBe(true);
+      expect(roleMayAccess(role, '/api/overtime', GET)).toBe(true);
+    }
+  });
+
+  // Every role needs the service charge and VAT to render a bill; none but the
+  // manager may change them.
+  it('lets any signed-in staff read settings but not write them', () => {
+    for (const role of ['cashier', 'head-waiter', 'head-chef', 'cleaner']) {
+      expect(roleMayAccess(role, '/api/settings', GET)).toBe(true);
+      expect(roleMayAccess(role, '/api/settings', PUT)).toBe(false);
+    }
+  });
+});
+
+describe('reports reach the screens that fetch them', () => {
+  // A Reports or Revenue nav item that opens onto a 403 reads as a broken app.
+  it('is readable by every role with a reporting screen', () => {
+    for (const role of ['manager', 'accountant', 'cashier', 'head-chef', 'head-waiter']) {
+      expect(roleMayAccess(role, '/api/reports/dashboard', GET)).toBe(true);
+    }
+  });
+
+  it('is still refused to roles without one', () => {
+    expect(roleMayAccess('cleaner', '/api/reports/dashboard', GET)).toBe(false);
+    expect(roleMayAccess('delivery-staff', '/api/reports/financial', GET)).toBe(false);
+  });
+});
+
+describe('payments, tips and the audit log', () => {
+  it('lets the cashier take and verify money', () => {
+    expect(roleMayAccess('cashier', '/api/payments', GET)).toBe(true);
+    expect(roleMayAccess('cashier', '/api/payments', POST)).toBe(true);
+  });
+
+  // A waiter sees whether the table has settled but cannot mark it settled.
+  it('lets a waiter read payments and record a tip, but not take payment', () => {
+    expect(roleMayAccess('head-waiter', '/api/payments', GET)).toBe(true);
+    expect(roleMayAccess('head-waiter', '/api/payments', POST)).toBe(false);
+    expect(roleMayAccess('head-waiter', '/api/tips', POST)).toBe(true);
+  });
+
+  it('keeps money away from the kitchen and the cleaner', () => {
+    for (const role of ['head-chef', 'assistant-chef', 'cleaner']) {
+      expect(roleMayAccess(role, '/api/payments', GET)).toBe(false);
+      expect(roleMayAccess(role, '/api/tips', GET)).toBe(false);
+    }
+  });
+
+  // The audit log names everyone. It appears in no role's list, so the default
+  // refusal is what protects it — this asserts that default has not drifted.
+  it('is manager-only', () => {
+    expect(roleMayAccess('manager', '/api/audit', GET)).toBe(true);
+    for (const role of ['cashier', 'head-waiter', 'head-chef', 'delivery-staff', 'cleaner']) {
+      expect(roleMayAccess(role, '/api/audit', GET)).toBe(false);
     }
   });
 });
@@ -293,11 +462,20 @@ describe('defaults', () => {
     }
   });
 
-  it('refuses uploads to everyone but the manager', () => {
-    for (const r of ROLES.filter((x) => x !== 'manager')) {
-      expect(roleMayAccess(r, '/api/upload', POST)).toBe(false);
+  /**
+   * Uploads were manager-only, which was right while the only uploads were menu
+   * and gallery images. Payment evidence changed that: §9 requires a screenshot
+   * against a Telebirr, CBE or bank payment, and it is taken by whoever takes
+   * the money — the cashier at the till, the driver on the doorstep.
+   *
+   * Recording is still not verifying. Only a cashier or manager can verify a
+   * payment, so the driver's evidence is still checked by the till.
+   */
+  it('allows uploads only to the manager and to whoever takes payment', () => {
+    const canUpload = ['manager', 'cashier', 'delivery-staff'];
+    for (const r of ROLES) {
+      expect(roleMayAccess(r, '/api/upload', POST)).toBe(canUpload.includes(r));
     }
-    expect(roleMayAccess('manager', '/api/upload', POST)).toBe(true);
   });
 });
 

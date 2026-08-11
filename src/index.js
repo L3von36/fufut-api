@@ -19,6 +19,14 @@ import { authorize, redactStaffForRole } from './auth.js';
 
 import { handleContent, checkScheduledPublish } from './handlers/content.js';
 import { handleOrders } from './handlers/orders.js';
+import { handlePayments } from './handlers/payments.js';
+import { handleAudit } from './handlers/audit.js';
+import { handleDelivery } from './handlers/delivery.js';
+import { handleRecipes } from './handlers/recipes.js';
+import { handleInventory, handleWaste } from './handlers/inventory.js';
+import { handlePurchases } from './handlers/purchases.js';
+import { handleHR } from './handlers/hr.js';
+import { handleReports } from './handlers/reports.js';
 import { handleReservations } from './handlers/reservations.js';
 import { handleReviews } from './handlers/reviews.js';
 import { handleMenu } from './handlers/menu.js';
@@ -83,7 +91,18 @@ async function route(pathname, method, url, request, env, ctx, auth) {
   }
 
   if (pathname.startsWith('/api/orders')) {
-    const r = await handleOrders(pathname, method, url, request, env);
+    const r = await handleOrders(pathname, method, url, request, env, auth);
+    if (r !== null) return r;
+  }
+  // Payments and tips are separate resources from orders on purpose: a waiter
+  // may take an order and may not verify a bank transfer, and a tip is not
+  // revenue. Gated independently in the role matrix for both reasons.
+  if (pathname.startsWith('/api/payments') || pathname.startsWith('/api/tips')) {
+    const r = await handlePayments(pathname, method, url, request, env, auth);
+    if (r !== null) return r;
+  }
+  if (pathname.startsWith('/api/audit')) {
+    const r = await handleAudit(pathname, method, url, env);
     if (r !== null) return r;
   }
   if (pathname.startsWith('/api/reservations')) {
@@ -100,6 +119,45 @@ async function route(pathname, method, url, request, env, ctx, auth) {
   // fall through whenever the generic handler should do the actual write.
   const tables = await handleTables(pathname, method, url, request, env, auth);
   if (tables !== null) return tables;
+
+  // HR and reporting have no generic-resource equivalent. Both must precede
+  // handleResources only in the sense that they own paths it does not map;
+  // ordering here is for readability.
+  const hr = await handleHR(pathname, method, url, request, env, auth);
+  if (hr !== null) return hr;
+
+  const reports = await handleReports(pathname, method, url, request, env, auth);
+  if (reports !== null) return reports;
+
+  // Recipes and the unit catalogue have no generic-resource equivalent, so
+  // order relative to it does not matter.
+  const recipes = await handleRecipes(pathname, method, url, request, env, auth);
+  if (recipes !== null) return recipes;
+
+  // Must precede handleResources: it owns every route that changes a *quantity*,
+  // and specifically intercepts the direct write to `stock` that used to
+  // overwrite the previous value with no record. Catalogue edits — renaming,
+  // recategorising, setting a reorder point — return null and fall through.
+  const inventory = await handleInventory(pathname, method, url, request, env, auth);
+  if (inventory !== null) return inventory;
+
+  // Must precede handleResources: waste that names a real ingredient now takes
+  // it off the shelf as well as logging it. Free-text legacy waste returns null
+  // and falls through, so the existing screen keeps working unchanged.
+  const waste = await handleWaste(pathname, method, request, env, auth);
+  if (waste !== null) return waste;
+
+  // Must precede handleResources for suppliers: the list is enriched with each
+  // supplier's outstanding balance, which the generic handler cannot compute.
+  const purchases = await handlePurchases(pathname, method, url, request, env, auth);
+  if (purchases !== null) return purchases;
+
+  // Must precede handleResources: it owns the delivery state machine and the
+  // driver's settlement with the cashier. Plain edits to address, phone and eta
+  // return null and fall through to the generic handler, which already does
+  // those correctly.
+  const delivery = await handleDelivery(pathname, method, url, request, env, auth);
+  if (delivery !== null) return delivery;
 
   // Must precede handleResources: that handler writes any column it is given,
   // so a request carrying password_hash would set it directly. Creation and

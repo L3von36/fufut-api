@@ -1,4 +1,17 @@
 import { d1Query, d1Run, json, readBody } from '../lib/db.js';
+import { writeAudit } from '../lib/audit.js';
+import { actorName, isManager } from '../auth.js';
+import { refreshPaymentStatus } from './payments.js';
+import { syncDeliveryToOrderStatus } from './delivery.js';
+import { consumeForOrder, reverseOrderConsumption } from '../lib/ledger.js';
+
+/**
+ * Order states that mean the food was actually made, and therefore that the
+ * ingredients left the shelf. 'ready' is the honest moment; the later states
+ * are included so an order that jumps straight to completed — a takeaway paid
+ * and handed over in one action — is not missed.
+ */
+const CONSUME_ON_STATUS = new Set(['ready', 'served', 'completed', 'fulfilled']);
 import {
   normaliseLines,
   stampColumnFor,
@@ -107,7 +120,188 @@ async function insertOrderItems(env, orderId, items, createdIso) {
   }
 }
 
-async function handleOrders(pathname, method, url, request, env) {
+function round2(n) {
+  return Math.round((Number(n) || 0) * 100) / 100;
+}
+
+/**
+ * Columns the orders table actually has, resolved once per isolate.
+ *
+ * Migration 005 adds seventeen columns. Writing them unconditionally would take
+ * ordering offline for the window between deploying this Worker and applying
+ * the migration, and one try/catch per column — the pattern the `notes` column
+ * used — does not scale to seventeen. Filtering against PRAGMA instead means
+ * the deploy order stops mattering, which is the property that was actually
+ * wanted both times.
+ *
+ * Cached because the schema cannot change under a running isolate; a cold start
+ * after the migration picks up the new columns.
+ */
+let ORDER_COLUMNS = null;
+async function orderColumns(env) {
+  if (ORDER_COLUMNS) return ORDER_COLUMNS;
+  const { results } = await d1Query(env, "PRAGMA table_info(orders)");
+  ORDER_COLUMNS = (results || []).map((c) => c.name);
+  return ORDER_COLUMNS;
+}
+
+/** Test seam: forget the cached schema. */
+function resetOrderColumns() {
+  ORDER_COLUMNS = null;
+}
+
+/**
+ * Turn the POS's `paymentBreakdown` into real payment rows.
+ *
+ * The POS has always sent this array — `[{method, amount}, …]` for a split bill,
+ * a single entry otherwise. The API collapsed it to the string "cash+telebirr"
+ * on `orders.payment`, so the amount per method was lost at the door and
+ * per-method revenue could not be reported.
+ *
+ * `orders.payment` is still written, unchanged, because the receipt and several
+ * screens read it. It is now a summary of these rows.
+ *
+ * Never throws: a guest who has paid must not be told their order failed.
+ */
+async function recordSubmittedPayments(env, auth, orderId, data) {
+  const breakdown = Array.isArray(data.paymentBreakdown) ? data.paymentBreakdown : [];
+  // An order can be created before it is paid — a waiter sending food to the
+  // kitchen, a delivery going out on account. No breakdown simply means no
+  // money has changed hands yet.
+  if (!breakdown.length) return { inserted: 0, warning: null };
+
+  try {
+    const nowIso = new Date().toISOString();
+    const statements = breakdown
+      .filter((p) => p && Number(p.amount))
+      .map((p) => {
+        const method = String(p.method || "cash").toLowerCase();
+        // A transfer is only settled once somebody has seen the evidence.
+        const status = ["telebirr", "cbe", "bank"].includes(method) ? "recorded" : "verified";
+        return env.DB.prepare(
+          `INSERT INTO payments
+             (id, order_id, method, amount, tendered, change_due, reference, evidence_key,
+              status, collected_by, collected_by_name, verified_by, verified_by_name,
+              verified_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(
+          "PM" + crypto.randomUUID().slice(0, 10),
+          orderId,
+          method,
+          round2(p.amount),
+          p.tendered !== undefined ? round2(p.tendered) : null,
+          p.change !== undefined ? round2(p.change) : null,
+          p.reference || null,
+          p.evidenceKey || null,
+          status,
+          (auth && auth.staff_id) || null,
+          auth ? actorName(auth) : null,
+          status === "verified" ? (auth && auth.staff_id) || null : null,
+          status === "verified" ? (auth ? actorName(auth) : null) : null,
+          status === "verified" ? nowIso : null,
+          nowIso
+        );
+      });
+
+    if (!statements.length) return { inserted: 0, warning: null };
+    await env.DB.batch(statements);
+    await refreshPaymentStatus(env, orderId);
+    return { inserted: statements.length, warning: null };
+  } catch (e) {
+    return {
+      inserted: 0,
+      warning: `Order saved, but the payment record was not written: ${String(e.message || e)}`,
+    };
+  }
+}
+
+/**
+ * Record the tip against the person who earned it.
+ *
+ * `orders.tip` says what was added to the bill; this says who is owed it, which
+ * is the question the manager actually asks. The tip is attributed to whoever
+ * took the order, which is right for a waiter closing their own table — a
+ * delivery tip is reassigned to the driver when the round is settled.
+ */
+async function recordSubmittedTip(env, auth, orderId, data, tip, orderType) {
+  if (!tip || tip <= 0) return { inserted: 0, warning: null };
+  try {
+    const nowIso = new Date().toISOString();
+    let staffName = auth ? actorName(auth) : null;
+    await d1Run(
+      env,
+      `INSERT INTO tips
+         (id, order_id, staff_id, staff_name, amount, method, status, source, date, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'recorded', ?, ?, ?)`,
+      [
+        "TP" + crypto.randomUUID().slice(0, 10),
+        orderId,
+        (auth && auth.staff_id) || null,
+        staffName,
+        tip,
+        data.payment ? String(data.payment).split("+")[0].toLowerCase() : null,
+        orderType || null,
+        nowIso.slice(0, 10),
+        nowIso,
+      ]
+    );
+    return { inserted: 1, warning: null };
+  } catch (e) {
+    return {
+      inserted: 0,
+      warning: `Order saved, but the tip was not recorded: ${String(e.message || e)}`,
+    };
+  }
+}
+
+/**
+ * Create the delivery job that a delivery order implies.
+ *
+ * This is the fix for the gap that made delivery non-functional: `orders.type`
+ * could be 'delivery' and the `delivery` table existed with every column it
+ * needed, but nothing ever wrote a row. A delivery order taken at the till
+ * never appeared on the Delivery screen, so there was no way to assign a
+ * driver, no address in front of anyone, and no record of the money coming
+ * back.
+ *
+ * One order produces one delivery job, keyed by the order id, so a retried
+ * submission cannot put the same food on the road twice.
+ */
+async function createDeliveryJob(env, auth, orderId, data, orderType) {
+  if (orderType !== "delivery") return { id: null, warning: null };
+  try {
+    const { results } = await d1Query(env, "SELECT id FROM delivery WHERE orderId = ?", [orderId]);
+    if (results && results.length) return { id: results[0].id, warning: null };
+
+    const nowIso = new Date().toISOString();
+    const id = "DL" + crypto.randomUUID().slice(0, 7);
+    await d1Run(
+      env,
+      `INSERT INTO delivery
+         (id, orderId, customer, address, phone, notes, status, fee, payment_status, created, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'new', ?, 'unpaid', ?, ?)`,
+      [
+        id,
+        orderId,
+        data.customer || data.name || "Walk-in",
+        data.address || data.deliveryAddress || "",
+        data.customerPhone || data.phone || "",
+        data.deliveryNotes || data.notes || "",
+        round2(data.deliveryFee),
+        nowIso,
+        nowIso,
+      ]
+    );
+    return { id, warning: null };
+  } catch (e) {
+    return {
+      id: null,
+      warning: `Order saved, but the delivery job was not created: ${String(e.message || e)}`,
+    };
+  }
+}
+
+async function handleOrders(pathname, method, url, request, env, auth) {
   const m = method.toUpperCase();
   const sub = pathname.replace(/^\/api\/orders/, "");
   if (m === "GET" && sub === "") {
@@ -130,33 +324,56 @@ async function handleOrders(pathname, method, url, request, env) {
       const items = typeof data.items === "string" ? data.items : JSON.stringify(data.items || []);
       const tableId = data.tableNum || data.table_number || data.table_id || null;
       const notes = typeof data.notes === "string" ? data.notes.trim() : "";
-      const base = [id, items, Number(data.total) || 0, data.payment || null, data.order_type || data.type || null, tableId, data.name || data.customer || null, data.status || "new", data.email || ""];
-      // The POS checkout has an order-notes field intended for allergies and prep
-      // instructions ("no dairy - allergy"). It was serialized into the payload but
-      // the orders table had no column for it, so it was silently dropped before
-      // reaching the kitchen.
+      const nowIso = new Date().toISOString();
+      const orderType = data.order_type || data.type || null;
+      const tip = round2(data.tip);
+
+      // Every field the POS has always sent. Before this, ten of them were
+      // written and the rest — subtotal, discount, discount_reason, tip — were
+      // read off the wire and dropped, so a tip taken on the floor left no
+      // trace anywhere in the system.
       //
-      // The write is attempted with `notes` and retried without it if the column is
-      // not present yet. That keeps order creation working either side of the
-      // `ALTER TABLE orders ADD COLUMN notes TEXT` migration, so deploy order
-      // cannot take ordering offline.
-      try {
-        await d1Run(
-          env,
-          "INSERT INTO orders (id, items, total, payment, type, table_id, customer, status, email, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-          [...base, notes]
-        );
-      } catch (e) {
-        // SQLite reports exactly: "table orders has no column named notes".
-        // Match only that shape — a broader test would swallow unrelated write
-        // failures and silently drop the note instead of surfacing the error.
-        if (!/has no column named|no such column/i.test(String(e && e.message))) throw e;
-        await d1Run(
-          env,
-          "INSERT INTO orders (id, items, total, payment, type, table_id, customer, status, email) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-          base
-        );
-      }
+      // The write is filtered against the columns the table actually has
+      // (see orderColumns), which replaces the previous insert-and-retry: with
+      // this many new columns, one try/catch per column would be unreadable,
+      // and the filter keeps ordering working either side of migration 005.
+      const row = {
+        id,
+        items,
+        total: round2(data.total),
+        payment: data.payment || null,
+        type: orderType,
+        table_id: tableId,
+        customer: data.name || data.customer || null,
+        status: data.status || "new",
+        email: data.email || "",
+        notes,
+        subtotal: data.subtotal !== undefined ? round2(data.subtotal) : round2(data.total),
+        discount: round2(data.discount),
+        discount_type: data.discountType || data.discount_type || null,
+        discount_reason: data.discountReason || data.discount_reason || null,
+        tip,
+        tip_type: data.tipType || data.tip_type || null,
+        service_charge: round2(data.serviceCharge),
+        tax: round2(data.tax),
+        delivery_fee: round2(data.deliveryFee),
+        customer_phone: data.customerPhone || data.phone || null,
+        // A takeaway is waiting at the counter from the moment it is taken; a
+        // dine-in or delivery order has no pickup stage at all.
+        pickup_status: orderType === "takeaway" ? "awaiting" : null,
+        payment_status: "unpaid",
+        created_by: (auth && auth.staff_id) || null,
+        created_by_name: auth ? actorName(auth) : null,
+      };
+
+      const cols = await orderColumns(env);
+      const writable = Object.keys(row).filter((c) => cols.includes(c));
+      await d1Run(
+        env,
+        `INSERT INTO orders (${writable.join(", ")}) VALUES (${writable.map(() => "?").join(", ")})`,
+        writable.map((c) => row[c])
+      );
+
       // orderItems is the structured cart the POS already sends alongside the
       // human-readable items string; it is preferred because it carries the
       // menu id, the unit price and the modifiers. Falling back to items keeps
@@ -165,9 +382,46 @@ async function handleOrders(pathname, method, url, request, env) {
         env,
         id,
         data.orderItems || data.order_items || data.items,
-        new Date().toISOString()
+        nowIso
       );
-      return json({ ok: true, id, items: tracking.inserted, warning: tracking.warning || undefined });
+
+      // Payments, the tip and the delivery job are all consequences of the
+      // order existing, and none of them may take ordering offline if they
+      // fail — same reasoning as insertOrderItems above. Each returns a warning
+      // rather than throwing.
+      const followUps = [];
+      const payments = await recordSubmittedPayments(env, auth, id, data);
+      if (payments.warning) followUps.push(payments.warning);
+
+      const tipResult = await recordSubmittedTip(env, auth, id, data, tip, orderType);
+      if (tipResult.warning) followUps.push(tipResult.warning);
+
+      const delivery = await createDeliveryJob(env, auth, id, data, orderType);
+      if (delivery.warning) followUps.push(delivery.warning);
+
+      await writeAudit(env, auth, {
+        action: "create",
+        entity: "orders",
+        entityId: id,
+        after: {
+          type: orderType,
+          table_id: tableId,
+          total: row.total,
+          subtotal: row.subtotal,
+          discount: row.discount,
+          tip: row.tip,
+        },
+      });
+
+      const warnings = [tracking.warning, ...followUps].filter(Boolean);
+      return json({
+        ok: true,
+        id,
+        items: tracking.inserted,
+        payments: payments.inserted,
+        deliveryId: delivery.id || undefined,
+        warning: warnings.length ? warnings.join(" ") : undefined,
+      });
     } catch (e) {
       return json({ ok: false, error: String(e.message || e) }, 500);
     }
@@ -272,6 +526,16 @@ async function handleOrders(pathname, method, url, request, env) {
     const fields = [];
     const values = [];
     const nowIso = new Date().toISOString();
+    let consumptionWarning = null;
+
+    // Read first, so the audit entry can say what the value was. §37 asks for
+    // the previous value on a change, and a discount or a price amendment is
+    // exactly the case where "it used to be" is the whole question.
+    const { results: prior } = await d1Query(env, "SELECT * FROM orders WHERE id = ?", [id]);
+    const before = (prior && prior[0]) || null;
+    if (before && before.voided_at) {
+      return json({ ok: false, error: "Order has been voided and cannot be changed" }, 409);
+    }
     if (data.status !== void 0) {
       fields.push("status = ?");
       values.push(data.status);
@@ -317,6 +581,35 @@ async function handleOrders(pathname, method, url, request, env) {
       fields.push("notes = ?");
       values.push(typeof data.notes === "string" ? data.notes.trim() : "");
     }
+    // Amending a bill after it has been opened: a discount applied at the till,
+    // a tip added when the guest pays, a delivery fee agreed on the phone.
+    // Filtered against the live schema so this works either side of migration
+    // 005, for the same reason the INSERT is.
+    const editableMoney = {
+      subtotal: data.subtotal,
+      discount: data.discount,
+      discount_type: data.discountType ?? data.discount_type,
+      discount_reason: data.discountReason ?? data.discount_reason,
+      tip: data.tip,
+      tip_type: data.tipType ?? data.tip_type,
+      service_charge: data.serviceCharge ?? data.service_charge,
+      tax: data.tax,
+      delivery_fee: data.deliveryFee ?? data.delivery_fee,
+      customer_phone: data.customerPhone ?? data.customer_phone,
+      pickup_status: data.pickupStatus ?? data.pickup_status,
+    };
+    const liveCols = await orderColumns(env);
+    for (const [col, val] of Object.entries(editableMoney)) {
+      if (val === void 0 || !liveCols.includes(col)) continue;
+      fields.push(`${col} = ?`);
+      values.push(typeof val === "string" ? val : round2(val));
+    }
+    // A takeaway handed over is picked up; stamping it here means the counter
+    // does not need a second call to close the order out.
+    if (data.pickupStatus === "collected" && liveCols.includes("picked_up_at")) {
+      fields.push("picked_up_at = COALESCE(picked_up_at, ?)");
+      values.push(nowIso);
+    }
     if (fields.length === 0) return json({ ok: false, error: "No fields to update" }, 400);
     fields.push("updated_at = ?");
     values.push(nowIso);
@@ -346,14 +639,128 @@ async function handleOrders(pathname, method, url, request, env) {
       }
     }
 
-    return json({ ok: true, updated_at: nowIso });
+    // The chef marking food ready is what should put a delivery in front of a
+    // driver. Before this, somebody had to remember to move the job by hand on
+    // a second screen, which is the kind of step that gets skipped at 8pm.
+    if (data.status !== void 0) {
+      await syncDeliveryToOrderStatus(env, id, data.status);
+    }
+
+    // ── Sale → recipe → ingredient consumption ──────────────────────────────
+    // Posted when the kitchen marks the food ready, because that is the moment
+    // the ingredients were physically used. Waiting for payment would leave the
+    // shelf wrong for as long as a table sits, and posting at order time would
+    // deduct for food that is later cancelled.
+    //
+    // Idempotent via orders.consumed_at, so a second tap on "Ready" cannot
+    // deduct twice — the double-deduction failure in §56.
+    if (data.status !== void 0 && CONSUME_ON_STATUS.has(String(data.status).toLowerCase())) {
+      const consumed = await consumeForOrder(env, auth, id);
+      if (!consumed.ok) {
+        // Never fails the status change. The kitchen must be able to say food
+        // is ready whatever the stock records think, and a warning that
+        // reaches the manager is the right escalation — not a blocked pass.
+        consumptionWarning = consumed.error;
+      } else if (consumed.warnings && consumed.warnings.length) {
+        consumptionWarning = consumed.warnings.join('; ');
+      }
+    }
+
+    // The bill changed, so what is owed on it changed. Derived rather than
+    // assumed, so an order cannot end up marked paid without payments behind it.
+    if (data.total !== void 0 || data.tip !== void 0 || data.discount !== void 0) {
+      try { await refreshPaymentStatus(env, id); } catch { /* status is recomputed on next read */ }
+    }
+
+    await writeAudit(env, auth, {
+      action: "update",
+      entity: "orders",
+      entityId: id,
+      before,
+      after: Object.fromEntries(
+        fields
+          .map((f, i) => [f.split(" ")[0], values[i]])
+          .filter(([c]) => c !== "updated_at")
+      ),
+    });
+
+    return json({ ok: true, updated_at: nowIso, warning: consumptionWarning || undefined });
   }
+  // DELETE voids the order; it does not remove it.
+  //
+  // The row is a sale, and it owns its lines, its payments and (once the recipe
+  // engine posts) its stock consumption. Deleting it destroyed all of that in
+  // one statement with nothing recorded — a cancelled order is still a fact
+  // about the day's trading and the accountant has to be able to see it. §37 of
+  // the spec requires void/reverse over deletion for exactly this reason.
   if (m === "DELETE" && sub.startsWith("/")) {
     const id = sub.slice(1);
-    const { meta } = await d1Run(env, "DELETE FROM orders WHERE id = ?", [id]);
-    if (!meta.changes) return json({ ok: false, error: "Order not found" }, 404);
-    return json({ ok: true });
+    let body = null;
+    try { body = await readBody(request); } catch { /* DELETE commonly has no body */ }
+    const reason = body && body.reason ? String(body.reason).trim() : "";
+
+    const { results } = await d1Query(env, "SELECT * FROM orders WHERE id = ?", [id]);
+    const order = results && results[0];
+    if (!order) return json({ ok: false, error: "Order not found" }, 404);
+    if (order.voided_at) return json({ ok: false, error: "Order is already voided" }, 409);
+
+    // Money already taken has to be dealt with deliberately. Voiding around it
+    // would leave payments attached to an order that no longer counts, which is
+    // how a till reconciles short with nothing to point at.
+    const { results: pays } = await d1Query(
+      env,
+      "SELECT id, amount FROM payments WHERE order_id = ? AND status <> 'rejected'",
+      [id]
+    );
+    const taken = (pays || []).reduce((s, p) => s + (Number(p.amount) || 0), 0);
+    if (Math.round(taken * 100) / 100 > 0 && !isManager((auth && (auth.sessionRole || auth.role)) || "")) {
+      return json(
+        { ok: false, error: "This order has been paid. A manager must refund it before voiding." },
+        409
+      );
+    }
+
+    const nowIso = new Date().toISOString();
+    await d1Run(
+      env,
+      `UPDATE orders
+          SET status = 'cancelled', voided_at = ?, voided_by = ?, void_reason = ?, updated_at = ?
+        WHERE id = ?`,
+      [nowIso, auth ? actorName(auth) : null, reason || null, nowIso, id]
+    );
+    // The lines go with it, so the kitchen board clears and the timing report
+    // does not average in food that was never served.
+    await d1Run(
+      env,
+      "UPDATE order_items SET status = 'cancelled' WHERE order_id = ? AND status <> 'served'",
+      [id]
+    );
+    await d1Run(env, "UPDATE delivery SET status = 'cancelled', cancelled_at = ?, updated_at = ? WHERE orderId = ?", [
+      nowIso, nowIso, id,
+    ]);
+
+    // Put back what the order took. A reversal rather than a deletion: the
+    // original sale movements stay and matching positive rows are added, so the
+    // ledger shows the stock going out and coming back, which is what happened.
+    // Food already cooked is not recovered, so this is the manager's call —
+    // `keepConsumption` leaves the deduction standing and the waste visible.
+    let restocked = 0;
+    if (!body || !body.keepConsumption) {
+      const reversal = await reverseOrderConsumption(env, auth, id, reason || 'Order voided');
+      restocked = reversal.posted || 0;
+    }
+
+    await writeAudit(env, auth, {
+      action: "void",
+      entity: "orders",
+      entityId: id,
+      before: { status: order.status, total: order.total },
+      after: { status: "cancelled", voided_at: nowIso },
+      reason: reason || null,
+    });
+
+    return json({ ok: true, voided: true, id, restocked });
   }
   return null;
 }
-export { mapOrderRow, handleOrders };
+export { mapOrderRow, handleOrders, resetOrderColumns, round2 };

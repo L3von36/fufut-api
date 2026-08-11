@@ -45,6 +45,8 @@ const PUBLIC = [
   { method: 'GET', exact: '/api/menu' },
   { method: 'GET', exact: '/api/menus' },
   { method: 'GET', exact: '/api/reviews' },
+  // Menu and gallery images, which the public website renders. Payment evidence
+  // also lives in R2 and must NOT be reachable this way — see isPrivateImage.
   { method: 'GET', prefix: '/api/images/' },
 
   // Anonymous customer actions from the website. Removing these breaks online
@@ -65,6 +67,12 @@ const MANAGER_ONLY = [
   { method: 'DELETE', prefix: '/api/staff' },
   // Issuing somebody else a new password is an account takeover in one call.
   { method: 'POST', exact: '/api/auth/reset-password' },
+  // Tax bands, pension rates and overtime multipliers. Changing one silently
+  // changes what every future payslip pays out, so it stays with the person
+  // answerable for it — and the change is audited.
+  { method: 'PUT', prefix: '/api/settings' },
+  // Running payroll commits the business to paying people.
+  { method: 'POST', exact: '/api/payroll/run' },
 ];
 
 /**
@@ -84,7 +92,14 @@ const PASSWORD_CHANGE_ALLOWED = new Set([
  * Session housekeeping, plus the shared catalogue and CMS reads that the app
  * chrome needs on every screen.
  */
-const ANY_STAFF_READ = new Set(['menu', 'content', 'gallery', 'reviews']);
+// `units` is a static catalogue of grams, litres and pieces — the same list the
+// conversion engine uses. It carries no business data, and gating it would mean
+// a recipe editor whose unit dropdown is empty for some roles.
+// `settings` is readable by any signed-in member of staff because the checkout
+// needs the service charge and VAT to compute a bill, and the kitchen screens
+// need the grace period. Writing it is manager-only (see MANAGER_ONLY), which
+// is where the control belongs — the values are business policy, not secrets.
+const ANY_STAFF_READ = new Set(['menu', 'content', 'gallery', 'reviews', 'units', 'settings']);
 
 /**
  * Resource access per role.
@@ -103,36 +118,89 @@ const ROLE_ACCESS = {
   manager: { read: '*', write: '*' },
 
   'head-chef': {
-    read: ['orders', 'inventory', 'waste', 'expenses'],
+    // Recipes, stock movements and suppliers all belong to the person who owns
+    // food cost. Purchases are readable — they need to see what arrived and at
+    // what price — but committing spend stays with the manager.
+    read: ['orders', 'inventory', 'waste', 'expenses', 'recipes', 'units', 'suppliers', 'purchases'],
     // menu-availability lets them 86 a dish that has run out. The menu itself
     // stays manager-only, so pricing is untouched.
-    write: ['orders', 'inventory', 'waste', 'menu-availability'],
+    write: ['orders', 'inventory', 'waste', 'menu-availability', 'recipes'],
   },
   // Reads stock, does not own it. Monitoring levels, ordering supplies and
   // controlling food cost belong to the head chef; an assistant executes
   // against those counts, and two people adjusting the same figures is how a
   // stock take stops reconciling.
   'assistant-chef': {
-    read: ['orders', 'inventory'],
+    // Reads recipes because they cook from them; writes none of it, for the
+    // same reason they do not own the stock counts.
+    read: ['orders', 'inventory', 'recipes', 'units'],
     write: ['orders'],
   },
   'head-waiter': {
-    read: ['orders', 'tables', 'reservations'],
-    write: ['orders', 'tables', 'reservations'],
+    // Reads payments to see whether a table has settled before clearing it, and
+    // writes tips because a tip left on the table is theirs to record. Cannot
+    // write payments: taking the money is the cashier's, and a floor tablet
+    // that can mark a bill paid is a hole with no compensating control.
+    read: ['orders', 'tables', 'reservations', 'payments', 'tips'],
+    write: ['orders', 'tables', 'reservations', 'tips'],
   },
   cashier: {
-    read: ['orders', 'tables', 'reservations', 'expenses', 'staff', 'timeclock', 'cashdrawer'],
-    write: ['orders', 'tables', 'reservations', 'timeclock', 'cashdrawer'],
+    read: ['orders', 'tables', 'reservations', 'expenses', 'staff', 'timeclock', 'cashdrawer', 'payments', 'tips', 'delivery'],
+    // `upload` is the transfer screenshot that §9 requires against a Telebirr,
+    // CBE or bank payment. Without it the evidence has nowhere to go and the
+    // verification step has nothing to verify against.
+    write: ['orders', 'tables', 'reservations', 'timeclock', 'cashdrawer', 'payments', 'tips', 'delivery', 'upload'],
   },
+  // A driver needs the order behind the job — what is in the bag, what it comes
+  // to, and whether it is already paid — plus a way to record the cash or the
+  // transfer taken on the doorstep and the tip that came with it. Recording is
+  // not verifying: /payments/:id/verify refuses every role but cashier and
+  // manager, so the money the driver reports is still checked by the till when
+  // they get back.
   'delivery-staff': {
-    read: ['delivery'],
-    write: ['delivery'],
+    read: ['delivery', 'orders', 'payments', 'tips'],
+    // Uploads for the same reason as the cashier: the screenshot is taken on
+    // the doorstep, and a driver who can record a transfer but not photograph
+    // it has to write the reference on their hand and type it in later.
+    write: ['delivery', 'payments', 'tips', 'upload'],
   },
   cleaner: {
     read: ['waste', 'tables'],
     write: ['waste'],
   },
+
+  /**
+   * Accountant — §47 and §51. Reads the whole financial picture and changes
+   * almost none of it.
+   *
+   * Writes only `expenses`, because recording a bill that arrived is
+   * bookkeeping. Everything else is read-only on purpose: an accountant who can
+   * edit the sales, the payments or the payroll they are reconciling is not
+   * reconciling anything. They cannot reach `settings` either — the tax bands
+   * are theirs to *advise* on, and a manager applies them, which keeps the
+   * decision and the audit entry with the person answerable for it.
+   */
+  accountant: {
+    read: [
+      'reports', 'orders', 'payments', 'tips', 'expenses', 'purchases', 'suppliers',
+      'staff', 'attendance', 'overtime', 'leave', 'adjustments', 'payroll',
+      'inventory', 'cashdrawer', 'timeclock', 'shifts', 'audit',
+    ],
+    write: ['expenses'],
+  },
 };
+
+/**
+ * Resources every role that has a Reports or Revenue screen must be able to
+ * read, or those screens render empty.
+ *
+ * Kept as a separate list rather than repeated per role, because the failure it
+ * prevents — a nav item that opens onto nothing — is the one this matrix has
+ * already caused once.
+ */
+for (const role of ['cashier', 'head-chef', 'head-waiter']) {
+  ROLE_ACCESS[role].read.push('reports');
+}
 
 /**
  * The resource a path acts on.
@@ -148,6 +216,12 @@ export function resourceForPath(pathname) {
   if (parts[0] !== 'api' || parts.length < 2) return null;
 
   const head = parts[1];
+  // A payment screenshot is part of the payment record, so whoever may write a
+  // payment may attach evidence to it and whoever may read one may look at it.
+  // Gating it as its own resource would mean maintaining two lists that have to
+  // agree, and the failure when they drift is a driver who can record a
+  // transfer but cannot photograph it.
+  if (head === 'images' && isPrivateImage(pathname)) return 'payments';
   // Marking a dish unavailable is its own resource, so the head chef can 86
   // something without being granted the menu - which is where price, cost and
   // margin live. The endpoint itself reads only `available`, so this grant
@@ -208,6 +282,31 @@ export function roleMayAccess(role, pathname, method) {
   return Array.isArray(allowed) && allowed.includes(resource);
 }
 
+/**
+ * Image keys that must never be served to an anonymous request.
+ *
+ * `/api/images/` is public because the website renders menu and gallery photos
+ * from it. Payment evidence is stored in the same bucket and would inherit that
+ * — a transfer screenshot shows an account number, a name and an amount, and
+ * anyone holding the key could fetch it without signing in.
+ *
+ * Keys are opaque and unguessable, but "hard to guess" is not an access
+ * control: the key travels in payloads, logs and screenshots of the till.
+ */
+const PRIVATE_IMAGE_PREFIXES = ['payments/', 'receipts/'];
+
+export function isPrivateImage(pathname) {
+  if (!pathname.startsWith('/api/images/')) return false;
+  let key = pathname.slice('/api/images/'.length);
+  try {
+    key = decodeURIComponent(key);
+  } catch {
+    // A malformed escape cannot be decoded, so it cannot be shown to be public.
+    return true;
+  }
+  return PRIVATE_IMAGE_PREFIXES.some((p) => key.startsWith(p));
+}
+
 function matches(rules, pathname, method) {
   return rules.some((r) => {
     if (r.method && r.method !== method) return false;
@@ -227,7 +326,9 @@ function isManager(role) {
  * @returns {{ok: true, auth: object|null} | {ok: false, response: Response}}
  */
 export async function authorize(request, env, pathname, method) {
-  if (matches(PUBLIC, pathname, method)) {
+  // Checked before the public list, so a private key cannot be let through by
+  // the broad /api/images/ prefix rule.
+  if (matches(PUBLIC, pathname, method) && !isPrivateImage(pathname)) {
     return { ok: true, auth: null };
   }
 
