@@ -60,8 +60,14 @@ async function handleStaff(pathname, method, request, env) {
     fields.id = id;
     fields.created = now();
     fields.password_hash = await hashPassword(initial);
-    // Whoever set it is not the person who will use it, so it must be replaced.
-    fields.must_change_password = 1;
+    // Not set. The flag exists to force the holder to replace a password
+    // somebody else chose — but staff can no longer change their own, so
+    // setting it would refuse the account every endpoint including the only
+    // route it is permitted, leaving it unable to do anything at all.
+    //
+    // The manager owns the credential for its whole life now, so replacement is
+    // a reset, not a self-service change.
+    fields.must_change_password = 0;
     fields.password_set_at = new Date().toISOString();
 
     const cols = Object.keys(fields);

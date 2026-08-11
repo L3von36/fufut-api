@@ -125,9 +125,13 @@ async function handleResetPassword(request, env) {
 
   const temporary = chosen || generateTempPassword();
   const hash = await hashPassword(temporary);
+  // must_change_password stays 0: staff cannot change their own password, so
+  // forcing them to would refuse the account every endpoint including the only
+  // route it is allowed. The manager owns the credential for its whole life,
+  // and replacing it is another reset rather than a self-service change.
   await d1Run(
     env,
-    "UPDATE staff SET password_hash = ?, must_change_password = 1, password_set_at = ? WHERE id = ?",
+    "UPDATE staff SET password_hash = ?, must_change_password = 0, password_set_at = ? WHERE id = ?",
     [hash, new Date().toISOString(), String(staffId)]
   );
 

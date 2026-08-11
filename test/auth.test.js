@@ -119,11 +119,37 @@ describe('forced password change', () => {
   });
 
   it.each([
-    ['POST', '/api/auth/change-password'],
     ['POST', '/api/auth/logout'],
     ['GET', '/api/auth/me'],
   ])('still allows %s %s', async (m, p) => {
     const d = await decide(p, m, pending);
+    expect(d.ok).toBe(true);
+  });
+
+  /**
+   * The trap the manager-owns-passwords policy creates, pinned deliberately.
+   *
+   * change-password is now MANAGER_ONLY, which is checked *before* the
+   * must_change_password block. So an ordinary account carrying the flag is
+   * refused every route in the system including the only one it used to be
+   * allowed — it can log out and check who it is, and nothing else.
+   *
+   * That is why cfg-004 clears the flag and why staff.js and session.js no
+   * longer set it. If this test ever starts failing because the flag is being
+   * set again, accounts are being bricked at the moment of creation.
+   */
+  it('leaves a flagged non-manager with no way to rescue itself', async () => {
+    const d = await decide('/api/auth/change-password', 'POST', pending);
+    expect(d.ok).toBe(false);
+    expect(d.response.status).toBe(403);
+  });
+
+  // A manager clears MANAGER_ONLY, so the flag still behaves as it always did
+  // for them: one permitted action, and it is the useful one.
+  it('still lets a flagged manager change their own password', async () => {
+    const d = await decide('/api/auth/change-password', 'POST', {
+      staff_id: 'S4', sessionRole: 'Manager', must_change_password: 1,
+    });
     expect(d.ok).toBe(true);
   });
 

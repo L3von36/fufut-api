@@ -67,6 +67,18 @@ const MANAGER_ONLY = [
   { method: 'DELETE', prefix: '/api/staff' },
   // Issuing somebody else a new password is an account takeover in one call.
   { method: 'POST', exact: '/api/auth/reset-password' },
+  // Changing a password at all, including one's own.
+  //
+  // The business's decision: the manager provisions every credential and staff
+  // do not alter them. That is a deliberate trade — it removes self-service
+  // rotation and means the manager knows every password, in exchange for one
+  // person being accountable for who can get into the till.
+  //
+  // It only works because `must_change_password` is no longer set (see
+  // handlers/staff.js and session.js). With that flag set and this route
+  // manager-only, an ordinary account would be refused every endpoint including
+  // the one route it is allowed, and would be unable to do anything at all.
+  { method: 'POST', exact: '/api/auth/change-password' },
   // Tax bands, pension rates and overtime multipliers. Changing one silently
   // changes what every future payslip pays out, so it stays with the person
   // answerable for it — and the change is audited.
@@ -249,15 +261,17 @@ export function actorName(auth) {
 
 /**
  * Session housekeeping is never role-gated; it is how a role is known at all.
- * Changing your own password belongs here too: no role's resource list contains
- * `auth`, so without this the matrix would refuse the one action a person with a
- * pending password change is required to perform - locking out every account.
+ *
+ * `change-password` used to be here, so anybody signed in could change their
+ * own. It is now manager-only (see MANAGER_ONLY) at the business's decision:
+ * the manager provisions every credential. It is checked before this function
+ * runs, so listing it here would have no effect either way — but leaving it
+ * would misdescribe the rule to the next reader.
  */
-function isSessionRoute(pathname) {
+export function isSessionRoute(pathname) {
   return (
     pathname === '/api/auth/me' ||
-    pathname === '/api/auth/logout' ||
-    pathname === '/api/auth/change-password'
+    pathname === '/api/auth/logout'
   );
 }
 

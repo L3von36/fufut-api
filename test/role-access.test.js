@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { roleMayAccess, resourceForPath, actorName, isPrivateImage } from '../src/auth.js';
+import { roleMayAccess, resourceForPath, actorName, isPrivateImage, isSessionRoute } from '../src/auth.js';
 
 const GET = 'GET';
 const POST = 'POST';
@@ -269,6 +269,54 @@ describe('delivery staff', () => {
   // driver must not be able to change the order itself either.
   it('cannot rewrite the order', () => {
     expect(roleMayAccess('delivery-staff', '/api/orders', PUT)).toBe(false);
+  });
+});
+
+/**
+ * The manager provisions every credential; staff do not alter them. A
+ * deliberate trade — no self-service rotation, and the manager knows every
+ * password, in exchange for one person being accountable for who can reach the
+ * till.
+ */
+describe('password policy', () => {
+  it('lets nobody but a manager create or edit an account', () => {
+    for (const role of ['cashier', 'head-waiter', 'head-chef', 'delivery-staff', 'cleaner', 'accountant']) {
+      expect(roleMayAccess(role, '/api/staff', POST)).toBe(false);
+      expect(roleMayAccess(role, '/api/staff', PUT)).toBe(false);
+    }
+  });
+
+  it('lets nobody but a manager set a password', () => {
+    // Both routes are in MANAGER_ONLY, which is checked before the role matrix,
+    // so this asserts the matrix does not quietly grant `auth` to anybody.
+    for (const role of ['cashier', 'head-waiter', 'head-chef', 'delivery-staff', 'cleaner', 'accountant']) {
+      expect(roleMayAccess(role, '/api/auth/reset-password', POST)).toBe(false);
+      expect(roleMayAccess(role, '/api/auth/change-password', POST)).toBe(false);
+    }
+  });
+
+  /**
+   * Signing out and asking who you are must never depend on what you may
+   * reach, or a role with a narrow matrix could not end its own session.
+   */
+  it('still lets anyone sign out and check who they are', () => {
+    for (const role of ['cashier', 'cleaner', 'delivery-staff']) {
+      expect(roleMayAccess(role, '/api/auth/logout', POST)).toBe(false);
+    }
+    // Those two are handled by isSessionRoute ahead of the matrix, not by it.
+    expect(isSessionRoute('/api/auth/logout')).toBe(true);
+    expect(isSessionRoute('/api/auth/me')).toBe(true);
+  });
+
+  /**
+   * The trap this policy creates. must_change_password refuses an account every
+   * route except change-password; making that manager-only leaves such an
+   * account with nothing it can do. cfg-004 clears the flag, and staff.js and
+   * session.js no longer set it — this asserts the route is genuinely no longer
+   * a session route, which is what made the old arrangement safe.
+   */
+  it('no longer treats change-password as a universally reachable route', () => {
+    expect(isSessionRoute('/api/auth/change-password')).toBe(false);
   });
 });
 
