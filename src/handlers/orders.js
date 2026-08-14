@@ -472,6 +472,30 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     return json((results || []).map((i) => Object.assign({}, i, { durations: itemDurations(i) })));
   }
 
+  // GET /api/orders/:id — one order with its lines attached.
+  //
+  // This is the single-order endpoint the open-tab flow needs: a waiter who has
+  // an unpaid order on a table has to be able to fetch it (with items) to show
+  // the running bill and to append a new round to it. Without it, the POS could
+  // list orders but never look one up, so the only way back to an open tab was
+  // re-typing the whole cart. Declared after the /:id/items routes so "items" is
+  // not swallowed as an order id.
+  if (m === "GET" && /^\/[^/]+$/.test(sub)) {
+    const orderId = sub.slice(1);
+    const { results } = await d1Query(env, "SELECT * FROM orders WHERE id = ?", [orderId]);
+    const order = results && results[0];
+    if (!order) return json({ ok: false, error: "Order not found" }, 404);
+
+    const { results: lines } = await d1Query(
+      env,
+      "SELECT * FROM order_items WHERE order_id = ? ORDER BY line_no",
+      [orderId]
+    );
+    const items = (lines || []).map((i) => Object.assign({}, i, { durations: itemDurations(i) }));
+
+    return json({ ...mapOrderRow(order), items });
+  }
+
   // PUT /api/orders/:orderId/items/:itemId  { status }
   // Marking one line moves that line only, then the order's own status is
   // recomputed from all of its lines so the kitchen board stays coherent.
