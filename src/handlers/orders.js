@@ -86,6 +86,9 @@ function resolveCategory(line, lookup) {
  * the guest is waiting for, and taking ordering offline to protect a metric is
  * the wrong trade. Failures come back as a warning on the response instead of
  * disappearing.
+ *
+ * `lineOffset` lets a new round continue an open ticket's numbering instead of
+ * colliding with the lines already on it.
  */
 async function insertOrderItems(env, orderId, items, createdIso, lineOffset = 0) {
   const lines = normaliseLines(items, lineOffset);
@@ -93,32 +96,61 @@ async function insertOrderItems(env, orderId, items, createdIso, lineOffset = 0)
 
   try {
     const lookup = await categoryLookup(env);
-    const statements = lines.map((line) =>
-      env.DB.prepare(
-        `INSERT INTO order_items
-           (id, order_id, line_no, menu_item_id, name, category, course, qty, unit_price,
-            modifiers, notes, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)`
-      ).bind(
+    const cols = await orderItemColumns(env);
+    const canCourse = cols.includes('course');
+
+    const statements = lines.map((line) => {
+      const columns = [
+        'id', 'order_id', 'line_no', 'menu_item_id', 'name', 'category', 'qty',
+        'unit_price', 'modifiers', 'notes', 'status', 'created_at',
+      ];
+      if (canCourse) columns.push('course');
+      const placeholders = columns.map(() => '?').join(', ');
+      const params = [
         'OI' + crypto.randomUUID().slice(0, 10),
         orderId,
         line.lineNo,
         line.menuItemId || null,
         line.name,
         resolveCategory(line, lookup),
-        line.course || 'main',
         line.qty,
         line.unitPrice,
         line.modifiers || null,
         line.notes || null,
-        createdIso
-      )
-    );
+        'new',
+        createdIso,
+      ];
+      if (canCourse) params.push(line.course || 'main');
+      return env.DB.prepare(
+        `INSERT INTO order_items (${columns.join(', ')}) VALUES (${placeholders})`
+      ).bind(...params);
+    });
     await env.DB.batch(statements);
     return { inserted: lines.length, warning: null };
   } catch (e) {
     return { inserted: 0, warning: `Order saved, but per-item timing was not recorded: ${String(e.message || e)}` };
   }
+}
+
+/**
+ * Columns the order_items table actually has, resolved once per isolate.
+ *
+ * Same rationale as orderColumns below: the new `course` column arrives by
+ * migration, so writing it unconditionally would take line tracking offline for
+ * the window between deploying this Worker and applying the migration. Filtering
+ * against PRAGMA means the deploy order stops mattering here too.
+ */
+let ITEM_COLUMNS = null;
+async function orderItemColumns(env) {
+  if (ITEM_COLUMNS) return ITEM_COLUMNS;
+  const { results } = await d1Query(env, "PRAGMA table_info(order_items)");
+  ITEM_COLUMNS = (results || []).map((c) => c.name);
+  return ITEM_COLUMNS;
+}
+
+/** Test seam: forget the cached order_items schema. */
+function resetOrderItemColumns() {
+  ITEM_COLUMNS = null;
 }
 
 function round2(n) {
@@ -172,6 +204,17 @@ async function recordSubmittedPayments(env, auth, orderId, data) {
   if (!breakdown.length) return { inserted: 0, warning: null };
 
   try {
+    // Idempotency guard for settlement: an open tab is created empty and paid
+    // later with a PUT, and a retried PUT (a flaky tablet, the offline queue)
+    // must not post the same cash twice. If rows already exist the money is
+    // already on the books — this call is the duplicate.
+    const { results: existing } = await d1Query(
+      env,
+      "SELECT id FROM payments WHERE order_id = ? AND status <> 'rejected'",
+      [orderId]
+    );
+    if (existing && existing.length) return { inserted: 0, warning: null };
+
     const nowIso = new Date().toISOString();
     const statements = breakdown
       .filter((p) => p && Number(p.amount))
@@ -227,12 +270,18 @@ async function recordSubmittedPayments(env, auth, orderId, data) {
 async function recordSubmittedTip(env, auth, orderId, data, tip, orderType) {
   if (!tip || tip <= 0) return { inserted: 0, warning: null };
   try {
-    // Idempotency: skip if a tips row already exists for this order.
-    const { results: existing } = await d1Query(env, 'SELECT id FROM tips WHERE order_id = ?', [orderId]);
-    if (existing && existing.length) return { inserted: 0, warning: null };
-
     const nowIso = new Date().toISOString();
     let staffName = auth ? actorName(auth) : null;
+    // Idempotency guard, mirroring recordSubmittedPayments: an open tab is
+    // settled with a PUT that can be retried (flaky tablet, offline queue), and
+    // a retry must not record the same tip twice. One tip row per order is the
+    // rule — the order itself already carries the tip figure.
+    const { results: existing } = await d1Query(
+      env,
+      "SELECT id FROM tips WHERE order_id = ?",
+      [orderId]
+    );
+    if (existing && existing.length) return { inserted: 0, warning: null };
     await d1Run(
       env,
       `INSERT INTO tips
@@ -477,73 +526,98 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     return json((results || []).map((i) => Object.assign({}, i, { durations: itemDurations(i) })));
   }
 
-  // PATCH /api/orders/:id/items — append a round to an existing open order.
+  // PATCH /api/orders/:id/items — append a round to an open order.
   //
-  // The waiter adds items to a table's running tab. New lines get the next
-  // line_no so one ticket keeps continuous numbering. The bill subtotal/total
-  // is recomputed from all non-cancelled lines — 'the bill follows the food'.
-  if (m === 'PATCH' && /^\/[^/]+\/items$/.test(sub)) {
-    const orderId = sub.split('/')[1];
-    const { results: orderRows } = await d1Query(env, 'SELECT * FROM orders WHERE id = ?', [orderId]);
-    const order = orderRows && orderRows[0];
-    if (!order) return json({ ok: false, error: 'Order not found' }, 404);
-    if (order.voided_at) return json({ ok: false, error: 'Order has been voided' }, 409);
-    if (order.status === 'completed' || order.status === 'cancelled' || order.status === 'fulfilled') {
-      return json({ ok: false, error: `Order is ${order.status} and cannot be modified` }, 409);
-    }
-
+  // The open-tab flow: a waiter fires a first round to the kitchen with POST,
+  // which creates the order, and the table now has a tab. The next round on the
+  // same table must extend that order rather than create a sibling — otherwise
+  // the kitchen board shows two tickets for one sitting and the bill splits
+  // into two orders at the till. This appends lines with the next line numbers
+  // (via insertOrderItems' lineOffset) so the ticket keeps its sequence, and
+  // recomputes the running bill from every line on the order.
+  if (m === "PATCH" && /^\/[^/]+\/items$/.test(sub)) {
+    const orderId = sub.split("/")[1];
     const data = await readBody(request);
-    if (!data) return json({ ok: false, error: 'Invalid JSON body' }, 400);
+    if (!data) return json({ ok: false, error: "Invalid JSON body" }, 400);
 
-    const newItems = data.orderItems || data.order_items || data.items || [];
-    if (!Array.isArray(newItems) || !newItems.length) {
-      return json({ ok: false, error: 'No items to append' }, 400);
+    const { results: orderRows } = await d1Query(env, "SELECT * FROM orders WHERE id = ?", [orderId]);
+    const order = orderRows && orderRows[0];
+    if (!order) return json({ ok: false, error: "Order not found" }, 404);
+    if (order.voided_at) {
+      return json({ ok: false, error: "Order has been voided and cannot take new items" }, 409);
+    }
+    if (["completed", "cancelled", "fulfilled"].includes(String(order.status || "").toLowerCase())) {
+      return json({ ok: false, error: "Order is closed and cannot take new items" }, 409);
     }
 
-    // Determine the next line_no from existing lines.
-    const { results: existingLines } = await d1Query(
+    // Continue the ticket's numbering where the last round left off. Note the
+    // explicit null check: line_no 0 is a valid row (the very first line of a
+    // ticket), and `raw || -1` would misread it as "no lines yet".
+    const { results: lineRows } = await d1Query(
       env,
-      'SELECT MAX(line_no) AS max_line FROM order_items WHERE order_id = ?',
+      "SELECT MAX(line_no) AS maxLineNo FROM order_items WHERE order_id = ?",
       [orderId]
     );
-    const lineOffset = ((existingLines && existingLines[0] && existingLines[0].max_line) || 0) + 1;
+    const rawMax = lineRows && lineRows[0] ? lineRows[0].maxLineNo : null;
+    const maxLineNo = rawMax === null || rawMax === undefined ? -1 : Number(rawMax);
+    const lineOffset = maxLineNo + 1;
 
     const nowIso = new Date().toISOString();
-    const tracking = await insertOrderItems(env, orderId, newItems, nowIso, lineOffset);
+    const tracking = await insertOrderItems(
+      env,
+      orderId,
+      data.orderItems || data.order_items || data.items,
+      nowIso,
+      lineOffset
+    );
+    if (!tracking.inserted) {
+      return json({ ok: false, error: "No orderable items in request", warning: tracking.warning }, 400);
+    }
 
-    // Recompute subtotal and total from all non-cancelled lines.
+    // Recompute the running bill from the lines now on the order, so the total
+    // always matches the sum of what the kitchen has been fired. The flat
+    // summary the receipt reads is rebuilt by appending this round's lines.
     const { results: allLines } = await d1Query(
       env,
-      "SELECT * FROM order_items WHERE order_id = ? AND status <> 'cancelled'",
+      "SELECT unit_price, qty FROM order_items WHERE order_id = ? AND status <> 'cancelled'",
       [orderId]
     );
-    const newSubtotal = round2((allLines || []).reduce((s, l) => s + (Number(l.unit_price) || 0) * (Number(l.qty) || 0), 0));
-    const newTotal = round2(newSubtotal + (Number(order.discount) || 0) + (Number(order.tip) || 0) + (Number(order.delivery_fee) || 0) + (Number(order.service_charge) || 0) + (Number(order.tax) || 0));
+    const subtotal = round2(
+      (allLines || []).reduce((s, l) => s + (Number(l.unit_price) || 0) * (Number(l.qty) || 0), 0)
+    );
+    const tip = Number(order.tip) || 0;
+    const discount = Number(order.discount) || 0;
+    const serviceCharge = Number(order.service_charge) || 0;
+    const tax = Number(order.tax) || 0;
+    const deliveryFee = Number(order.delivery_fee) || 0;
+    const total = round2(subtotal - discount + tip + serviceCharge + tax + deliveryFee);
 
-    // Rebuild flat items string from all lines.
-    const flatAll = (allLines || []).map(l => `${l.qty}x${l.name}`).join(', ');
+    const flat = typeof data.items === "string" ? data.items.trim() : "";
+    const itemsSummary = order.items
+      ? String(order.items).trim() + (flat ? ", " + flat : "")
+      : flat;
 
     await d1Run(
       env,
-      `UPDATE orders SET items = ?, subtotal = ?, total = ?, updated_at = ? WHERE id = ?`,
-      [flatAll, newSubtotal, newTotal, nowIso, orderId]
+      "UPDATE orders SET items = ?, subtotal = ?, total = ?, updated_at = ? WHERE id = ?",
+      [itemsSummary, subtotal, total, nowIso, orderId]
     );
 
     await writeAudit(env, auth, {
-      action: 'append-round',
-      entity: 'orders',
+      action: "update",
+      entity: "orders",
       entityId: orderId,
-      after: { itemsAppended: tracking.inserted, subtotal: newSubtotal, total: newTotal },
+      before: { total: order.total, items: order.items },
+      after: { total, items: itemsSummary, addedLines: tracking.inserted },
     });
 
-    const warnings = [tracking.warning].filter(Boolean);
     return json({
       ok: true,
-      id: orderId,
-      itemsAppended: tracking.inserted,
-      subtotal: newSubtotal,
-      total: newTotal,
-      warning: warnings.length ? warnings.join(' ') : undefined,
+      orderId,
+      items: tracking.inserted,
+      subtotal,
+      total,
+      warning: tracking.warning || undefined,
     });
   }
 
@@ -626,6 +700,10 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     const values = [];
     const nowIso = new Date().toISOString();
     let consumptionWarning = null;
+    // Warnings from posting a settlement (payment rows, tip row). They never
+    // fail the PUT — the bill must be payable even if a payment record drops —
+    // and ride the response's warning field alongside the consumption warning.
+    const followSettlementWarnings = [];
 
     // Read first, so the audit entry can say what the value was. §37 asks for
     // the previous value on a change, and a discount or a price amendment is
@@ -771,35 +849,38 @@ async function handleOrders(pathname, method, url, request, env, auth) {
       try { await refreshPaymentStatus(env, id); } catch { /* status is recomputed on next read */ }
     }
 
-    // ── Open-tab settlement ───────────────────────────────────────────────
-    // When the POS settles an existing open tab, it PUTs the order with
-    // paymentBreakdown and tip. Record them idempotently — a retried PUT
-    // (the POS has offline queue/retry) must not double-charge.
-    const settlementWarnings = [];
-    if (data.paymentBreakdown) {
-      const payments = await recordSubmittedPayments(env, auth, id, data);
-      if (payments.warning) settlementWarnings.push(payments.warning);
+    // ── Settlement of an open tab ─────────────────────────────────────────
+    // Checkout no longer creates a second order to take the money: it PUTs the
+    // existing order with its payment breakdown and tip. The payment and tip
+    // rows are posted here — the same path POST /orders uses — so a split bill
+    // and a waiter's tip land on the order that actually ran. Both helpers are
+    // idempotent (recordSubmittedPayments refuses to double-post, and
+    // recordSubmittedTip skips an order that already has a tip row), so a
+    // retried PUT cannot take the same cash twice.
+    if (Array.isArray(data.paymentBreakdown) && data.paymentBreakdown.length) {
+      const settlement = await recordSubmittedPayments(env, auth, id, data);
+      if (settlement.warning) followSettlementWarnings.push(settlement.warning);
     }
-    const tip = data.tip !== void 0 ? round2(data.tip) : (before ? Number(before.tip) || 0 : 0);
-    if (tip > 0) {
-      const tipResult = await recordSubmittedTip(env, auth, id, data, tip, before ? before.type : null);
-      if (tipResult.warning) settlementWarnings.push(tipResult.warning);
+    const settleTip = round2(data.tip);
+    if (settleTip > 0) {
+      const tipResult = await recordSubmittedTip(env, auth, id, data, settleTip, data.type || before?.type || null);
+      if (tipResult.warning) followSettlementWarnings.push(tipResult.warning);
     }
 
     await writeAudit(env, auth, {
-      action: 'update',
-      entity: 'orders',
+      action: "update",
+      entity: "orders",
       entityId: id,
       before,
       after: Object.fromEntries(
         fields
-          .map((f, i) => [f.split(' ')[0], values[i]])
-          .filter(([c]) => c !== 'updated_at')
+          .map((f, i) => [f.split(" ")[0], values[i]])
+          .filter(([c]) => c !== "updated_at")
       ),
     });
 
-    const allWarnings = [consumptionWarning, ...settlementWarnings].filter(Boolean);
-    return json({ ok: true, updated_at: nowIso, warning: allWarnings.length ? allWarnings.join(' ') : undefined });
+    const warnings = [consumptionWarning, ...followSettlementWarnings].filter(Boolean);
+    return json({ ok: true, updated_at: nowIso, warning: warnings.length ? warnings.join(" ") : undefined });
   }
   // DELETE voids the order; it does not remove it.
   //
@@ -877,9 +958,5 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     return json({ ok: true, voided: true, id, restocked });
   }
   return null;
-}
-/** Test seam: forget the cached order_items schema (for future use). */
-function resetOrderItemColumns() {
-  /* No cached item columns yet — placeholder for test seam symmetry. */
 }
 export { mapOrderRow, handleOrders, resetOrderColumns, resetOrderItemColumns, round2 };

@@ -148,6 +148,10 @@ export function parseFlatItems(flat) {
  * a count on one row rather than exploded into N rows: the kitchen marks "two
  * macchiatos" ready together, and splitting them would ask staff to tick twice
  * for one action.
+ *
+ * `lineOffset` renumbers the rows so a second round can be appended to an open
+ * order without colliding with the lines already on it: the new ticket starts
+ * where the old one left off.
  */
 export function normaliseLines(items, lineOffset = 0) {
   let list = items;
@@ -176,11 +180,14 @@ export function normaliseLines(items, lineOffset = 0) {
       const qty = Number(raw.qty ?? raw.quantity ?? 1);
 
       return {
-        lineNo: index + lineOffset,
+        lineNo: lineOffset + index,
         menuItemId: raw.menuItemId || raw.menu_item_id || raw.id || '',
         name,
         category: raw.category ? String(raw.category) : '',
-        course: raw.course || 'main',
+        // Open tabs fire tickets by course, so a line carries which course of
+        // the meal it belongs to. Orders that predate the column default to
+        // 'main': a single-course ticket behaves exactly as it always did.
+        course: raw.course ? String(raw.course) : 'main',
         qty: Number.isFinite(qty) && qty > 0 ? Math.round(qty) : 1,
         unitPrice: Number.isFinite(Number(price)) ? Number(price) : 0,
         modifiers: Array.isArray(raw.modifiers) ? JSON.stringify(raw.modifiers) : '',
