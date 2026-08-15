@@ -149,7 +149,7 @@ export function parseFlatItems(flat) {
  * macchiatos" ready together, and splitting them would ask staff to tick twice
  * for one action.
  */
-export function normaliseLines(items) {
+export function normaliseLines(items, lineOffset = 0) {
   let list = items;
   if (typeof list === 'string') {
     try {
@@ -176,10 +176,11 @@ export function normaliseLines(items) {
       const qty = Number(raw.qty ?? raw.quantity ?? 1);
 
       return {
-        lineNo: index,
+        lineNo: index + lineOffset,
         menuItemId: raw.menuItemId || raw.menu_item_id || raw.id || '',
         name,
         category: raw.category ? String(raw.category) : '',
+        course: raw.course || 'main',
         qty: Number.isFinite(qty) && qty > 0 ? Math.round(qty) : 1,
         unitPrice: Number.isFinite(Number(price)) ? Number(price) : 0,
         modifiers: Array.isArray(raw.modifiers) ? JSON.stringify(raw.modifiers) : '',

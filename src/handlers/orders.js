@@ -87,8 +87,8 @@ function resolveCategory(line, lookup) {
  * the wrong trade. Failures come back as a warning on the response instead of
  * disappearing.
  */
-async function insertOrderItems(env, orderId, items, createdIso) {
-  const lines = normaliseLines(items);
+async function insertOrderItems(env, orderId, items, createdIso, lineOffset = 0) {
+  const lines = normaliseLines(items, lineOffset);
   if (!lines.length) return { inserted: 0, warning: null };
 
   try {
@@ -96,9 +96,9 @@ async function insertOrderItems(env, orderId, items, createdIso) {
     const statements = lines.map((line) =>
       env.DB.prepare(
         `INSERT INTO order_items
-           (id, order_id, line_no, menu_item_id, name, category, qty, unit_price,
+           (id, order_id, line_no, menu_item_id, name, category, course, qty, unit_price,
             modifiers, notes, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)`
       ).bind(
         'OI' + crypto.randomUUID().slice(0, 10),
         orderId,
@@ -106,6 +106,7 @@ async function insertOrderItems(env, orderId, items, createdIso) {
         line.menuItemId || null,
         line.name,
         resolveCategory(line, lookup),
+        line.course || 'main',
         line.qty,
         line.unitPrice,
         line.modifiers || null,
@@ -226,6 +227,10 @@ async function recordSubmittedPayments(env, auth, orderId, data) {
 async function recordSubmittedTip(env, auth, orderId, data, tip, orderType) {
   if (!tip || tip <= 0) return { inserted: 0, warning: null };
   try {
+    // Idempotency: skip if a tips row already exists for this order.
+    const { results: existing } = await d1Query(env, 'SELECT id FROM tips WHERE order_id = ?', [orderId]);
+    if (existing && existing.length) return { inserted: 0, warning: null };
+
     const nowIso = new Date().toISOString();
     let staffName = auth ? actorName(auth) : null;
     await d1Run(
@@ -472,6 +477,76 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     return json((results || []).map((i) => Object.assign({}, i, { durations: itemDurations(i) })));
   }
 
+  // PATCH /api/orders/:id/items — append a round to an existing open order.
+  //
+  // The waiter adds items to a table's running tab. New lines get the next
+  // line_no so one ticket keeps continuous numbering. The bill subtotal/total
+  // is recomputed from all non-cancelled lines — 'the bill follows the food'.
+  if (m === 'PATCH' && /^\/[^/]+\/items$/.test(sub)) {
+    const orderId = sub.split('/')[1];
+    const { results: orderRows } = await d1Query(env, 'SELECT * FROM orders WHERE id = ?', [orderId]);
+    const order = orderRows && orderRows[0];
+    if (!order) return json({ ok: false, error: 'Order not found' }, 404);
+    if (order.voided_at) return json({ ok: false, error: 'Order has been voided' }, 409);
+    if (order.status === 'completed' || order.status === 'cancelled' || order.status === 'fulfilled') {
+      return json({ ok: false, error: `Order is ${order.status} and cannot be modified` }, 409);
+    }
+
+    const data = await readBody(request);
+    if (!data) return json({ ok: false, error: 'Invalid JSON body' }, 400);
+
+    const newItems = data.orderItems || data.order_items || data.items || [];
+    if (!Array.isArray(newItems) || !newItems.length) {
+      return json({ ok: false, error: 'No items to append' }, 400);
+    }
+
+    // Determine the next line_no from existing lines.
+    const { results: existingLines } = await d1Query(
+      env,
+      'SELECT MAX(line_no) AS max_line FROM order_items WHERE order_id = ?',
+      [orderId]
+    );
+    const lineOffset = ((existingLines && existingLines[0] && existingLines[0].max_line) || 0) + 1;
+
+    const nowIso = new Date().toISOString();
+    const tracking = await insertOrderItems(env, orderId, newItems, nowIso, lineOffset);
+
+    // Recompute subtotal and total from all non-cancelled lines.
+    const { results: allLines } = await d1Query(
+      env,
+      "SELECT * FROM order_items WHERE order_id = ? AND status <> 'cancelled'",
+      [orderId]
+    );
+    const newSubtotal = round2((allLines || []).reduce((s, l) => s + (Number(l.unit_price) || 0) * (Number(l.qty) || 0), 0));
+    const newTotal = round2(newSubtotal + (Number(order.discount) || 0) + (Number(order.tip) || 0) + (Number(order.delivery_fee) || 0) + (Number(order.service_charge) || 0) + (Number(order.tax) || 0));
+
+    // Rebuild flat items string from all lines.
+    const flatAll = (allLines || []).map(l => `${l.qty}x${l.name}`).join(', ');
+
+    await d1Run(
+      env,
+      `UPDATE orders SET items = ?, subtotal = ?, total = ?, updated_at = ? WHERE id = ?`,
+      [flatAll, newSubtotal, newTotal, nowIso, orderId]
+    );
+
+    await writeAudit(env, auth, {
+      action: 'append-round',
+      entity: 'orders',
+      entityId: orderId,
+      after: { itemsAppended: tracking.inserted, subtotal: newSubtotal, total: newTotal },
+    });
+
+    const warnings = [tracking.warning].filter(Boolean);
+    return json({
+      ok: true,
+      id: orderId,
+      itemsAppended: tracking.inserted,
+      subtotal: newSubtotal,
+      total: newTotal,
+      warning: warnings.length ? warnings.join(' ') : undefined,
+    });
+  }
+
   // GET /api/orders/:id — one order with its lines attached.
   //
   // This is the single-order endpoint the open-tab flow needs: a waiter who has
@@ -696,19 +771,35 @@ async function handleOrders(pathname, method, url, request, env, auth) {
       try { await refreshPaymentStatus(env, id); } catch { /* status is recomputed on next read */ }
     }
 
+    // ── Open-tab settlement ───────────────────────────────────────────────
+    // When the POS settles an existing open tab, it PUTs the order with
+    // paymentBreakdown and tip. Record them idempotently — a retried PUT
+    // (the POS has offline queue/retry) must not double-charge.
+    const settlementWarnings = [];
+    if (data.paymentBreakdown) {
+      const payments = await recordSubmittedPayments(env, auth, id, data);
+      if (payments.warning) settlementWarnings.push(payments.warning);
+    }
+    const tip = data.tip !== void 0 ? round2(data.tip) : (before ? Number(before.tip) || 0 : 0);
+    if (tip > 0) {
+      const tipResult = await recordSubmittedTip(env, auth, id, data, tip, before ? before.type : null);
+      if (tipResult.warning) settlementWarnings.push(tipResult.warning);
+    }
+
     await writeAudit(env, auth, {
-      action: "update",
-      entity: "orders",
+      action: 'update',
+      entity: 'orders',
       entityId: id,
       before,
       after: Object.fromEntries(
         fields
-          .map((f, i) => [f.split(" ")[0], values[i]])
-          .filter(([c]) => c !== "updated_at")
+          .map((f, i) => [f.split(' ')[0], values[i]])
+          .filter(([c]) => c !== 'updated_at')
       ),
     });
 
-    return json({ ok: true, updated_at: nowIso, warning: consumptionWarning || undefined });
+    const allWarnings = [consumptionWarning, ...settlementWarnings].filter(Boolean);
+    return json({ ok: true, updated_at: nowIso, warning: allWarnings.length ? allWarnings.join(' ') : undefined });
   }
   // DELETE voids the order; it does not remove it.
   //
@@ -787,4 +878,8 @@ async function handleOrders(pathname, method, url, request, env, auth) {
   }
   return null;
 }
-export { mapOrderRow, handleOrders, resetOrderColumns, round2 };
+/** Test seam: forget the cached order_items schema (for future use). */
+function resetOrderItemColumns() {
+  /* No cached item columns yet — placeholder for test seam symmetry. */
+}
+export { mapOrderRow, handleOrders, resetOrderColumns, resetOrderItemColumns, round2 };
