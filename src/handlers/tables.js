@@ -1,6 +1,7 @@
 import { d1Query, d1Run, json, readBody } from '../lib/db.js';
 import { holdsTable, blocksSeating, isNewSeating, ACTIVE_STATUSES, GRACE_MIN, SEATING_LEAD_MIN } from '../lib/booking.js';
 import { actorName } from '../auth.js';
+import { writeAudit } from '../lib/audit.js';
 
 const ACTIVE_LIST = ACTIVE_STATUSES.map((s) => `'${s}'`).join(', ');
 
@@ -180,19 +181,44 @@ async function handleTables(pathname, method, url, request, env, auth) {
     const claimingNewSeat = data.newSeating === true || isNewSeating(table, data.seated_at);
     const alreadyOccupied = String(table.status || '').toLowerCase() === 'occupied';
 
-    if (claimingNewSeat && alreadyOccupied && !isManager(auth)) {
-      return json(
-        {
-          ok: false,
-          error: `Table ${table.number} already has a party seated. Clear it or pick another table.`,
-          occupiedBy: {
-            server: table.server || null,
-            guests: table.guests || 0,
-            seatedAt: table.seated_at || null,
+    if (claimingNewSeat && alreadyOccupied) {
+      if (!isManager(auth)) {
+        return json(
+          {
+            ok: false,
+            error: `Table ${table.number} already has a party seated. Clear it or pick another table.`,
+            occupiedBy: {
+              server: table.server || null,
+              guests: table.guests || 0,
+              seatedAt: table.seated_at || null,
+            },
           },
+          409
+        );
+      }
+
+      // Taking a table off the party already on it is a decision, not a
+      // routine write, and the person displaced is not there to describe what
+      // happened. `override: true` is carried so the entry cannot be diffed
+      // away to nothing when the incoming guests and server happen to match
+      // the ones being replaced.
+      await writeAudit(env, auth, {
+        action: 'override',
+        entity: 'tables',
+        entityId: table.id,
+        before: {
+          occupied_by: table.server || null,
+          guests: table.guests || 0,
+          seated_at: table.seated_at || null,
         },
-        409
-      );
+        after: {
+          occupied_by: data.server || null,
+          guests: data.guests || 0,
+          seated_at: data.seated_at || null,
+          override: true,
+        },
+        reason: `Seated a new party on table ${table.number} over the one already there`,
+      });
     }
 
     const { results } = await d1Query(
@@ -243,6 +269,23 @@ async function handleTables(pathname, method, url, request, env, auth) {
         WHERE id = ? AND released_at IS NULL`,
       [nowIso, actorName(auth), nowIso, hold.id]
     );
+
+    // `released_by` on the booking says who, but only to whoever thinks to open
+    // that row. A promise made to a guest and then taken back belongs in the
+    // log the manager and the accountant actually read.
+    await writeAudit(env, auth, {
+      action: 'override',
+      entity: 'reservations',
+      entityId: hold.id,
+      before: { status: hold.status, released_at: null },
+      after: {
+        status: 'cancelled',
+        released_at: nowIso,
+        released_by: actorName(auth),
+        override: true,
+      },
+      reason: `Seated table ${table.number} over a booking held for ${hold.name || 'a guest'}`,
+    });
 
     // A manager overriding is deliberate, so the claim is unconditional: they
     // have already been told what they are taking.
