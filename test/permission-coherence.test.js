@@ -57,13 +57,13 @@ const SCREEN_NEEDS = {
  */
 const POS_PERMISSIONS = {
   manager: ['dashboard', 'orders', 'open-checks', 'tables', 'menu-mgmt', 'menu-view', 'expenses', 'pnl', 'cashdrawer', 'inventory', 'waste', 'shifts', 'timeclock', 'kitchen', 'reports', 'reservations', 'delivery', 'analytics', 'checkout', 'recipes', 'suppliers', 'purchases', 'stock-control'],
-  'head-chef': ['kitchen', 'orders', 'dashboard', 'inventory', 'waste', 'reports', 'pipeline', 'menu-mgmt', 'recipes', 'stock-control', 'suppliers', 'purchases'],
-  'assistant-chef': ['kitchen', 'orders', 'dashboard', 'inventory', 'recipes'],
-  'head-waiter': ['tables', 'orders', 'open-checks', 'dashboard', 'menu-view', 'reservations', 'checkout'],
+  'head-chef': ['kitchen', 'orders', 'dashboard', 'inventory', 'waste', 'reports', 'pipeline', 'menu-mgmt', 'recipes', 'stock-control', 'suppliers', 'purchases', 'timeclock'],
+  'assistant-chef': ['kitchen', 'orders', 'dashboard', 'inventory', 'recipes', 'timeclock'],
+  'head-waiter': ['tables', 'orders', 'open-checks', 'dashboard', 'menu-view', 'reservations', 'checkout', 'timeclock'],
   cashier: ['cashdrawer', 'orders', 'open-checks', 'dashboard', 'tables', 'reports', 'timeclock', 'reservations', 'revenue', 'menu-view', 'analytics', 'checkout'],
-  'delivery-staff': ['delivery', 'dashboard'],
-  cleaner: ['waste', 'dashboard'],
-  accountant: ['dashboard', 'reports', 'revenue', 'pnl', 'expenses', 'analytics', 'orders', 'purchases', 'suppliers'],
+  'delivery-staff': ['delivery', 'dashboard', 'timeclock'],
+  cleaner: ['waste', 'dashboard', 'timeclock'],
+  accountant: ['dashboard', 'reports', 'revenue', 'pnl', 'expenses', 'analytics', 'orders', 'purchases', 'suppliers', 'timeclock'],
 };
 
 /**
@@ -76,8 +76,21 @@ const POS_PERMISSIONS = {
  * degrades a tile rather than blanking the page.
  *
  * Its per-role expectations are asserted separately, further down.
+ *
+ * Time Clock is the second one, for a different reason.
+ *
+ * It has two halves. The roster — who is on shift today — needs `timeclock` and
+ * `staff` reads and belongs to whoever runs the floor. Clocking yourself on and
+ * off is everybody's, and goes through the self-service routes in auth.js,
+ * which are outside the role matrix by design: granting the resource instead
+ * would hand the floor the power to rewrite anyone's hours, which is a payroll
+ * figure.
+ *
+ * So every role carries the screen, and the roster half hides itself when the
+ * fetch is refused rather than rendering an empty grid that reads as "nobody is
+ * working".
  */
-const CONDITIONAL_SCREENS = new Set(['dashboard']);
+const CONDITIONAL_SCREENS = new Set(['dashboard', 'timeclock']);
 
 describe('every granted screen is backed by readable data', () => {
   for (const [role, screens] of Object.entries(POS_PERMISSIONS)) {

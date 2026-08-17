@@ -22,6 +22,7 @@
 import { d1Query, d1Run, json, readBody } from '../lib/db.js';
 import { writeAudit } from '../lib/audit.js';
 import { actorName, isManager } from '../auth.js';
+import { openChecksForStaff } from './orders.js';
 import {
   classifyAttendance,
   overtimeAmount,
@@ -614,8 +615,194 @@ async function putSetting(request, env, auth, key) {
 
 // ── Router ──────────────────────────────────────────────────────────────────
 
+// ── Clocking on and off ─────────────────────────────────────────────────────
+
+/**
+ * The shop is UTC+3 with no daylight saving, and `timeclock` holds local wall
+ * clock: date "2026-08-17", clock_in "09:00". Storing UTC here would put every
+ * shift three hours out and quietly corrupt the hours payroll pays on.
+ */
+const SHOP_OFFSET_MIN = 180;
+
+function shopNow(nowMs = Date.now()) {
+  const local = new Date(nowMs + SHOP_OFFSET_MIN * 60000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return {
+    date: `${local.getUTCFullYear()}-${pad(local.getUTCMonth() + 1)}-${pad(local.getUTCDate())}`,
+    time: `${pad(local.getUTCHours())}:${pad(local.getUTCMinutes())}`,
+  };
+}
+
+/**
+ * Whose record is being acted on.
+ *
+ * A staffId is honoured only for a manager; everyone else acts on themselves
+ * whatever they send. This is the whole security model of the self-service
+ * routes, so it is one function rather than a check repeated three times.
+ */
+function subjectStaffId(data, auth) {
+  const own = (auth && auth.staff_id) || null;
+  const asked = data && (data.staffId || data.staff_id);
+  if (asked && isManager((auth && (auth.sessionRole || auth.role)) || '')) return String(asked);
+  return own;
+}
+
+/** The shift this person has open, if any. */
+async function openEntryFor(env, staffId) {
+  const { results } = await d1Query(
+    env,
+    `SELECT * FROM timeclock
+      WHERE staff_id = ? AND (clock_out IS NULL OR TRIM(clock_out) = '')
+      ORDER BY date DESC, clock_in DESC
+      LIMIT 1`,
+    [String(staffId)]
+  );
+  return (results || [])[0] || null;
+}
+
+/** GET /api/timeclock/me — am I on shift, and what is still owed on my tables? */
+async function whoIsOnShift(env, url, auth) {
+  const asked = url && url.searchParams ? url.searchParams.get('staffId') : null;
+  const staffId = subjectStaffId({ staffId: asked }, auth);
+  if (!staffId) return json({ ok: false, error: 'No staff record on this session' }, 400);
+
+  const [entry, checks] = await Promise.all([
+    openEntryFor(env, staffId),
+    openChecksForStaff(env, staffId),
+  ]);
+
+  return json({
+    ok: true,
+    staffId,
+    clockedIn: !!entry,
+    entry: entry || null,
+    openChecks: checks.map((c) => ({
+      id: c.id,
+      table: c.table_id || null,
+      total: c.total,
+      created: c.created,
+      paymentStatus: c.payment_status || 'unpaid',
+    })),
+  });
+}
+
+/** POST /api/timeclock/clock-in */
+async function clockIn(request, env, auth) {
+  const data = (await readBody(request)) || {};
+  const staffId = subjectStaffId(data, auth);
+  if (!staffId) return json({ ok: false, error: 'No staff record on this session' }, 400);
+
+  const existing = await openEntryFor(env, staffId);
+  // Tapping twice must not open a second shift and double-count the hours.
+  if (existing) {
+    return json({ ok: false, error: 'Already clocked in.', entry: existing }, 409);
+  }
+
+  const { date, time } = shopNow();
+  const id = 'TC' + crypto.randomUUID().replace(/-/g, '').slice(0, 8);
+  await d1Run(
+    env,
+    `INSERT INTO timeclock (id, staff_id, date, clock_in, clock_out, hours, status, created)
+     VALUES (?, ?, ?, ?, '', 0, 'active', ?)`,
+    [id, String(staffId), date, time, new Date().toISOString()]
+  );
+
+  await writeAudit(env, auth, {
+    action: 'create', entity: 'timeclock', entityId: id,
+    after: { staff_id: staffId, date, clock_in: time },
+  });
+
+  return json({ ok: true, id, staffId, date, clockIn: time });
+}
+
+/**
+ * POST /api/timeclock/clock-out — the shift gate.
+ *
+ * A check that is still open when its waiter goes home is how a bill is never
+ * collected: the table gets cleared by somebody else, and by the morning nobody
+ * remembers who was sitting there. This is the point in the day where it is
+ * still cheap to fix, which is why professional tills refuse the clock-out
+ * rather than warning about it.
+ *
+ * A manager may override, because somebody has to be able to send a person home
+ * when a check is genuinely stuck — but they must say so with `force`, and it
+ * is written to the audit log with the checks that were left. A silent manager
+ * exemption would make the gate meaningless the moment it was inconvenient.
+ */
+async function clockOut(request, env, auth) {
+  const data = (await readBody(request)) || {};
+  const staffId = subjectStaffId(data, auth);
+  if (!staffId) return json({ ok: false, error: 'No staff record on this session' }, 400);
+
+  const entry = await openEntryFor(env, staffId);
+  if (!entry) return json({ ok: false, error: 'Not clocked in.' }, 409);
+
+  const outstanding = await openChecksForStaff(env, staffId);
+  const manager = isManager((auth && (auth.sessionRole || auth.role)) || '');
+  const forced = data.force === true && manager;
+
+  if (outstanding.length && !forced) {
+    const owed = outstanding.reduce((sum, c) => sum + (Number(c.total) || 0), 0);
+    return json(
+      {
+        ok: false,
+        error: `${outstanding.length} check${outstanding.length === 1 ? '' : 's'} still open, ETB ${Math.round(owed)} owed. Settle or hand them over before clocking out.`,
+        openChecks: outstanding.map((c) => ({
+          id: c.id,
+          table: c.table_id || null,
+          total: c.total,
+          created: c.created,
+        })),
+        totalOwed: Math.round(owed),
+        managerCanOverride: true,
+      },
+      409
+    );
+  }
+
+  const { time } = shopNow();
+  const worked = minutesWorked(entry.clock_in, time);
+
+  await d1Run(
+    env,
+    `UPDATE timeclock SET clock_out = ?, hours = ?, status = 'completed' WHERE id = ?`,
+    [time, Math.round((worked / 60) * 100) / 100, entry.id]
+  );
+
+  await writeAudit(env, auth, {
+    action: 'update', entity: 'timeclock', entityId: entry.id,
+    before: { clock_out: null },
+    after: {
+      clock_out: time,
+      hours: Math.round((worked / 60) * 100) / 100,
+      // Recorded on the entry itself: an override is the fact worth keeping.
+      forced_with_open_checks: forced ? outstanding.map((c) => c.id) : undefined,
+    },
+  });
+
+  return json({ ok: true, id: entry.id, clockOut: time, hours: Math.round((worked / 60) * 100) / 100, forced });
+}
+
+/** Minutes between two "HH:MM" stamps, treating a wrap as a shift past midnight. */
+function minutesWorked(from, to) {
+  const parse = (t) => {
+    const m = String(t || '').match(/^(\d{1,2}):(\d{2})/);
+    return m ? Number(m[1]) * 60 + Number(m[2]) : null;
+  };
+  const a = parse(from);
+  const b = parse(to);
+  if (a === null || b === null) return 0;
+  return b < a ? b + 1440 - a : b - a;
+}
+
 export async function handleHR(pathname, method, url, request, env, auth) {
   const m = method.toUpperCase();
+
+  // Self-service, ahead of the generic timeclock resource. See SELF_SERVICE in
+  // auth.js for why these are reachable by every role.
+  if (pathname === '/api/timeclock/me' && m === 'GET') return whoIsOnShift(env, url, auth);
+  if (pathname === '/api/timeclock/clock-in' && m === 'POST') return clockIn(request, env, auth);
+  if (pathname === '/api/timeclock/clock-out' && m === 'POST') return clockOut(request, env, auth);
 
   if (pathname.startsWith('/api/attendance')) {
     const sub = pathname.replace(/^\/api\/attendance/, '');

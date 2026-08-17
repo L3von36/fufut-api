@@ -213,6 +213,19 @@ async function listOpenChecks(env) {
   return results || [];
 }
 
+/**
+ * Open checks belonging to one member of staff.
+ *
+ * Ownership is `created_by`, the person who took the order. That is who is
+ * asked about it at the end of a shift, and it is stamped by the server from
+ * the session rather than sent by the client.
+ */
+async function openChecksForStaff(env, staffId) {
+  if (!staffId) return [];
+  const open = await listOpenChecks(env);
+  return open.filter((o) => String(o.created_by || '') === String(staffId));
+}
+
 /** Open checks still sitting against one table. */
 async function openChecksForTable(env, tableNumber, excludeOrderId) {
   const open = await listOpenChecks(env);
@@ -1134,4 +1147,4 @@ async function handleOrders(pathname, method, url, request, env, auth) {
   }
   return null;
 }
-export { mapOrderRow, handleOrders, resetOrderColumns, resetOrderItemColumns, round2 };
+export { mapOrderRow, handleOrders, resetOrderColumns, resetOrderItemColumns, round2, openChecksForStaff };

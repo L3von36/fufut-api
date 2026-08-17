@@ -114,6 +114,25 @@ const PASSWORD_CHANGE_ALLOWED = new Set([
 const ANY_STAFF_READ = new Set(['menu', 'content', 'gallery', 'reviews', 'units', 'settings']);
 
 /**
+ * Clocking yourself in and out, and asking whether you are on shift.
+ *
+ * Every role has to be able to do this. The shift gate exists to stop a waiter
+ * going home with money still owed on their tables, and a waiter has no
+ * `timeclock` grant at all. Granting them the resource would be the wrong fix:
+ * `timeclock` write through the generic handler is the power to rewrite
+ * anybody's hours, which is a payroll figure.
+ *
+ * So these three routes are open to any signed-in member of staff, and the
+ * handler restricts them to the caller's own record — a staffId is honoured
+ * only for a manager, who is the person already trusted with the roster.
+ */
+const SELF_SERVICE = new Set([
+  '/api/timeclock/me',
+  '/api/timeclock/clock-in',
+  '/api/timeclock/clock-out',
+]);
+
+/**
  * Resource access per role.
  *
  * `read` covers GET; `write` covers POST, PUT, PATCH and DELETE. A resource
@@ -420,6 +439,12 @@ export async function authorize(request, env, pathname, method) {
   // Signing out and checking who you are must never depend on what you may
   // reach, or a role with a narrow matrix could not end its own session.
   if (isSessionRoute(pathname)) {
+    return { ok: true, auth };
+  }
+
+  // Clocking on and off is everyone's, and is scoped to the caller inside the
+  // handler rather than by the role matrix. See SELF_SERVICE.
+  if (SELF_SERVICE.has(pathname)) {
     return { ok: true, auth };
   }
 
