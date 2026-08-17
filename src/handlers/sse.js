@@ -9,6 +9,11 @@ function sseEvent(event, data) {
 async function handleSSE(request, env, channel) {
   const encoder = new TextEncoder();
   let timer = null;
+  // The last payload sent, so a tick that found nothing new stays quiet.
+  // Previously every tick emitted, which made the stream a 10-second poll in
+  // disguise: a screen could not subscribe and refresh on the event without
+  // refetching ten times a minute forever. Only the keepalive is unconditional.
+  let lastSignature = null;
   const stream = new ReadableStream({
     async start(controller) {
       const safe = /* @__PURE__ */ __name((fn) => {
@@ -19,13 +24,24 @@ async function handleSSE(request, env, channel) {
       }, "safe");
       const tick = /* @__PURE__ */ __name(async () => {
         try {
+          let eventName;
+          let payload;
           if (channel === "tables") {
             const { results } = await d1Query(env, "SELECT * FROM tables ORDER BY created DESC");
-            safe(() => controller.enqueue(sseEvent("table_update", { tables: (results || []).map((r) => mapResourceRow("tables", r)) })));
+            eventName = "table_update";
+            payload = { tables: (results || []).map((r) => mapResourceRow("tables", r)) };
           } else {
             const { results } = await d1Query(env, "SELECT * FROM orders WHERE status NOT IN ('completed','cancelled','fulfilled') ORDER BY created DESC");
             const rows = (results || []).map((o) => Object.assign({}, o, { tableNum: o.table_id || o.table_number || null, table_number: o.table_id || o.table_number || null }));
-            safe(() => controller.enqueue(sseEvent("new_order", { orders: rows })));
+            eventName = "new_order";
+            payload = { orders: rows };
+          }
+          const signature = JSON.stringify(payload);
+          // The first tick always emits, so a screen that has just connected
+          // gets the current state rather than waiting for the floor to move.
+          if (signature !== lastSignature) {
+            lastSignature = signature;
+            safe(() => controller.enqueue(sseEvent(eventName, payload)));
           }
         } catch (e) {
         }

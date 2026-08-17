@@ -1,5 +1,5 @@
 import { d1Query, d1Run, json, readBody } from '../lib/db.js';
-import { holdsTable, blocksSeating, ACTIVE_STATUSES, GRACE_MIN, SEATING_LEAD_MIN } from '../lib/booking.js';
+import { holdsTable, blocksSeating, isNewSeating, ACTIVE_STATUSES, GRACE_MIN, SEATING_LEAD_MIN } from '../lib/booking.js';
 import { actorName } from '../auth.js';
 
 const ACTIVE_LIST = ACTIVE_STATUSES.map((s) => `'${s}'`).join(', ');
@@ -79,6 +79,54 @@ async function listTablesWithHolds(env) {
 }
 
 /**
+ * Take the table, or lose the race.
+ *
+ * Checking "is it free?" and then writing is two statements, and two waiters
+ * who both read "free" both write. The condition therefore lives *in* the
+ * write: SQLite applies it atomically, so of two simultaneous claims exactly
+ * one reports a changed row and the other is told who beat it.
+ *
+ * Returns null when the caller should fall through to the generic handler,
+ * which applies the rest of the fields (guests, server, notes).
+ */
+async function claimSeat(env, table, data, claimingNewSeat) {
+  if (!claimingNewSeat) return null; // editing the party already seated
+
+  const seatedAt = String(data.seated_at || '').trim() || new Date().toISOString();
+  const { meta } = await d1Run(
+    env,
+    `UPDATE tables
+        SET status = 'occupied', seated_at = ?
+      WHERE id = ?
+        AND (status <> 'occupied' OR seated_at IS NULL OR TRIM(seated_at) = '')`,
+    [seatedAt, table.id]
+  );
+
+  if (!meta.changes) {
+    const { results } = await d1Query(
+      env,
+      'SELECT number, server, guests, seated_at FROM tables WHERE id = ?',
+      [table.id]
+    );
+    const now = (results || [])[0] || table;
+    return json(
+      {
+        ok: false,
+        error: `Table ${now.number} was just taken by someone else. Refresh the floor plan.`,
+        occupiedBy: {
+          server: now.server || null,
+          guests: now.guests || 0,
+          seatedAt: now.seated_at || null,
+        },
+      },
+      409
+    );
+  }
+
+  return null; // claimed - let the generic handler write the remaining fields
+}
+
+/**
  * The seating gate.
  *
  * Runs before the generic resource handler so that a table held by a booking
@@ -111,6 +159,42 @@ async function handleTables(pathname, method, url, request, env, auth) {
     const nextStatus = String(data.status || '').toLowerCase();
     if (!SEATING_STATUSES.includes(nextStatus)) return null; // not a seating change
 
+    // ── Is somebody already sitting here? ────────────────────────────────────
+    // A table holds one party at a time. Four screens can send this same write
+    // (floor plan, menu send-to-kitchen, orders, checkout), so the rule lives
+    // here rather than in any of them.
+    const { results: tableRows } = await d1Query(
+      env,
+      'SELECT id, number, status, server, guests, seated_at FROM tables WHERE id = ?',
+      [tableId]
+    );
+    const table = (tableRows || [])[0];
+    if (!table) return null; // let the generic handler answer 404
+
+    // `newSeating` is the caller stating intent: a waiter starting a fresh party
+    // rather than adding a round to the tab already on the table. The server
+    // cannot infer it — a client that just refetched the row echoes back the
+    // stored seated_at either way — so the flag only ever makes the check
+    // stricter, never laxer. It is not a table column, so the generic handler
+    // filters it out before the write.
+    const claimingNewSeat = data.newSeating === true || isNewSeating(table, data.seated_at);
+    const alreadyOccupied = String(table.status || '').toLowerCase() === 'occupied';
+
+    if (claimingNewSeat && alreadyOccupied && !isManager(auth)) {
+      return json(
+        {
+          ok: false,
+          error: `Table ${table.number} already has a party seated. Clear it or pick another table.`,
+          occupiedBy: {
+            server: table.server || null,
+            guests: table.guests || 0,
+            seatedAt: table.seated_at || null,
+          },
+        },
+        409
+      );
+    }
+
     const { results } = await d1Query(
       env,
       `SELECT id, name, guests, status, start_at, end_at, released_at, no_show_at
@@ -127,7 +211,7 @@ async function handleTables(pathname, method, url, request, env, auth) {
     // blocksSeating, not holdsTable: a booking later today is shown on the floor
     // plan but must not stop the table being used until its lead time.
     const hold = (results || []).find((r) => blocksSeating(r, nowMs));
-    if (!hold) return null; // nothing blocks it - proceed as normal
+    if (!hold) return claimSeat(env, table, data, claimingNewSeat);
 
     if (!isManager(auth)) {
       return json(
@@ -160,7 +244,11 @@ async function handleTables(pathname, method, url, request, env, auth) {
       [nowIso, actorName(auth), nowIso, hold.id]
     );
 
-    return null; // fall through so the generic handler performs the update
+    // A manager overriding is deliberate, so the claim is unconditional: they
+    // have already been told what they are taking.
+    return claimingNewSeat && !alreadyOccupied
+      ? claimSeat(env, table, data, claimingNewSeat)
+      : null;
   }
 
   return null;

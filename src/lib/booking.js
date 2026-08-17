@@ -175,6 +175,27 @@ export function blocksSeating(reservation, nowMs, graceMin = GRACE_MIN, leadMin 
   return nowMs >= start - leadMin * 60000;
 }
 
+/**
+ * Is this write seating a *new* party, or editing the one already sitting there?
+ *
+ * `seated_at` doubles as the seating's identity: it is stamped once when a party
+ * sits down and cleared when the table is released, so a caller that sends the
+ * same value back is working on the seating it already knows about. A caller
+ * sending a different one — or none at all — is trying to start a new one, and
+ * that is the case that has to be refused when somebody is already there.
+ *
+ * Without this distinction the two are indistinguishable at the API: both are
+ * `PUT {status:'occupied'}`, so either every edit to a seated table is refused
+ * or no second party is ever refused.
+ */
+export function isNewSeating(table, requestedSeatedAt) {
+  if (!table) return true;
+  if (String(table.status || '').toLowerCase() !== 'occupied') return true;
+  const current = String(table.seated_at || '').trim();
+  if (!current) return true;
+  return String(requestedSeatedAt || '').trim() !== current;
+}
+
 /** Bookings whose grace has expired and which nobody has marked yet. */
 export function isLapsedNoShow(reservation, nowMs, graceMin = GRACE_MIN) {
   if (!reservation) return false;
