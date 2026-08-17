@@ -25,6 +25,8 @@ import { roleMayAccess, ROLES } from '../src/auth.js';
 const SCREEN_NEEDS = {
   dashboard: ['delivery', 'expenses', 'inventory', 'orders', 'reports', 'reservations', 'tables'],
   orders: ['menu', 'orders'],
+  // Reads the open checks and the floor plan it can move them between.
+  'open-checks': ['orders', 'tables'],
   'menu-mgmt': ['menu'],
   'menu-view': ['menu'],
   tables: ['orders', 'tables'],
@@ -54,11 +56,11 @@ const SCREEN_NEEDS = {
  * hope: a screen granted here and missing there is caught, and vice versa.
  */
 const POS_PERMISSIONS = {
-  manager: ['dashboard', 'orders', 'tables', 'menu-mgmt', 'menu-view', 'expenses', 'pnl', 'cashdrawer', 'inventory', 'waste', 'shifts', 'timeclock', 'kitchen', 'reports', 'reservations', 'delivery', 'analytics', 'checkout', 'recipes', 'suppliers', 'purchases', 'stock-control'],
+  manager: ['dashboard', 'orders', 'open-checks', 'tables', 'menu-mgmt', 'menu-view', 'expenses', 'pnl', 'cashdrawer', 'inventory', 'waste', 'shifts', 'timeclock', 'kitchen', 'reports', 'reservations', 'delivery', 'analytics', 'checkout', 'recipes', 'suppliers', 'purchases', 'stock-control'],
   'head-chef': ['kitchen', 'orders', 'dashboard', 'inventory', 'waste', 'reports', 'pipeline', 'menu-mgmt', 'recipes', 'stock-control', 'suppliers', 'purchases'],
   'assistant-chef': ['kitchen', 'orders', 'dashboard', 'inventory', 'recipes'],
-  'head-waiter': ['tables', 'orders', 'dashboard', 'menu-view', 'reservations', 'checkout'],
-  cashier: ['cashdrawer', 'orders', 'dashboard', 'tables', 'reports', 'timeclock', 'reservations', 'revenue', 'menu-view', 'analytics', 'checkout'],
+  'head-waiter': ['tables', 'orders', 'open-checks', 'dashboard', 'menu-view', 'reservations', 'checkout'],
+  cashier: ['cashdrawer', 'orders', 'open-checks', 'dashboard', 'tables', 'reports', 'timeclock', 'reservations', 'revenue', 'menu-view', 'analytics', 'checkout'],
   'delivery-staff': ['delivery', 'dashboard'],
   cleaner: ['waste', 'dashboard'],
   accountant: ['dashboard', 'reports', 'revenue', 'pnl', 'expenses', 'analytics', 'orders', 'purchases', 'suppliers'],

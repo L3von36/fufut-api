@@ -4,6 +4,9 @@ import { actorName, isManager } from '../auth.js';
 import { refreshPaymentStatus } from './payments.js';
 import { syncDeliveryToOrderStatus } from './delivery.js';
 import { consumeForOrder, reverseOrderConsumption } from '../lib/ledger.js';
+import { blocksSeating, ACTIVE_STATUSES } from '../lib/booking.js';
+
+const ACTIVE_LIST = ACTIVE_STATUSES.map((s) => `'${s}'`).join(', ');
 
 /**
  * Order states that mean the food was actually made, and therefore that the
@@ -176,6 +179,46 @@ async function orderColumns(env) {
   const { results } = await d1Query(env, "PRAGMA table_info(orders)");
   ORDER_COLUMNS = (results || []).map((c) => c.name);
   return ORDER_COLUMNS;
+}
+
+/**
+ * Checks with money still owed on them.
+ *
+ * "Open" is a question about money, not about food. An order that has been
+ * served is exactly when the bill falls due, so order status is deliberately
+ * not a filter here — the floor plan already made that mistake, dropping a tab
+ * from its badge the moment the food was marked delivered. Only cancelling or
+ * voiding stops a check being owed, and only settling stops it being open.
+ * 'overpaid' is settled: the guest is owed change, not the shop.
+ *
+ * Oldest first, because the check that has been open longest is the one most
+ * likely to walk.
+ */
+async function listOpenChecks(env) {
+  const cols = await orderColumns(env);
+  const where = ["COALESCE(status,'') <> 'cancelled'"];
+  if (cols.includes('voided_at')) where.push('voided_at IS NULL');
+  // Filtered against the live schema for the same reason the writes are: the
+  // payment columns arrived in migration 005, and a SELECT naming a column the
+  // table does not have fails outright rather than degrading.
+  if (cols.includes('payment_status')) {
+    where.push("(payment_status IS NULL OR payment_status IN ('unpaid','partial'))");
+  } else {
+    where.push("COALESCE(payment,'') <> 'paid'");
+  }
+  const { results } = await d1Query(
+    env,
+    `SELECT * FROM orders WHERE ${where.join(' AND ')} ORDER BY created ASC`
+  );
+  return results || [];
+}
+
+/** Open checks still sitting against one table. */
+async function openChecksForTable(env, tableNumber, excludeOrderId) {
+  const open = await listOpenChecks(env);
+  return open.filter(
+    (o) => String(o.table_id || '') === String(tableNumber) && o.id !== excludeOrderId
+  );
 }
 
 /** Test seam: forget the cached schema. */
@@ -355,13 +398,140 @@ async function createDeliveryJob(env, auth, orderId, data, orderType) {
   }
 }
 
+/**
+ * Move a check to another table.
+ *
+ * This exists because of what staff do without it. A guest changes seats, or
+ * the order went on the wrong table, and the only tool available is to clear
+ * the table — which drops the tab off the floor plan while the money is still
+ * owed. Giving people the operation is how you stop the workaround; refusing
+ * the workaround without providing the operation just moves the damage.
+ *
+ * The destination is subject to the same exclusivity as seating anywhere else:
+ * a table with a party on it, or one inside a booking's window, is refused
+ * unless a manager decides otherwise.
+ */
+async function transferCheck(orderId, request, env, auth) {
+  const data = await readBody(request);
+  if (!data) return json({ ok: false, error: "Invalid JSON body" }, 400);
+
+  const target = String(
+    data.tableNumber ?? data.table_number ?? data.tableNum ?? ""
+  ).trim();
+  if (!target) return json({ ok: false, error: "tableNumber is required" }, 400);
+
+  const { results: orderRows } = await d1Query(env, "SELECT * FROM orders WHERE id = ?", [orderId]);
+  const order = (orderRows || [])[0];
+  if (!order) return json({ ok: false, error: "Order not found" }, 404);
+  if (order.voided_at) {
+    return json({ ok: false, error: "This check has been voided and cannot be moved." }, 409);
+  }
+  if (String(order.payment_status || "") === "paid") {
+    return json({ ok: false, error: "This check is already settled." }, 409);
+  }
+
+  const from = String(order.table_id || "");
+  // Moving a check to where it already is should not disturb either table.
+  if (from === target) return json({ ok: true, moved: false, from, to: target });
+
+  const { results: destRows } = await d1Query(env, "SELECT * FROM tables WHERE number = ?", [target]);
+  const dest = (destRows || [])[0];
+  if (!dest) return json({ ok: false, error: `Table ${target} does not exist.` }, 404);
+
+  const manager = isManager((auth && (auth.sessionRole || auth.role)) || "");
+  const nowMs = Date.now();
+
+  if (String(dest.status || "").toLowerCase() === "occupied" && !manager) {
+    return json(
+      {
+        ok: false,
+        error: `Table ${target} already has a party seated. Pick an empty table or ask a manager.`,
+        occupiedBy: { server: dest.server || null, guests: dest.guests || 0, seatedAt: dest.seated_at || null },
+      },
+      409
+    );
+  }
+
+  const { results: bookings } = await d1Query(
+    env,
+    `SELECT id, name, guests, status, start_at, end_at, released_at, no_show_at
+       FROM reservations
+      WHERE table_id = ?
+        AND status IN (${ACTIVE_LIST})
+        AND released_at IS NULL
+        AND no_show_at IS NULL
+        AND start_at IS NOT NULL AND end_at IS NOT NULL`,
+    [dest.id]
+  );
+  const hold = (bookings || []).find((r) => blocksSeating(r, nowMs));
+  if (hold && !manager) {
+    return json(
+      {
+        ok: false,
+        error: `Table ${target} is reserved. A manager must release it before a check can be moved there.`,
+        reservation: { id: hold.id, name: hold.name, guests: hold.guests, startAt: hold.start_at, endAt: hold.end_at },
+      },
+      409
+    );
+  }
+
+  const nowIso = new Date().toISOString();
+  const { results: srcRows } = await d1Query(env, "SELECT * FROM tables WHERE number = ?", [from]);
+  const src = (srcRows || [])[0] || null;
+
+  await d1Run(env, "UPDATE orders SET table_id = ?, updated_at = ? WHERE id = ?", [target, nowIso, orderId]);
+
+  // The party moves with the check: guests and server come across, and the
+  // seating clock is only started if the destination was not already running
+  // one, so a manager merging onto a busy table does not reset its timer.
+  await d1Run(
+    env,
+    `UPDATE tables
+        SET status = 'occupied',
+            seated_at = CASE WHEN seated_at IS NULL OR TRIM(seated_at) = '' THEN ? ELSE seated_at END,
+            guests = ?,
+            server = ?
+      WHERE id = ?`,
+    [nowIso, (src && src.guests) || dest.guests || 0, (src && src.server) || dest.server || "", dest.id]
+  );
+
+  // Free the table they left, but only once nothing is owed on it. Another
+  // party's tab may still be sitting there.
+  let sourceFreed = false;
+  if (src) {
+    const remaining = await openChecksForTable(env, from, orderId);
+    if (!remaining.length) {
+      await d1Run(
+        env,
+        "UPDATE tables SET status = 'available', seated_at = '', guests = 0, server = '' WHERE id = ?",
+        [src.id]
+      );
+      sourceFreed = true;
+    }
+  }
+
+  await writeAudit(env, auth, {
+    action: "update",
+    entity: "orders",
+    entityId: orderId,
+    before: { table_id: from },
+    after: { table_id: target, source_table_freed: sourceFreed },
+  });
+
+  return json({ ok: true, moved: true, from, to: target, sourceFreed });
+}
+
 async function handleOrders(pathname, method, url, request, env, auth) {
   const m = method.toUpperCase();
   const sub = pathname.replace(/^\/api\/orders/, "");
   if (m === "GET" && sub === "") {
-    const tableFilter = url && url.searchParams ? url.searchParams.get("table_number") : null;
+    const params = url && url.searchParams ? url.searchParams : null;
+    const tableFilter = params ? params.get("table_number") : null;
+    const openOnly = params ? ['1', 'true', 'yes'].includes(String(params.get("open") || '').toLowerCase()) : false;
     let rows;
-    if (tableFilter) {
+    if (openOnly) {
+      rows = await listOpenChecks(env);
+    } else if (tableFilter) {
       const { results } = await d1Query(env, "SELECT * FROM orders WHERE table_id = ? ORDER BY created DESC", [String(tableFilter)]);
       rows = results || [];
     } else {
@@ -643,6 +813,11 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     const items = (lines || []).map((i) => Object.assign({}, i, { durations: itemDurations(i) }));
 
     return json({ ...mapOrderRow(order), items });
+  }
+
+  // POST /api/orders/:id/transfer  { tableNumber }
+  if (m === "POST" && /^\/[^/]+\/transfer$/.test(sub)) {
+    return transferCheck(sub.split("/")[1], request, env, auth);
   }
 
   // PUT /api/orders/:orderId/items/:itemId  { status }
