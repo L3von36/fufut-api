@@ -1,11 +1,13 @@
 -- Schema for a local FU FUT server, dumped from the production D1
 -- database on 2026-08-18. Regenerate with:
 --   npx wrangler d1 execute fufut-db --remote --command "SELECT sql FROM sqlite_master"
-
-CREATE TABLE IF NOT EXISTS _cf_KV (
-        key TEXT PRIMARY KEY,
-        value BLOB
-      ) WITHOUT ROWID;
+--
+-- `_cf_KV` appears in that dump and is deliberately NOT here. It is D1's own
+-- internal table: SQLite will happily create it, which is why this file worked
+-- locally for weeks, but D1 refuses with SQLITE_AUTH — so a dump containing it
+-- cannot bootstrap a D1 database at all. Found the first time this file was
+-- applied to a real D1 instead of to local SQLite. The local KV shim uses its
+-- own `_local_kv` table and never wanted this one.
 CREATE TABLE IF NOT EXISTS audit_log (
   id          TEXT PRIMARY KEY,
   at          TEXT NOT NULL,
@@ -540,10 +542,16 @@ CREATE TABLE IF NOT EXISTS sync_outbox (
   at        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_entity_seq ON sync_outbox(entity, entity_id, seq);
+CREATE TABLE IF NOT EXISTS sync_identity (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  epoch      TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS sync_cursors (
   site_id    TEXT NOT NULL,
-  direction  TEXT NOT NULL,   -- push | pull
+  direction  TEXT NOT NULL,   -- in | out
   last_seq   INTEGER NOT NULL DEFAULT 0,
+  epoch      TEXT,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (site_id, direction)
 );

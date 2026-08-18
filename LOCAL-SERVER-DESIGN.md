@@ -245,11 +245,32 @@ Do 1 before 3. Capture is fail-open, so a Worker with `SITE_ID` set and no
 `sync_outbox` keeps trading and logs an error per process — survivable, but not
 a state to enter deliberately.
 
-**The rehearsal this still needs:** every test to date runs the cloud side
-against local SQLite standing in for D1. The one difference that matters is that
-D1 is remote, so a push that times out mid-batch is a real case the tests cannot
-produce. Rehearse against a staging Worker with migration 014 applied before
-pointing the cafe at it.
+**The rehearsal has been done.** `wrangler deploy --env rehearsal` puts the
+Worker on its own D1 database (`fufut-db-staging`) rather than production's —
+the `fufut-api-staging` deploy in CI deliberately shares production's D1/KV/R2,
+which makes it exactly the wrong place to rehearse something that writes rows.
+A real box synced with it over the real internet: an order taken on the floor
+reached D1 with its line items, a booking made through the public API reached
+the box, a cloud-owned edit made locally surfaced as a conflict, and a repeat
+run pushed nothing.
+
+It found three things no local test could:
+
+1. **`local/schema.sql` could not bootstrap a D1 database at all.** The dump
+   included `_cf_KV`, D1's own internal table; SQLite creates it happily, D1
+   refuses with `SQLITE_AUTH`. Removed.
+2. **The box never learned its own pushes were refused.** Conflicts raised
+   during a push happen on the far side, and the daemon ignored the count in
+   the reply — a manager at a healthy box would have seen nothing wrong while
+   refused writes piled up where they could not look.
+3. **A rebuilt box lost everything, silently.** `seq` restarts at 1 when the
+   outbox is recreated — a re-imaged box, or one restored from the nightly
+   backup. The cloud compared those fresh low numbers against the cursor it
+   remembered and skipped every one as already applied: no error, no conflict,
+   an entire day's trading into a void. Journals now carry an `epoch`, and a
+   cursor whose epoch no longer matches resets to zero. This is the one that
+   would have hurt, because restoring from backup is exactly the moment you
+   most need the writes to arrive.
 
 ## Staged plan
 

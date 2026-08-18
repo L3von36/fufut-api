@@ -18,13 +18,29 @@ CREATE TABLE IF NOT EXISTS sync_outbox (
 -- Replay is ordered per entity, so this is the index the sync engine reads on.
 CREATE INDEX IF NOT EXISTS idx_outbox_entity_seq ON sync_outbox(entity, entity_id, seq);
 
+-- Which journal this side is, so a rebuilt box is not mistaken for the old one.
+--
+-- `seq` restarts at 1 whenever the outbox is recreated — a re-imaged box, or one
+-- restored from backup. Without a way to tell the journals apart the receiver
+-- compares those fresh low seqs against the cursor it remembers and skips every
+-- one as already applied: total, silent data loss with no error and no conflict.
+-- Found by the staging rehearsal, where a second box's orders vanished against
+-- a cursor left at 4.
+CREATE TABLE IF NOT EXISTS sync_identity (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  epoch      TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
 -- How far each side has been read. `direction` separates "what we have pushed"
 -- from "what we have pulled": one row per peer per direction, so an interrupted
--- push cannot rewind the pull cursor.
+-- push cannot rewind the pull cursor. `epoch` is the sender's journal identity —
+-- when it changes, the cursor is meaningless and resets to zero.
 CREATE TABLE IF NOT EXISTS sync_cursors (
   site_id    TEXT NOT NULL,
-  direction  TEXT NOT NULL,   -- push | pull
+  direction  TEXT NOT NULL,   -- in | out
   last_seq   INTEGER NOT NULL DEFAULT 0,
+  epoch      TEXT,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (site_id, direction)
 );

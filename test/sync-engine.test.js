@@ -131,6 +131,24 @@ describe('the floor wins about the floor', () => {
     expect(open[0].entity).toBe('tables');
   });
 
+  it('tells the box its own write was refused', async () => {
+    // Found by the staging rehearsal, which reported "run 0, cloud reports 1":
+    // conflicts raised by a push happen on the far side, and the daemon was
+    // ignoring the count in the reply. A manager at a healthy box would see
+    // nothing wrong while refused writes piled up where they could not look.
+    await d1Run(box, 'UPDATE staff SET role = ? WHERE id = ?', ['manager', 'S-NOBODY']);
+
+    const result = await engine.runOnce();
+
+    expect(result.refused).toBe(1);
+    expect(result.conflicts).toBe(1);
+
+    // And the box can report what the other side is holding, without anybody
+    // having to go and look.
+    const state = await engine.status();
+    expect(state.unresolved_remote).toBeGreaterThanOrEqual(0);
+  });
+
   it('surfaces a menu price edited on the box during an outage', async () => {
     // The manager may use the backoffice on the box. Menu is cloud-owned, so
     // the edit cannot simply be applied — it has to be seen.
@@ -142,6 +160,41 @@ describe('the floor wins about the floor', () => {
     expect(open).toHaveLength(1);
     expect(open[0].entity).toBe('menu_items');
     expect(open[0].site_id).toBe('local');
+  });
+});
+
+describe('a box rebuilt from backup is not mistaken for the old one', () => {
+  it('does not let the cloud skip a fresh journal', async () => {
+    // The worst bug the staging rehearsal found, and it was completely silent:
+    // a re-imaged box restarts seq at 1, the cloud compares those against the
+    // cursor it remembers, and skips every entry as already applied. A full
+    // day's trading into a void, with no error and no conflict.
+    await d1Run(box, 'INSERT INTO orders (id, items, total) VALUES (?, ?, ?)', ['O-FIRST', '[]', 10]);
+    await d1Run(box, 'INSERT INTO orders (id, items, total) VALUES (?, ?, ?)', ['O-SECOND', '[]', 20]);
+    await engine.runOnce();
+    expect(cloudDb.prepare('SELECT count(*) AS n FROM orders').get().n).toBe(2);
+
+    // The box is rebuilt: same site_id, brand new journal starting at seq 1.
+    boxDb.exec('DELETE FROM sync_outbox');
+    boxDb.exec('DELETE FROM sync_cursors');
+    boxDb.exec('DELETE FROM sync_identity');
+    boxDb.exec("DELETE FROM sqlite_sequence WHERE name = 'sync_outbox'");
+
+    await d1Run(box, 'INSERT INTO orders (id, items, total) VALUES (?, ?, ?)', ['O-AFTER-REBUILD', '[]', 30]);
+    const result = await engine.runOnce();
+
+    expect(result.pushed).toBeGreaterThan(0);
+    expect(cloudDb.prepare("SELECT count(*) AS n FROM orders WHERE id = 'O-AFTER-REBUILD'").get().n).toBe(1);
+  });
+
+  it('still refuses to double-apply within one journal', async () => {
+    // The epoch reset must not cost the idempotency it sits next to.
+    await d1Run(box, 'INSERT INTO orders (id, items, total) VALUES (?, ?, ?)', ['O-ONCE', '[]', 40]);
+    await engine.runOnce();
+    const second = await engine.runOnce();
+
+    expect(second.pushed).toBe(0);
+    expect(cloudDb.prepare('SELECT count(*) AS n FROM orders').get().n).toBe(1);
   });
 });
 

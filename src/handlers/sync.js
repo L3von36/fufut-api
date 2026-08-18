@@ -110,21 +110,27 @@ export async function applyEntry(env, siteId, entry, receiver) {
   }
 }
 
-async function cursor(env, siteId, direction) {
+async function cursorRow(env, siteId, direction) {
   const { results } = await d1Query(
     env,
-    'SELECT last_seq FROM sync_cursors WHERE site_id = ? AND direction = ?',
+    'SELECT last_seq, epoch FROM sync_cursors WHERE site_id = ? AND direction = ?',
     [siteId, direction]
   );
-  return (results && results[0] && Number(results[0].last_seq)) || 0;
+  return (results && results[0]) || null;
 }
 
-export async function setCursor(env, siteId, direction, lastSeq) {
+async function cursor(env, siteId, direction) {
+  const row = await cursorRow(env, siteId, direction);
+  return (row && Number(row.last_seq)) || 0;
+}
+
+export async function setCursor(env, siteId, direction, lastSeq, epoch = null) {
   await d1Run(
     env,
-    `INSERT INTO sync_cursors (site_id, direction, last_seq, updated_at) VALUES (?, ?, ?, ?)
-     ON CONFLICT (site_id, direction) DO UPDATE SET last_seq = excluded.last_seq, updated_at = excluded.updated_at`,
-    [siteId, direction, lastSeq, new Date().toISOString()]
+    `INSERT INTO sync_cursors (site_id, direction, last_seq, epoch, updated_at) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT (site_id, direction) DO UPDATE SET last_seq = excluded.last_seq,
+       epoch = excluded.epoch, updated_at = excluded.updated_at`,
+    [siteId, direction, lastSeq, epoch, new Date().toISOString()]
   );
 }
 
@@ -142,8 +148,21 @@ async function handlePush(request, env, receiver) {
   }
 
   const siteId = String(body.site_id || 'unknown');
+  const epoch = body.epoch ? String(body.epoch) : null;
   const applied = { applied: 0, duplicate: 0, conflict: 0, skipped: 0 };
-  let lastSeq = await cursor(env, siteId, 'in');
+
+  /**
+   * A journal that is not the one this cursor describes starts from nothing.
+   *
+   * `seq` restarts at 1 when a box is re-imaged or restored from backup. Judged
+   * against the remembered cursor those fresh low numbers look like entries
+   * already applied, and every one is skipped — silently, with no error and no
+   * conflict, which is the worst way to lose a day's trading. Comparing the
+   * epoch is what tells a new journal from a replayed one.
+   */
+  const known = await cursorRow(env, siteId, 'in');
+  const rewound = Boolean(epoch && known && known.epoch && known.epoch !== epoch);
+  let lastSeq = rewound ? 0 : (known && Number(known.last_seq)) || 0;
 
   // In seq order, always: "add the item" must not arrive after "mark it
   // served".
@@ -163,8 +182,10 @@ async function handlePush(request, env, receiver) {
     if (seq) lastSeq = seq;
   }
 
-  await setCursor(env, siteId, 'in', lastSeq);
-  return json({ ok: true, last_seq: lastSeq, ...applied });
+  await setCursor(env, siteId, 'in', lastSeq, epoch);
+  // `rewound` tells the sender its journal was recognised as a new one, which
+  // is worth seeing in a log rather than inferring from counts.
+  return json({ ok: true, last_seq: lastSeq, rewound, ...applied });
 }
 
 /** GET /api/sync/pull?since=N — hand over this side's journal. */

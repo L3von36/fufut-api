@@ -35,6 +35,28 @@ export const SYNC_INTERVAL_MS = 30_000;
  */
 const RETAIN_ACKED_MS = 7 * 24 * 60 * 60 * 1000;
 
+/**
+ * This journal's identity, created once and kept.
+ *
+ * A re-imaged box, or one restored from backup, starts its outbox `seq` at 1
+ * again. The cloud has no way to tell those fresh low numbers from entries it
+ * already applied, so without this it skips every one of them and the box
+ * trades all day into a void. Generated here, sent with every push, and the
+ * receiver resets its cursor when it changes.
+ */
+async function journalEpoch(env) {
+  const { results } = await d1Query(env, 'SELECT epoch FROM sync_identity WHERE id = 1');
+  if (results && results[0] && results[0].epoch) return results[0].epoch;
+
+  const epoch = crypto.randomUUID();
+  await d1Run(env, 'INSERT OR IGNORE INTO sync_identity (id, epoch, created_at) VALUES (1, ?, ?)', [
+    epoch,
+    new Date().toISOString(),
+  ]);
+  const confirm = await d1Query(env, 'SELECT epoch FROM sync_identity WHERE id = 1');
+  return (confirm.results && confirm.results[0] && confirm.results[0].epoch) || epoch;
+}
+
 async function cursor(env, siteId, direction) {
   const { results } = await d1Query(
     env,
@@ -60,6 +82,7 @@ export function createSyncEngine({ env, fetchImpl, now = () => Date.now() }) {
   let timer = null;
   let lastSuccessAt = null;
   let lastError = null;
+  let remoteUnresolved = 0;
 
   function configured() {
     return Boolean(env.CLOUD_URL && env.SYNC_TOKEN);
@@ -82,9 +105,18 @@ export function createSyncEngine({ env, fetchImpl, now = () => Date.now() }) {
     return await response.json();
   }
 
-  /** Send everything the cloud has not acknowledged. */
+  /**
+   * Send everything the cloud has not acknowledged.
+   *
+   * Returns the cloud's refusals as well as the count sent. The box has to know
+   * when its own writes were turned away: a manager standing at a healthy box
+   * would otherwise see nothing wrong while conflicts pile up on the other
+   * side, which is the silent drop this design exists to prevent — just viewed
+   * from the end that cannot see it.
+   */
   async function push() {
     let sent = 0;
+    let refused = 0;
     for (let round = 0; round < MAX_ROUNDS; round += 1) {
       const since = await cursor(env, peer, 'out');
       const { results } = await d1Query(
@@ -97,18 +129,23 @@ export function createSyncEngine({ env, fetchImpl, now = () => Date.now() }) {
 
       const answer = await request('/api/sync/push', {
         method: 'POST',
-        body: JSON.stringify({ site_id: me, entries }),
+        body: JSON.stringify({ site_id: me, epoch: await journalEpoch(env), entries }),
       });
+
+      if (answer.rewound) {
+        console.log('[fufut] sync: the cloud did not recognise this journal and started again from the beginning — expected after restoring this box from a backup');
+      }
 
       // Trust the cloud's acknowledgement rather than what we sent: if it
       // applied less than it was given, the rest must be sent again.
       const acked = Number(answer.last_seq || 0);
+      refused += Number(answer.conflict || 0);
       if (acked <= since) break; // no progress; stop rather than spin
       await setCursor(env, peer, 'out', acked);
       sent += entries.filter((e) => e.seq <= acked).length;
       if (entries.length < BATCH) break;
     }
-    return sent;
+    return { sent, refused };
   }
 
   /** Collect and apply everything the cloud has that this box has not seen. */
@@ -151,7 +188,10 @@ export function createSyncEngine({ env, fetchImpl, now = () => Date.now() }) {
     if (!configured()) return { skipped: 'not configured' };
 
     try {
-      await request(`/api/sync/status?site_id=${encodeURIComponent(me)}`);
+      const beat = await request(`/api/sync/status?site_id=${encodeURIComponent(me)}`);
+      // What the other side is holding for a human, so the box can say so
+      // without anybody having to go and look.
+      remoteUnresolved = Number(beat.unresolved_conflicts || 0);
     } catch (err) {
       lastError = err.message;
       if (online !== false) {
@@ -169,11 +209,15 @@ export function createSyncEngine({ env, fetchImpl, now = () => Date.now() }) {
     }
 
     try {
-      const pushed = await push();
-      const { applied, conflicts } = await pull();
+      const { sent: pushed, refused } = await push();
+      const { applied, conflicts: pulledConflicts } = await pull();
       const pruned = await prune();
       lastSuccessAt = new Date(now()).toISOString();
       lastError = null;
+
+      // Both directions. A write of ours the cloud refused counts every bit as
+      // much as one of theirs we refused.
+      const conflicts = pulledConflicts + refused;
 
       if (pushed || applied || conflicts) {
         console.log(
@@ -181,10 +225,10 @@ export function createSyncEngine({ env, fetchImpl, now = () => Date.now() }) {
             (pruned ? `, pruned ${pruned}` : '')
         );
       }
-      if (conflicts) {
+      if (conflicts || remoteUnresolved) {
         console.log('[fufut] sync: conflicts need a manager — GET /api/sync/reconciliation');
       }
-      return { online: true, pushed, applied, conflicts, pruned };
+      return { online: true, pushed, applied, conflicts, refused, pruned };
     } catch (err) {
       // Reachable but the exchange failed. Worth saying every time, because
       // unlike an outage this is not expected.
@@ -247,6 +291,9 @@ export function createSyncEngine({ env, fetchImpl, now = () => Date.now() }) {
       unresolved,
       last_success: lastSuccessAt,
       last_error: lastError,
+      // Held by the cloud, not by us. Without this the box can look completely
+      // healthy while the other side is sitting on refused writes.
+      unresolved_remote: remoteUnresolved,
     };
   }
 

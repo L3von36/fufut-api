@@ -38,7 +38,7 @@
  *   for a captured row to land in. Content in KV stays cloud-authoritative.
  */
 const EXCLUDED = new Set([
-  'sessions', 'sync_outbox', 'sync_cursors', 'sync_reconciliation', 'venue_heartbeat',
+  'sessions', 'sync_outbox', 'sync_cursors', 'sync_reconciliation', 'sync_identity', 'venue_heartbeat',
   'd1_migrations', '_cf_kv',
 ]);
 

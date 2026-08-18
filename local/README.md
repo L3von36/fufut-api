@@ -184,6 +184,10 @@ backoffice on the box during an outage writes to cloud-owned entities.
   handlers write conditional updates — the atomic table claim carries
   `AND status <> 'occupied'` — and a condition re-evaluated against the
   receiver's state can quietly match nothing.
+- **A journal carries an `epoch`.** Recreating the outbox — a re-imaged box, a
+  restore from backup — restarts `seq` at 1, and without an epoch the receiver
+  skips all of it as already applied. Silent, total, and at the worst possible
+  moment.
 - **`venue_heartbeat` is excluded from capture,** like the cursors. It is
   written every 30 seconds; journalling it would have the cloud handing the box
   ~2,880 entries a day saying only that the box is alive.
@@ -194,11 +198,12 @@ Multi-venue, real-time sync (polling is enough for one venue), R2 image sync
 (images are served from whichever origin holds them), and a reconciliation UI in
 the backoffice — the table and the API exist, the screen does not.
 
-**And none of it has run against real Cloudflare.** Every test to date exercises
-the cloud side against local SQLite standing in for D1. The difference that
-matters is that D1 is remote: a push that times out mid-batch is a real case the
-tests cannot produce. Rehearse against a staging Worker before pointing the cafe
-at this.
+**It has been rehearsed against real Cloudflare** — `wrangler deploy --env
+rehearsal`, which uses its own `fufut-db-staging` database rather than
+production's. That found three bugs local tests could not, the worst being that
+a box restored from backup restarts its journal at `seq` 1 and had every entry
+skipped by the cloud as already applied. Journals now carry an `epoch` for
+exactly that reason. See the design doc.
 
 ## Tests
 

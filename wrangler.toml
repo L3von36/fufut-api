@@ -58,3 +58,52 @@ crons = ["* * * * *"]
 #
 # [vars]
 # SITE_ID = "cloud"
+
+# ── Rehearsal environment ────────────────────────────────────────────────────
+# `wrangler deploy --env rehearsal` puts the Worker on its OWN D1 database.
+#
+# This exists because the `fufut-api-staging` deploy in CI shares production's
+# D1/KV/R2 — deliberately, so it exercises real data — which makes it exactly
+# the wrong place to rehearse sync. A sync rehearsal pushes entries and creates
+# rows; doing that against the production database is not a rehearsal, it is a
+# write to the business's records.
+#
+# Bindings are not inherited by named environments, so everything is repeated.
+# KV and R2 point at the production namespaces on purpose: the sync routes never
+# touch either, and creating six throwaway namespaces to prove that would be
+# more moving parts, not fewer.
+[env.rehearsal]
+vars = { SITE_ID = "cloud" }
+
+[[env.rehearsal.d1_databases]]
+binding = "DB"
+database_name = "fufut-db-staging"
+database_id = "a7e16cd6-8f14-4dd3-9b8b-6b119b18421f"
+
+[[env.rehearsal.r2_buckets]]
+binding = "IMAGES_R2"
+bucket_name = "fufut-images"
+
+[[env.rehearsal.kv_namespaces]]
+binding = "CONTENT_KV"
+id = "d591041eadfe4b69bbdd608e706c7f88"
+
+[[env.rehearsal.kv_namespaces]]
+binding = "MENU_KV"
+id = "72ed1b11297048a4b17f702091c06baa"
+
+[[env.rehearsal.kv_namespaces]]
+binding = "ORDERS_KV"
+id = "3d1056ebcd05439e911585c6f942fafa"
+
+[[env.rehearsal.kv_namespaces]]
+binding = "RESERVATIONS_KV"
+id = "686a682f961c45a9882b407f84e71b62"
+
+[[env.rehearsal.kv_namespaces]]
+binding = "REVIEWS_KV"
+id = "d2bf07f27482429aa3482d31527c1f6c"
+
+[[env.rehearsal.kv_namespaces]]
+binding = "GALLERY_KV"
+id = "8a05f5eecd7e477b92825d22df3ee67c"
