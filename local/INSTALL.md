@@ -30,11 +30,24 @@ connection is the thing you are working around; do not plan to download
 anything there.
 
 ```
-cd fufut-management/pos        && npx vite build --base /
-cd fufut-management/backoffice && npx vite build --base /backoffice/
+cd fufut-api && node local/mirror-bundles.mjs web
 ```
 
-**Ignore `vite.config.js`.** Both configs say `/pos/` and `/backoffice/`, and
+**Copy what is deployed; do not build.** Vite 8.1.5 — the version the lockfile
+pins — emits chunk files with an extra hash segment
+(`AppLayout-dRSWbmr3-Gibc_EBk.js`) while the bundle's own import map still asks
+for `AppLayout-dRSWbmr3.js`. Every lazily-loaded route 404s, which is every
+screen including the login page. It looks like a working build: `index.html`
+resolves and the app boots before failing.
+
+What Cloudflare serves predates that version and works. It is also the artifact
+the venue has been using for months, which makes it the better thing to put on
+the box regardless — the box should run what the cafe runs, not a fresh build
+nobody has exercised.
+
+Needs the internet, so it belongs here with the other before-you-travel steps.
+
+If you do build by hand, **ignore `vite.config.js`.** Both configs say `/pos/` and `/backoffice/`, and
 neither is what production uses: `.github/workflows/build-pos.yml` overrides
 both with `--base /`, and each app is deployed to its own subdomain root. The
 config is a trap — it looks authoritative and is dead.
@@ -68,8 +81,8 @@ PC behind a counter does not have.
 
 Take with you:
 
-- the `fufut-api` repository
-- `pos/dist` and `backoffice/dist`
+- the `fufut-api` repository, **including the `web/` directory** the mirror
+  filled
 - **`fufut-dump.sql`**
 - the Docker install for the box's OS
 - the `SYNC_TOKEN`, if sync is being switched on (see the design doc)
@@ -92,9 +105,7 @@ box at once, and it will look like the box has failed.
 mkdir -p ~/fufut/{data,web,backups}
 cd ~/fufut
 # copy docker-compose.yml, Dockerfile, src/, local/, package.json here
-mkdir -p web/backoffice
-cp -r /media/usb/pos-dist/.        web/
-cp -r /media/usb/backoffice-dist/. web/backoffice/
+cp -r /media/usb/web/. web/
 ```
 
 The finished layout:
