@@ -1,0 +1,23 @@
+{
+  "_comment": [
+    "Functions deliberately removed from the source, which are still present in",
+    "the currently deployed Worker because it predates the removal.",
+    "",
+    "check-drift.mjs fails when the deployed script contains a function this repo",
+    "does not, because that is what an out-of-band deploy looks like. A commit",
+    "that legitimately deletes or renames a function looks identical, and without",
+    "this file it would block every deploy from then on — which in practice means",
+    "somebody disables the check, and the guardrail is worth more than that.",
+    "",
+    "An entry here is a claim, made in a reviewable diff, that a name's",
+    "disappearance was intended. Entries become unnecessary the moment the deploy",
+    "lands; the check says which ones can go."
+  ],
+  "removed": [
+    {
+      "name": "cursor",
+      "why": "src/handlers/sync.js — replaced by cursorRow, which reads the epoch alongside last_seq so a rebuilt box's journal is recognised. Left unused and tree-shaken out of the bundle.",
+      "commit": "d1ca18c"
+    }
+  ]
+}

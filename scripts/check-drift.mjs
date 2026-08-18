@@ -18,7 +18,7 @@
  */
 
 import { execSync } from 'node:child_process';
-import { readFileSync, rmSync } from 'node:fs';
+import { readFileSync, rmSync, existsSync } from 'node:fs';
 
 const SCRIPT = process.argv[2] || 'fufut-api';
 const { CLOUDFLARE_API_TOKEN: TOKEN, CLOUDFLARE_ACCOUNT_ID: ACCOUNT } = process.env;
@@ -53,16 +53,60 @@ execSync('npx wrangler deploy --dry-run --outdir=.drift-build', { stdio: 'pipe' 
 const local = readFileSync('.drift-build/index.js', 'utf8');
 rmSync('.drift-build', { recursive: true, force: true });
 
+/**
+ * Deletions look exactly like drift.
+ *
+ * A function present in the deployed script and absent from this repo is the
+ * signature of an out-of-band deploy — and equally the signature of a commit
+ * that legitimately removed it, since production still predates the removal.
+ * Failing on both means every deletion blocks deploys until somebody switches
+ * the check off, and the check is worth more than that.
+ *
+ * So a removal has to be declared, in a diff a reviewer sees. That keeps the
+ * property that actually matters: nothing disappears from production without a
+ * human having said so in git.
+ */
+const ALLOW_PATH = new URL('./removed-functions.json', import.meta.url);
+let declared = [];
+if (existsSync(ALLOW_PATH)) {
+  try {
+    declared = JSON.parse(readFileSync(ALLOW_PATH, 'utf8')).removed || [];
+  } catch (e) {
+    console.error(`Could not read removed-functions.json: ${e.message}`);
+    process.exit(2);
+  }
+}
+const declaredNames = new Set(declared.map((r) => r.name));
+
 const dep = fnNames(deployed);
 const loc = fnNames(local);
-const missing = [...dep].filter((n) => !loc.has(n)); // live has code we do not
+const gone = [...dep].filter((n) => !loc.has(n));    // live has code we do not
+const missing = gone.filter((n) => !declaredNames.has(n));
+const accounted = gone.filter((n) => declaredNames.has(n));
 const extra = [...loc].filter((n) => !dep.has(n));   // we have code not live
+// Entries stop being needed once the deploy lands. Said out loud so the list
+// cannot rot into a permanent exemption nobody remembers granting.
+const stale = [...declaredNames].filter((n) => !dep.has(n));
+
+if (accounted.length) {
+  console.log('\nRemoved deliberately (declared in scripts/removed-functions.json):');
+  for (const name of accounted) {
+    const row = declared.find((r) => r.name === name);
+    console.log(`  ${name} — ${(row && row.why) || 'no reason given'}`);
+  }
+}
+if (stale.length) {
+  console.log('\nNo longer deployed; these entries can be deleted from removed-functions.json:');
+  console.log('  ' + stale.join(', '));
+}
 
 if (missing.length) {
   console.error('\nDRIFT — deployed contains functions absent from this repo:');
   console.error('  ' + missing.join(', '));
   console.error('\nProduction is running code that is not in git. Someone deployed');
   console.error('outside CI. Reconcile before deploying over it.');
+  console.error('\nIf this commit removed them on purpose, declare them in');
+  console.error('scripts/removed-functions.json with a reason.');
 }
 if (extra.length) {
   console.log('\nRepo contains functions not yet deployed (expected before a deploy):');

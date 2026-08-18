@@ -119,11 +119,6 @@ async function cursorRow(env, siteId, direction) {
   return (results && results[0]) || null;
 }
 
-async function cursor(env, siteId, direction) {
-  const row = await cursorRow(env, siteId, direction);
-  return (row && Number(row.last_seq)) || 0;
-}
-
 export async function setCursor(env, siteId, direction, lastSeq, epoch = null) {
   await d1Run(
     env,
