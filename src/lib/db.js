@@ -1,3 +1,5 @@
+import { outboxCapture, outboxBatchStatements } from './outbox.js';
+
 var D1_BINDING = "DB";
 
 function json(data, status = 200) {
@@ -28,7 +30,29 @@ async function d1Query(env, sql, params = []) {
 }
 
 async function d1Run(env, sql, params = []) {
-  return await env[D1_BINDING].prepare(sql).bind(...params).run();
+  const result = await env[D1_BINDING].prepare(sql).bind(...params).run();
+  // After the write, never before: the journal describes what happened, so a
+  // statement that failed must leave no entry behind for the other side to
+  // replay.
+  await outboxCapture(env, sql, params);
+  return result;
+}
+
+/**
+ * A batch, journalled inside its own transaction.
+ *
+ * Takes `{ sql, params }` descriptors rather than pre-bound statements,
+ * because the journal needs the SQL and the parameters and a bound D1
+ * statement will not give them back. The outbox inserts ride along in the same
+ * batch, so on both sides the journal commits with the writes it describes or
+ * not at all — an order that exists without its sync entry would reach the
+ * kitchen here and never appear on the other side.
+ */
+async function d1Batch(env, entries) {
+  const list = Array.isArray(entries) ? entries : [];
+  const statements = list.map(({ sql, params = [] }) => env[D1_BINDING].prepare(sql).bind(...params));
+  if (!statements.length) return [];
+  return await env[D1_BINDING].batch([...statements, ...outboxBatchStatements(env, list)]);
 }
 
 function stripMeta(content) {
@@ -39,4 +63,4 @@ function stripMeta(content) {
   }
   return clean;
 }
-export { D1_BINDING, json, readBody, now, vid, d1Query, d1Run, stripMeta };
+export { D1_BINDING, json, readBody, now, vid, d1Query, d1Run, d1Batch, stripMeta };

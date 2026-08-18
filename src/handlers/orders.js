@@ -1,4 +1,4 @@
-import { d1Query, d1Run, json, readBody } from '../lib/db.js';
+import { d1Query, d1Run, d1Batch, json, readBody } from '../lib/db.js';
 import { writeAudit } from '../lib/audit.js';
 import { actorName, isManager } from '../auth.js';
 import { refreshPaymentStatus } from './payments.js';
@@ -130,11 +130,12 @@ async function insertOrderItems(env, orderId, items, createdIso, lineOffset = 0)
         createdIso,
       ];
       if (canCourse) params.push(line.course || 'main');
-      return env.DB.prepare(
-        `INSERT INTO order_items (${columns.join(', ')}) VALUES (${placeholders})`
-      ).bind(...params);
+      return {
+        sql: `INSERT INTO order_items (${columns.join(', ')}) VALUES (${placeholders})`,
+        params,
+      };
     });
-    await env.DB.batch(statements);
+    await d1Batch(env, statements);
     return { inserted: lines.length, warning: null };
   } catch (e) {
     return { inserted: 0, warning: `Order saved, but per-item timing was not recorded: ${String(e.message || e)}` };
@@ -284,13 +285,13 @@ async function recordSubmittedPayments(env, auth, orderId, data) {
         const method = String(p.method || "cash").toLowerCase();
         // A transfer is only settled once somebody has seen the evidence.
         const status = ["telebirr", "cbe", "bank"].includes(method) ? "recorded" : "verified";
-        return env.DB.prepare(
-          `INSERT INTO payments
+        return {
+          sql: `INSERT INTO payments
              (id, order_id, method, amount, tendered, change_due, reference, evidence_key,
               status, collected_by, collected_by_name, verified_by, verified_by_name,
               verified_at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).bind(
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          params: [
           "PM" + crypto.randomUUID().slice(0, 10),
           orderId,
           method,
@@ -306,11 +307,12 @@ async function recordSubmittedPayments(env, auth, orderId, data) {
           status === "verified" ? (auth ? actorName(auth) : null) : null,
           status === "verified" ? nowIso : null,
           nowIso
-        );
+          ],
+        };
       });
 
     if (!statements.length) return { inserted: 0, warning: null };
-    await env.DB.batch(statements);
+    await d1Batch(env, statements);
     await refreshPaymentStatus(env, orderId);
     return { inserted: statements.length, warning: null };
   } catch (e) {

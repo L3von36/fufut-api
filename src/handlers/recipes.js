@@ -18,7 +18,7 @@
  * recipe did we consume" is never ambiguous at the point it has to be recorded.
  */
 
-import { d1Query, d1Run, json, readBody } from '../lib/db.js';
+import { d1Query, d1Run, d1Batch, json, readBody } from '../lib/db.js';
 import { writeAudit } from '../lib/audit.js';
 import { actorName } from '../auth.js';
 import { isKnownUnit, areCompatible, unitCatalogue } from '../lib/units.js';
@@ -141,13 +141,13 @@ async function insertRecipe(env, auth, { menuItemId, name, variant, version, yie
   );
 
   if (lines.length) {
-    await env.DB.batch(
-      lines.map((l) =>
-        env.DB.prepare(
-          `INSERT INTO recipe_items
+    await d1Batch(
+      env,
+      lines.map((l) => ({
+        sql: `INSERT INTO recipe_items
              (id, recipe_id, inventory_id, qty, unit, is_packaging, waste_pct, optional, sort_order, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).bind(
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        params: [
           'RI' + crypto.randomUUID().slice(0, 10),
           id,
           l.inventory_id,
@@ -157,9 +157,9 @@ async function insertRecipe(env, auth, { menuItemId, name, variant, version, yie
           l.waste_pct,
           l.optional,
           l.sort_order,
-          l.notes
-        )
-      )
+          l.notes,
+        ],
+      }))
     );
   }
 

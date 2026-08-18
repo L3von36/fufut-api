@@ -529,3 +529,42 @@ CREATE INDEX IF NOT EXISTS idx_tips_date  ON tips(date);
 CREATE INDEX IF NOT EXISTS idx_tips_order ON tips(order_id);
 CREATE INDEX IF NOT EXISTS idx_tips_staff ON tips(staff_id, date);
 CREATE INDEX IF NOT EXISTS idx_waste_item ON waste(inventory_id, date);
+
+-- Sync tables (migration 014). See migrations/014-sync.sql.
+CREATE TABLE IF NOT EXISTS sync_outbox (
+  seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity    TEXT NOT NULL,   -- the table written to
+  entity_id TEXT,            -- primary key of the affected row, when it can be told
+  op        TEXT NOT NULL,   -- insert | update | delete
+  payload   TEXT NOT NULL,   -- JSON { sql, params } — the write, verbatim
+  at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_entity_seq ON sync_outbox(entity, entity_id, seq);
+CREATE TABLE IF NOT EXISTS sync_cursors (
+  site_id    TEXT NOT NULL,
+  direction  TEXT NOT NULL,   -- push | pull
+  last_seq   INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (site_id, direction)
+);
+CREATE TABLE IF NOT EXISTS sync_reconciliation (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id       TEXT NOT NULL,   -- which peer the entry came from
+  seq           INTEGER,         -- its seq on that peer, for tracing
+  entity        TEXT NOT NULL,
+  entity_id     TEXT,
+  op            TEXT,
+  payload       TEXT,
+  reason        TEXT NOT NULL,   -- why it was not applied
+  winner        TEXT,            -- local | cloud
+  resolved      INTEGER NOT NULL DEFAULT 0,
+  resolved_by   TEXT,
+  resolved_at   TEXT,
+  created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_open ON sync_reconciliation(resolved, created_at);
+CREATE TABLE IF NOT EXISTS venue_heartbeat (
+  site_id   TEXT PRIMARY KEY,
+  last_seen TEXT NOT NULL,
+  detail    TEXT
+);

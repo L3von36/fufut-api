@@ -63,8 +63,27 @@ export function createLocalEnv({ dir = process.env.FUFUT_DATA_DIR || path.join(H
     DB,
     IMAGES_R2: createR2Bucket(path.join(dir, 'images')),
     ...createKVNamespaces(db, KV_NAMESPACES),
+
+    /**
+     * Who this side is, in sync terms. The box always has an identity — it is
+     * one of the two writers by definition — so capture is on here from the
+     * start, while the deployed cloud Worker stays untouched until SITE_ID is
+     * set on it deliberately.
+     *
+     * One venue for now, so the ids are fixed rather than provisioned.
+     * `sync_outbox` and the cursors are keyed on them, which is what makes
+     * adding a second venue later a configuration change rather than a
+     * migration.
+     */
+    SITE_ID: 'local',
+    /** Where to sync to. Unset means the box journals but never talks. */
+    CLOUD_URL: undefined,
+    /** Shared secret for the machine-to-machine sync routes. */
+    SYNC_TOKEN: undefined,
+
     // Anything configured as a Worker var or secret passes through, so the same
-    // handlers can read it here.
+    // handlers can read it here — and so the three above can be overridden from
+    // the environment or docker-compose.
     ...process.env,
   };
 
