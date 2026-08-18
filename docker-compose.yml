@@ -1,0 +1,83 @@
+# The box in the cafe.
+#
+#   docker compose up -d          start, and keep it started
+#   docker compose logs -f        watch service
+#   docker compose ps             is it healthy
+#
+# Stage 3 of LOCAL-SERVER-DESIGN.md: one box, one tablet pointed at it, the
+# cloud still primary. A rehearsal, not a migration — nothing syncs yet.
+
+services:
+  api:
+    build: .
+    image: fufut-local:latest
+    container_name: fufut-local
+    # A power cut should end with everything running and no human involved.
+    # Not `always`: if somebody deliberately stops the container, it stays
+    # stopped.
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      FUFUT_DATA_DIR: /data
+      # Drop the built POS into ./web and it is served from this box too, on
+      # the same origin as the API — which is what lets the production bundle
+      # talk to the local API with no rebuild and a first-party cookie.
+      FUFUT_WEB_DIR: /web
+      TZ: Africa/Addis_Ababa
+    volumes:
+      # HOST BIND MOUNTS, NOT NAMED VOLUMES. This is deliberate and it matters:
+      # one `docker compose down -v` on a named volume and the trading history
+      # is gone. A bind mount is a directory somebody can see, copy and back up
+      # without knowing anything about Docker.
+      - ./data:/data
+      - ./web:/web:ro
+      - ./backups:/backups
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/_local/health').then(r=>r.json()).then(b=>process.exit(b.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    logging:
+      # A till that runs for a year should not fill its own disk with logs and
+      # take itself down.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # The nightly snapshot. Runs in the same image, shares the data mount, and
+  # takes a consistent copy with VACUUM INTO while the API keeps trading.
+  #
+  # Until the sync engine exists, this is the entire disaster plan: lose the
+  # box and you lose everything since the last one of these.
+  backup:
+    image: fufut-local:latest
+    container_name: fufut-backup
+    depends_on:
+      - api
+    restart: unless-stopped
+    environment:
+      FUFUT_DATA_DIR: /data
+      FUFUT_BACKUP_DIR: /backups
+      TZ: Africa/Addis_Ababa
+    volumes:
+      # Not read-only, despite only ever reading. Opening a WAL database
+      # requires touching its -shm file, so a read-only mount fails outright.
+      # The script opens SQLite itself in readOnly mode, which is where the
+      # actual protection lives.
+      - ./data:/data
+      - ./backups:/backups
+    # Sleeps until 03:00, backs up, repeats. A container loop rather than host
+    # cron so the whole thing stays inside `docker compose up`, with nothing to
+    # forget to install on a new box.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          now=$$(date +%s)
+          next=$$(date -d 'tomorrow 03:00' +%s 2>/dev/null || echo $$((now + 86400)))
+          sleep $$((next - now))
+          node /app/local/backup.js || echo "[backup] FAILED"
+        done

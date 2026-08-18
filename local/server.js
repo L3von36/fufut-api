@@ -20,13 +20,47 @@ import http from 'node:http';
 import { Readable } from 'node:stream';
 import worker from '../src/index.js';
 import { createLocalEnv } from './env.js';
+import { createStaticHandler } from './static.js';
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 /** Matches the `crons = ["* * * * *"]` trigger in wrangler.toml. */
 const CRON_INTERVAL_MS = 60_000;
+const STARTED_AT = Date.now();
 
-const { env, dbPath, dir } = createLocalEnv();
+const { env, db, dbPath, dir } = createLocalEnv();
+const serveStatic = createStaticHandler(process.env.FUFUT_WEB_DIR);
+
+/**
+ * The container healthcheck.
+ *
+ * It lives here rather than in the Worker on purpose. `/api/health` requires a
+ * session — correctly — and the alternative would be poking a hole in the auth
+ * matrix for the benefit of Docker, which is the wrong trade on a till.
+ *
+ * It reads from SQLite instead of just answering 200. A process that is up but
+ * cannot reach its database is exactly the state a restart fixes and a
+ * liveness-only check hides.
+ */
+function health(res) {
+  let body;
+  let status = 200;
+  try {
+    const staff = db.prepare('SELECT count(*) AS n FROM staff').get();
+    body = {
+      ok: true,
+      uptime_s: Math.round((Date.now() - STARTED_AT) / 1000),
+      database: 'ok',
+      staff: staff.n,
+      web: serveStatic ? 'serving' : 'api-only',
+    };
+  } catch (err) {
+    status = 503;
+    body = { ok: false, database: String(err.message || err) };
+  }
+  res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+  res.end(JSON.stringify(body));
+}
 
 /**
  * `ctx.waitUntil` on Cloudflare keeps the isolate alive for work started but
@@ -80,6 +114,13 @@ const server = http.createServer(async (req, res) => {
   const started = Date.now();
   const { ctx, settled } = createContext();
   try {
+    if (req.url.split('?')[0] === '/_local/health') return health(res);
+
+    // The API always wins. A built app is not allowed to shadow `/api/*` —
+    // a stray file in the web directory must not be able to take the till
+    // offline by intercepting its requests.
+    if (serveStatic && !req.url.startsWith('/api/') && serveStatic(req, res)) return;
+
     const response = await worker.fetch(toRequest(req), env, ctx);
     await writeResponse(response, res);
     await settled();
@@ -128,4 +169,9 @@ server.listen(PORT, HOST, () => {
   console.log(`[fufut] local API on http://${HOST}:${PORT}`);
   console.log(`[fufut] data in ${dir}`);
   console.log(`[fufut] database ${dbPath}`);
+  console.log(
+    serveStatic
+      ? `[fufut] serving the built apps from ${process.env.FUFUT_WEB_DIR}`
+      : '[fufut] API only — set FUFUT_WEB_DIR to serve the POS from this box too'
+  );
 });

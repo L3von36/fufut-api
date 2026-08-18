@@ -1,0 +1,10 @@
+node_modules
+dist
+.wrangler
+.git
+.github
+test
+data
+backups
+web
+*.md
