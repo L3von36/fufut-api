@@ -147,18 +147,22 @@ middle of service is the wrong risk on a till.
 The built apps live in `./web`, served straight off the disk:
 
 ```
-web/index.html             a redirect, so the bare address opens the till
-web/pos/                   the POS,        reached at /pos/
-web/backoffice/            the backoffice, reached at /backoffice/
+web/index.html      the POS, at the address itself
+web/assets/         its assets
+web/sw.js           its service worker
+web/backoffice/     the backoffice, at /backoffice/
 ```
 
-Replace the contents of `web/pos/` or `web/backoffice/` and reload the tablet.
-No rebuild and no restart — the server reads from disk on every request.
+Replace the files and reload the tablet. No rebuild and no restart — the server
+reads from disk on every request.
 
-Each app must go in the folder matching the path it was built for, because that
-is what its asset URLs point at. Both are built with plain `npm run build`; the
-paths come from their own vite configs and are the same ones Cloudflare serves
-them at, so there is no box-specific build to keep track of.
+The POS must stay at the root: its service worker looks for `/sw.js` and
+`/assets/`, and nesting it silently costs the till its offline cache. Build the
+POS with `--base /` and the backoffice with `--base /backoffice/`.
+
+**If a tablet shows an old version, or the console fills with 401s on
+`/assets/…`**, it is a stale service worker, not the box. In the tablet's
+browser: DevTools → Application → Service Workers → Unregister, then reload.
 
 ---
 

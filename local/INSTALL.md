@@ -30,14 +30,26 @@ connection is the thing you are working around; do not plan to download
 anything there.
 
 ```
-cd fufut-management/pos        && npm run build
-cd fufut-management/backoffice && npm run build
+cd fufut-management/pos        && npx vite build --base /
+cd fufut-management/backoffice && npx vite build --base /backoffice/
 ```
 
-**No `--base` override.** Each app's `vite.config.js` already sets the path it
-is served under — `/pos/` and `/backoffice/` — and those are the paths
-Cloudflare serves them at too. Overriding would produce a bundle that only
-works on the box, which is one more thing to get wrong for no gain.
+**Ignore `vite.config.js`.** Both configs say `/pos/` and `/backoffice/`, and
+neither is what production uses: `.github/workflows/build-pos.yml` overrides
+both with `--base /`, and each app is deployed to its own subdomain root. The
+config is a trap — it looks authoritative and is dead.
+
+The POS in particular **must** be at the origin root, because
+`src/main.js` registers its service worker as `navigator.serviceWorker
+.register('/sw.js')` and `public/sw.js` caches `/pos/`, `/assets/logo.webp` and
+`/favicon.svg` — all root-absolute. `/pos/` there is one of the app's own
+client-side routes, not a folder. Served from a subdirectory the registration
+404s into the API, comes back 401, and the till loses its offline cache: the one
+capability the box exists to protect.
+
+The backoffice has no service worker, so it is happy under `/backoffice/` —
+which is what lets both apps share one origin on the box when production gives
+each a subdomain of its own.
 
 The bundles reference Google Fonts. With no internet the browser falls back to
 a system font: the till looks slightly different and works identically.
@@ -80,21 +92,18 @@ box at once, and it will look like the box has failed.
 mkdir -p ~/fufut/{data,web,backups}
 cd ~/fufut
 # copy docker-compose.yml, Dockerfile, src/, local/, package.json here
-mkdir -p web/pos web/backoffice
-cp -r /media/usb/pos-dist/.        web/pos/
+mkdir -p web/backoffice
+cp -r /media/usb/pos-dist/.        web/
 cp -r /media/usb/backoffice-dist/. web/backoffice/
-
-# Nothing lives at the root, so send anyone who typed just the address to the
-# till instead of an error page.
-printf '<!doctype html><meta charset="utf-8"><title>FU FUT</title>%s<p>Opening the till… <a href="/pos/">FU FUT POS</a></p>'   '<meta http-equiv="refresh" content="0; url=/pos/">' > web/index.html
 ```
 
 The finished layout:
 
 ```
-web/index.html             redirect to the till
-web/pos/index.html         the POS,        served at /pos/
-web/backoffice/index.html  the backoffice, served at /backoffice/
+web/index.html             the POS, at the origin root
+web/sw.js                  its service worker — must be here, not nested
+web/assets/                its assets
+web/backoffice/            the backoffice, at /backoffice/
 ```
 
 The three directories are bind mounts, deliberately, so they are ordinary
@@ -134,7 +143,7 @@ sit. Delete the dump from the USB stick when you are done with it.
 Not all of them. One.
 
 ```
-http://<the box's address>:8787/          # redirects to the till
+http://<the box's address>:8787/            # the till
 http://<the box's address>:8787/backoffice/
 ```
 
@@ -203,5 +212,6 @@ Written on a card, by the till, in the language the staff use:
 | Tablets cannot reach the box | Almost always the address moved. Check the DHCP reservation. |
 | `healthy` never arrives | `docker compose logs --tail 50 api`. Usually a mount path or a permission on `data/`. |
 | The app loads but the API 401s | The bundle is being served from somewhere other than the box, so the cookie is not first-party. Check the URL is the box's address. |
-| Assets 404 but the page loads | The bundle is in the wrong folder. `/pos/` bundles must be in `web/pos/`, `/backoffice/` in `web/backoffice/` — the base a bundle was built with has to match where it is mounted. |
+| Assets 404 but the page loads | The bundle is in the wrong folder, or built with the wrong `--base`. The POS goes at the root of `web/`, the backoffice in `web/backoffice/`. |
+| Assets 401, or the page is an old version | A stale service worker from an earlier build on that address. In the browser: DevTools → Application → Service Workers → Unregister, then hard-reload. The 401s are the cached app asking for paths that no longer exist and falling through to the API. |
 | Seeding fails | Use `--from-file` with the dump you brought. The container has no wrangler and no Cloudflare credentials, by design. |
