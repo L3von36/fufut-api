@@ -1,6 +1,7 @@
 # Running without the internet — local server design
 
-**Status:** proposal, for review. Nothing here is built yet.
+**Status:** proposal, for review. Stages 1 and 2 are built (see the staged plan
+at the end); stages 3 to 5 are not, and the four decisions below are still open.
 **Date:** 2026-08-18
 
 ## The problem
@@ -135,11 +136,33 @@ Database access is almost entirely funnelled through `d1Query` and `d1Run` in
 `env.DB.prepare()`.
 
 So the local server does not need a port. Implement an object exposing
-`prepare`, `bind`, `all`, `run`, `first` and `batch` over `better-sqlite3`, pass
-it as `env.DB`, and **the existing handlers run unchanged**. D1 is SQLite
-underneath, so the SQL is already compatible. Roughly a hundred lines of
-adapter, plus a small HTTP server mapping Node requests onto the existing
-`fetch(request, env)` entry point.
+`prepare`, `bind`, `all`, `run`, `first` and `batch` over SQLite, pass it as
+`env.DB`, and **the existing handlers run unchanged**. D1 is SQLite underneath,
+so the SQL is already compatible. Roughly a hundred lines of adapter, plus a
+small HTTP server mapping Node requests onto the existing `fetch(request, env)`
+entry point.
+
+Built in `local/`, and this held: the entire Worker runs on it with no change to
+`src/`. Two corrections to the sketch above.
+
+**Not `better-sqlite3`.** `node:sqlite` is built into Node 22.5+, so there is no
+native module to compile — which means the Docker image needs no build toolchain
+and the box never compiles anything over the connection whose absence is the
+reason it exists. A dependency avoided is a dependency that cannot fail on a
+Friday night.
+
+**The adapter's governing rule is that it must never be more permissive than
+D1**, or a bug that should fail locally ships to Cloudflare instead. Three real
+divergences had to be closed: D1 accepts booleans and the driver refuses them,
+the driver returns null-prototype rows where D1 returns ordinary objects, and
+`batch()` had to be a genuine transaction because `orders.js` puts an order and
+its lines in as one. `foreign_keys` is forced on for the same reason — SQLite
+defaults it off, D1 enforces constraints.
+
+KV and R2 needed shims too, which the sketch missed: six namespaces (backed by a
+table in the same SQLite file, so there is one thing to back up) and the images
+bucket (a directory). Their surface turned out to be tiny — get/put/delete, and
+put/get.
 
 The alternative — running Cloudflare's `workerd` locally so the runtime is
 identical — is more faithful, but `wrangler dev` is a development tool and it
@@ -194,14 +217,20 @@ mid-transaction is a worse problem than losing internet.
 
 ## Staged plan
 
-1. **Offline hardening** — small, and independent of everything above: keep a
-   signed-in session usable through an outage, and tell staff plainly that other
-   devices cannot see what they are entering. Worth doing whatever is decided
-   here.
-2. **D1 adapter and local runtime**, verified by running the existing API test
-   suite against it.
+1. ~~**Offline hardening**~~ — **done.** Small, and independent of everything
+   above: a signed-in session now survives an outage, and the banner tells staff
+   plainly that other devices cannot see what they are entering. Worth doing
+   whatever is decided here.
+2. ~~**D1 adapter and local runtime**~~ — **done**, in `local/` (see
+   `local/README.md`). The existing suite passes, and a new end-to-end test runs
+   the real Worker against real SQLite — sign-in, an order with batched lines,
+   the atomic table claim, KV, images, the cron sweep. Verified over HTTP and
+   across a restart. It is a runtime, not a deployment: there is still no sync
+   and no packaging.
 3. **Docker packaging, one box in the cafe**, pointed at by a single tablet with
-   the cloud still primary. A rehearsal, not a migration.
+   the cloud still primary. A rehearsal, not a migration. Should also serve the
+   POS and backoffice bundles, which stage 2 does not — today only the API is
+   local.
 4. **Sync engine** — outbox on both sides, reconciliation list.
 5. **Cut over**: tablets default to the local box; the cloud becomes the front
    door.
