@@ -37,6 +37,7 @@ import { handleResources } from './handlers/resources.js';
 import { handleTables, releaseOverstayedTables } from './handlers/tables.js';
 import { handleStaff } from './handlers/staff.js';
 import { handleSSE } from './handlers/sse.js';
+import { handleSync } from './handlers/sync.js';
 import {
   handleStaffLogin,
   handleSessionCheck,
@@ -88,6 +89,12 @@ async function route(pathname, method, url, request, env, ctx, auth) {
 
   if (pathname === '/api/events/tables' || pathname === '/api/events/kitchen') {
     return handleSSE(request, env, pathname.endsWith('tables') ? 'tables' : 'kitchen');
+  }
+
+  // Sync between the box and the cloud. Authorised in auth.js — the three
+  // machine routes by SYNC_TOKEN, the reconciliation list by a manager session.
+  if (pathname.startsWith('/api/sync/')) {
+    return handleSync(pathname, method, url, request, env, auth);
   }
 
   if (pathname.startsWith('/api/orders')) {

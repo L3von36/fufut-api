@@ -280,6 +280,58 @@ export function canonicalRole(role) {
  * own, so a cleaner cannot subscribe to the kitchen feed and receive orders
  * they may not fetch.
  */
+/**
+ * Routes the box talks to, authenticated machine-to-machine.
+ *
+ * No session is involved: the box is not a person and has no role. It holds a
+ * shared secret and may do exactly these three things.
+ */
+const SYNC_MACHINE = new Set(['/api/sync/push', '/api/sync/pull', '/api/sync/status']);
+
+/**
+ * Compare two secrets without leaking how much of one is right.
+ *
+ * A plain `===` on strings returns as soon as it finds a difference, and the
+ * time that takes is measurable across enough requests. Comparing digests
+ * rather than the tokens themselves also removes the length as a signal — both
+ * sides are always 32 bytes.
+ */
+async function secretsMatch(given, expected) {
+  const encoder = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest('SHA-256', encoder.encode(given)),
+    crypto.subtle.digest('SHA-256', encoder.encode(expected)),
+  ]);
+  const left = new Uint8Array(a);
+  const right = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < left.length; i += 1) diff |= left[i] ^ right[i];
+  return diff === 0;
+}
+
+/**
+ * The sync routes' own gate.
+ *
+ * With no SYNC_TOKEN configured the routes do not exist — 404 rather than 401,
+ * because a deployment that has not switched sync on should not advertise that
+ * it could. This is what keeps the currently deployed Worker's surface
+ * unchanged.
+ */
+export async function authorizeSync(request, env) {
+  if (!env || !env.SYNC_TOKEN) {
+    return { ok: false, response: json({ ok: false, error: 'Not found' }, 404) };
+  }
+
+  const header = request.headers.get('Authorization') || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  if (!token || !(await secretsMatch(token, String(env.SYNC_TOKEN)))) {
+    return { ok: false, response: json({ ok: false, error: 'Sync authentication required' }, 401) };
+  }
+
+  // No staff identity: nothing downstream should mistake the box for a person.
+  return { ok: true, auth: { sync: true, staff_id: null, sessionRole: null } };
+}
+
 export function resourceForPath(pathname) {
   const parts = String(pathname || '').split('/').filter(Boolean);
   if (parts[0] !== 'api' || parts.length < 2) return null;
@@ -397,6 +449,18 @@ function isManager(role) {
  * @returns {{ok: true, auth: object|null} | {ok: false, response: Response}}
  */
 export async function authorize(request, env, pathname, method) {
+  // Checked first, ahead of even the public list: these are the only routes
+  // authenticated by a shared secret rather than by a person, and nothing else
+  // should ever be able to widen them.
+  //
+  // `/api/sync/reconciliation` is deliberately NOT here. It is something a
+  // manager reads, so it falls through to the ordinary session check, where
+  // the role matrix resolves it as the `sync` resource — managers hold `*` and
+  // no other role lists it.
+  if (SYNC_MACHINE.has(pathname)) {
+    return authorizeSync(request, env);
+  }
+
   // Checked before the public list, so a private key cannot be let through by
   // the broad /api/images/ prefix rule.
   if (matches(PUBLIC, pathname, method) && !isPrivateImage(pathname)) {

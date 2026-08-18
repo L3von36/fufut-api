@@ -41,3 +41,20 @@ id = "8a05f5eecd7e477b92825d22df3ee67c"
 # Matches the deployed schedule (every minute) — checkScheduledPublish().
 [triggers]
 crons = ["* * * * *"]
+
+# ── Sync (stages 4-5) ────────────────────────────────────────────────────────
+# Deliberately commented out. Setting SITE_ID switches on outbox capture for
+# every write in production, so turning sync on is a decision with a date on it,
+# not something that rides along with an unrelated deploy.
+#
+# Before uncommenting:
+#   1. npx wrangler d1 execute fufut-db --remote --file migrations/014-sync.sql
+#      (capture is fail-open, so without the tables every write logs an error
+#      and nothing syncs — the till keeps working, which is the point, but it is
+#      not a state to deploy into deliberately)
+#   2. npx wrangler secret put SYNC_TOKEN
+#      The same value goes in the box's docker-compose.yml. Without it the
+#      /api/sync/* machine routes return 404 and do not exist.
+#
+# [vars]
+# SITE_ID = "cloud"
