@@ -58,6 +58,8 @@ export function createSyncEngine({ env, fetchImpl, now = () => Date.now() }) {
   let online = null; // null = not yet known, so the first result always logs
   let running = false;
   let timer = null;
+  let lastSuccessAt = null;
+  let lastError = null;
 
   function configured() {
     return Boolean(env.CLOUD_URL && env.SYNC_TOKEN);
@@ -151,6 +153,7 @@ export function createSyncEngine({ env, fetchImpl, now = () => Date.now() }) {
     try {
       await request(`/api/sync/status?site_id=${encodeURIComponent(me)}`);
     } catch (err) {
+      lastError = err.message;
       if (online !== false) {
         online = false;
         // Logged on the transition only. A box offline for two days should not
@@ -169,6 +172,8 @@ export function createSyncEngine({ env, fetchImpl, now = () => Date.now() }) {
       const pushed = await push();
       const { applied, conflicts } = await pull();
       const pruned = await prune();
+      lastSuccessAt = new Date(now()).toISOString();
+      lastError = null;
 
       if (pushed || applied || conflicts) {
         console.log(
@@ -183,6 +188,7 @@ export function createSyncEngine({ env, fetchImpl, now = () => Date.now() }) {
     } catch (err) {
       // Reachable but the exchange failed. Worth saying every time, because
       // unlike an outage this is not expected.
+      lastError = err.message;
       console.error('[fufut] sync: exchange failed:', err.message);
       return { online: true, error: err.message };
     }
@@ -211,5 +217,38 @@ export function createSyncEngine({ env, fetchImpl, now = () => Date.now() }) {
     timer = null;
   }
 
-  return { runOnce, start, stop, push, pull, prune, isConfigured: configured };
+  /**
+   * What the box knows about its own syncing, for the people standing next to
+   * it.
+   *
+   * This is deliberately local. A cloud-hosted flag saying "sync is broken"
+   * cannot be read during the outage that broke it, which is the one moment it
+   * would matter. Everything here comes off the box's own database.
+   */
+  async function status() {
+    if (!configured()) {
+      return { configured: false, online: false, pending: 0, unresolved: 0, last_success: null, last_error: null };
+    }
+    let pending = 0;
+    let unresolved = 0;
+    try {
+      const sent = await cursor(env, peer, 'out');
+      const behind = await d1Query(env, 'SELECT count(*) AS n FROM sync_outbox WHERE seq > ?', [sent]);
+      pending = (behind.results && behind.results[0] && behind.results[0].n) || 0;
+      const open = await d1Query(env, 'SELECT count(*) AS n FROM sync_reconciliation WHERE resolved = 0');
+      unresolved = (open.results && open.results[0] && open.results[0].n) || 0;
+    } catch {
+      // Reporting on sync must never be the thing that breaks.
+    }
+    return {
+      configured: true,
+      online: online === true,
+      pending,
+      unresolved,
+      last_success: lastSuccessAt,
+      last_error: lastError,
+    };
+  }
+
+  return { runOnce, start, stop, push, pull, prune, status, isConfigured: configured };
 }

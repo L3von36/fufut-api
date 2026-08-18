@@ -1,8 +1,9 @@
 # Running without the internet — local server design
 
-**Status:** proposal, for review. Stages 1 to 3 are built (see the staged plan
-at the end); stages 4 and 5 are not, and the four decisions below are still
-open.
+**Status:** all five stages built, and the four decisions made — see "Decisions
+made" and "Turning it on". Not live: capture is gated on `SITE_ID`, which is
+still commented out in `wrangler.toml`, so production behaves exactly as it did
+before any of this.
 **Date:** 2026-08-18
 
 ## The problem
@@ -204,17 +205,51 @@ mid-transaction is a worse problem than losing internet.
 | Both down | Paper. Every restaurant needs this plan and it belongs on the wall, not in a repo. |
 | Clock skew between sites | Timestamps are a tiebreak only, never the primary rule, precisely so skew cannot decide who wins. |
 
-## Decisions needed before building
+## Decisions made
 
-1. **Should online ordering be refused while the venue is offline?** Accepting a
-   delivery order the kitchen will never see is worse than telling the customer
-   ordering is briefly closed. A business call, not a technical one.
-2. **How long may the venue run offline before it demands attention?** Square
-   chose 24 hours. FU FUT is cash-heavy, so the exposure is different.
-3. **Who owns the box?** Somebody has to notice a failed healthcheck and be
-   willing to power-cycle it.
-4. **One venue, or eventually several?** The design holds for several, but the
-   site-id and reconciliation work is only worth building once.
+1. **Online ordering is refused while the venue is offline.** Enforced in the
+   API, not only in the website: a cached page or a direct POST would sail past
+   a UI flag, and the whole point is that no order enters a database the kitchen
+   cannot see. The threshold is three missed 30-second heartbeats. Two
+   consequences worth holding onto: a deployment with no box registered treats
+   ordering as **open**, because otherwise this would have closed the shop the
+   moment it shipped; and staff sessions are never refused, because the box
+   being down while the line is up is exactly when tablets fall back to the
+   cloud.
+2. **No hard offline time limit.** Square's 24-hour cap exists to bound card
+   fraud exposure; FU FUT is cash-heavy, so the same reasoning does not apply.
+   What bounds the risk here instead is the nightly backup and the fact that the
+   box is authoritative for the room — an outage is not a degraded mode, it is
+   the normal one.
+3. **The owner owns the box.** Practically that means somebody notices a red
+   healthcheck and is willing to power-cycle it; the runbook is written for
+   that person and assumes no knowledge of Docker.
+4. **One venue.** `site_id` is fixed at `local` and `cloud` rather than
+   provisioned. Every cursor and journal row is keyed on it, so a second venue
+   is a configuration change rather than a migration — but the reconciliation
+   and id-prefixing work that several venues would need is deliberately not
+   built.
+
+## Turning it on
+
+Nothing above is live. Capture is gated on `SITE_ID`, which is commented out in
+`wrangler.toml`, and the machine routes return 404 without `SYNC_TOKEN`. In
+order:
+
+1. `npx wrangler d1 execute fufut-db --remote --file migrations/014-sync.sql`
+2. `npx wrangler secret put SYNC_TOKEN`
+3. Uncomment `SITE_ID = "cloud"` in `wrangler.toml` and deploy.
+4. Put the same `SYNC_TOKEN` and a `CLOUD_URL` in the box's `.env`.
+
+Do 1 before 3. Capture is fail-open, so a Worker with `SITE_ID` set and no
+`sync_outbox` keeps trading and logs an error per process — survivable, but not
+a state to enter deliberately.
+
+**The rehearsal this still needs:** every test to date runs the cloud side
+against local SQLite standing in for D1. The one difference that matters is that
+D1 is remote, so a push that times out mid-batch is a real case the tests cannot
+produce. Rehearse against a staging Worker with migration 014 applied before
+pointing the cafe at it.
 
 ## Staged plan
 
@@ -237,6 +272,13 @@ mid-transaction is a worse problem than losing internet.
    something; nightly `VACUUM INTO` backups at 03:00; a seeding script for the
    rehearsal; `local/RUNBOOK.md` for the owner. Stage 3 still ends on hardware
    in the cafe — see `local/README.md`.
-4. **Sync engine** — outbox on both sides, reconciliation list.
-5. **Cut over**: tablets default to the local box; the cloud becomes the front
-   door.
+4. ~~**Sync engine**~~ — **done.** An append-only outbox on both sides, hooked
+   into `d1Run`/`d1Batch` rather than into ~80 handler call sites; a 30-second
+   push/pull daemon on the box; one shared ownership engine (`src/lib/`, not
+   `local/`, because both sides run it and two copies would drift); and a
+   reconciliation list for everything the rules refuse. Replay bypasses capture,
+   or the two sides would journal each other's replays forever.
+5. ~~**Cut over**~~ — **done** as far as it can be without hardware. Tablets
+   already reach the box for both the app and the API (stage 3), and the cloud
+   now refuses anonymous orders while the venue is quiet. What remains is
+   physical: put a box in the cafe, seed it, point a tablet at it.

@@ -34,6 +34,13 @@ const { env, db, dbPath, dir } = createLocalEnv();
 const serveStatic = createStaticHandler(process.env.FUFUT_WEB_DIR);
 
 /**
+ * The sync daemon. Inert unless CLOUD_URL and SYNC_TOKEN are set, so a box that
+ * has not been connected to the cloud behaves exactly as it did before.
+ * Created here rather than below the server because /_local/sync reports on it.
+ */
+const sync = createSyncEngine({ env });
+
+/**
  * The container healthcheck.
  *
  * It lives here rather than in the Worker on purpose. `/api/health` requires a
@@ -142,7 +149,22 @@ const server = http.createServer(async (req, res) => {
   const started = Date.now();
   const { ctx, settled } = createContext();
   try {
-    if (req.url.split('?')[0] === '/_local/health') return health(res);
+    const localPath = req.url.split('?')[0];
+    if (localPath === '/_local/health') return health(res);
+
+    /**
+     * What this box knows about its own syncing.
+     *
+     * Local on purpose: a cloud-hosted flag saying "sync is broken" cannot be
+     * read during the outage that broke it, which is the one moment it matters.
+     * This is what tells staff standing next to a perfectly healthy box that
+     * nothing has left it since Tuesday.
+     */
+    if (localPath === '/_local/sync') {
+      const state = await sync.status();
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      return res.end(JSON.stringify(state));
+    }
 
     // The API always wins. A built app is not allowed to shadow `/api/*` —
     // a stray file in the web directory must not be able to take the till
@@ -185,11 +207,6 @@ const cron = setInterval(async () => {
   }
 }, CRON_INTERVAL_MS);
 
-/**
- * The sync daemon. Inert unless CLOUD_URL and SYNC_TOKEN are set, so a box that
- * has not been connected to the cloud behaves exactly as it did before.
- */
-const sync = createSyncEngine({ env });
 sync.start();
 
 for (const signal of ['SIGINT', 'SIGTERM']) {

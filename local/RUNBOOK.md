@@ -182,22 +182,104 @@ power in the middle of a write is a worse problem than losing the internet.
 
 ---
 
+## Is it syncing?
+
+```
+curl http://localhost:8787/_local/sync
+```
+
+```json
+{"configured":true,"online":true,"pending":0,"unresolved":2,
+ "last_success":"2026-08-18T13:40:02.113Z","last_error":null}
+```
+
+| Field | What it means |
+|---|---|
+| `configured` | false = this box has not been connected to the cloud at all |
+| `online` | whether the cloud answered on the last try |
+| `pending` | writes made here that the cloud has not acknowledged |
+| `unresolved` | conflicts waiting for a manager (see below) |
+| `last_success` | the last complete exchange |
+
+This deliberately lives **on the box**, not in the cloud. A cloud-hosted "sync
+is broken" flag cannot be read during the outage that broke it, which is the one
+moment it matters.
+
+**`online: false` is not an emergency.** It is the condition this whole system
+was built for. The room carries on, writes queue, and they go up when the line
+returns. What deserves attention is `online: true` with `pending` climbing and
+`last_success` hours old — that means the box can reach the cloud and the
+exchange is failing anyway. `docker compose logs --tail 50 api` will say why.
+
+---
+
+## "Ordering is temporarily closed" on the website
+
+This is the system working as decided, not a fault. When the box has not
+checked in for 90 seconds the cloud stops accepting orders from the public,
+because an order taken then is one the kitchen never sees — the customer would
+pay and wait for food nobody started.
+
+To confirm:
+
+```
+curl https://fufut-api.fufutcoffee.workers.dev/api/venue/status
+```
+
+`online_ordering: false` means the cloud is not hearing from the box. Either the
+internet is down, or the box is. **Staff can still take orders throughout** —
+signed-in sessions are never refused, so the tablets keep working whichever
+side they are talking to.
+
+It reopens by itself within a minute of the box checking in again. Nothing to
+press.
+
+---
+
+## Conflicts, and what they are
+
+When both sides changed the same kind of thing, one of them wins by a rule —
+the box wins about tables and the clock, the cloud wins about the menu, prices,
+staff and bookings. **The losing write is never thrown away.** It is recorded so
+a person can decide.
+
+The commonest way to create one: using the backoffice on the box during an
+outage to change a price or add a member of staff. Those are cloud-owned, so on
+reconnect the change is refused and listed rather than applied.
+
+To see the list, signed in as a manager:
+
+```
+curl -b <manager session> https://fufut-api.fufutcoffee.workers.dev/api/sync/reconciliation
+```
+
+Each entry says which side it came from, what it tried to do, and why it was
+refused. **There is no screen for this yet** — the list and the API exist, the
+backoffice view does not.
+
+Resolving one means doing it again on the winning side. If a price was changed
+on the box during an outage and refused, change it again in the backoffice once
+the line is back. There is no button that replays it for you, deliberately:
+these are decisions, and a price is not something to re-apply without somebody
+looking at it.
+
+---
+
 ## What this box does not do yet
 
 Be clear about these, because they are the difference between a rehearsal and a
 migration.
 
-**It does not sync.** Nothing moves between the box and Cloudflare in either
-direction. Anything entered on the box exists only on the box, and anything
-entered in the cloud — online orders, web bookings, reviews — never reaches the
-box. This is stage 4 of the design.
-
-**During an internet outage, orders from outside still land in the cloud** where
-nobody in the building can see them. Until sync exists, an outage means checking
-online orders by hand once the line is back.
-
 **Card payments and anything that calls out to the internet cannot work while
 the line is down**, no matter how healthy this box is.
+
+**Sync may not be switched on.** Check `configured` at `/_local/sync`. If it
+says false, nothing moves between this box and the cloud in either direction:
+anything entered here stays here, and online bookings never arrive. The code is
+built and tested; connecting it is a deliberate step somebody has to take.
+
+**There is no reconciliation screen.** Conflicts are visible through the API
+only, as above. Somebody has to go looking rather than being told.
 
 ---
 
