@@ -72,6 +72,19 @@ crons = ["* * * * *"]
 # KV and R2 point at the production namespaces on purpose: the sync routes never
 # touch either, and creating six throwaway namespaces to prove that would be
 # more moving parts, not fewer.
+#
+# BETWEEN REHEARSALS THE WORKER DOES NOT EXIST. It is deleted once a rehearsal
+# finishes, so nothing is left publicly reachable running a cron against a
+# half-real database. The D1 database below persists — it is cheap, it holds
+# only test data, and keeping it means the next rehearsal starts from a schema
+# that is already correct.
+#
+# To rehearse again:
+#   npx wrangler secret put SYNC_TOKEN --env rehearsal   # the old one died with the Worker
+#   npx wrangler deploy --env rehearsal
+#
+# And delete the Worker again afterwards:
+#   npx wrangler delete --name fufut-api-rehearsal
 [env.rehearsal]
 vars = { SITE_ID = "cloud" }
 
