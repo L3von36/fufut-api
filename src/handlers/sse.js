@@ -16,13 +16,13 @@ async function handleSSE(request, env, channel) {
   let lastSignature = null;
   const stream = new ReadableStream({
     async start(controller) {
-      const safe = /* @__PURE__ */ __name((fn) => {
+      const safe = (fn) => {
         try {
           fn();
         } catch (e) {
         }
-      }, "safe");
-      const tick = /* @__PURE__ */ __name(async () => {
+      };
+      const tick = async () => {
         try {
           let eventName;
           let payload;
@@ -46,7 +46,7 @@ async function handleSSE(request, env, channel) {
         } catch (e) {
         }
         safe(() => controller.enqueue(encoder.encode(": keepalive\n\n")));
-      }, "tick");
+      };
       safe(() => controller.enqueue(sseEvent("connected", { ok: true, channel })));
       timer = setInterval(tick, 1e4);
       tick();

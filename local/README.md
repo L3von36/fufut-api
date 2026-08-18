@@ -1,12 +1,16 @@
 # The local server
 
-Stage 2 of [LOCAL-SERVER-DESIGN.md](../LOCAL-SERVER-DESIGN.md): the same API,
-running on a box in the cafe instead of on Cloudflare.
+Stages 2–3 of [LOCAL-SERVER-DESIGN.md](../LOCAL-SERVER-DESIGN.md): the same API,
+running on a box in the cafe instead of on Cloudflare — packaged in Docker,
+serving the built apps, and backing itself up nightly.
 
 ```
 npm run local            # http://0.0.0.0:8787
 FUFUT_DATA_DIR=/data PORT=8787 npm run local
 ```
+
+For the box itself, prefer Docker — see below, and
+[RUNBOOK.md](RUNBOOK.md) for the day-to-day.
 
 ## What this is
 
@@ -69,7 +73,53 @@ behaving identically is the entire value of the box. Regenerate with
 `npm run local:schema` after a migration.
 
 A fresh `FUFUT_DATA_DIR` gets the schema applied automatically, and nothing else
-— no staff, no menu, no tables. Seeding a real venue is stage 3.
+— no staff, no menu, no tables. For a rehearsal you want the real venue, so
+`seed-from-cloud.js` fills a local database from the live one:
+
+```
+node local/seed-from-cloud.js             # refuses if data is already there
+node local/seed-from-cloud.js --force     # replaces the local database
+node local/seed-from-cloud.js --schema-only
+```
+
+## The box (stage 3)
+
+```
+docker compose up -d      # build, start, and keep it started
+docker compose ps         # is it healthy
+```
+
+Why an image rather than `git pull` + `npm ci`: an image is atomic. A pull over
+a bad connection can fail halfway and leave a broken server in a building with
+nobody technical in it. The image either pulls or it does not, and the running
+container is untouched until it does. There is no build stage and no `npm ci`
+in it — the Worker imports nothing outside `node:*`, so the image is Node plus
+this repository's source, with no runtime supply chain at all.
+
+`data/`, `web/` and `backups/` are **host bind mounts, not named volumes**: one
+`docker compose down -v` on a named volume and the trading history is gone.
+A bind mount is a directory somebody can see, copy and back up without knowing
+anything about Docker.
+
+- **`/_local/health`** is the container healthcheck. It reads from SQLite
+  rather than just answering 200, because a process that is up but cannot reach
+  its database is exactly the state a restart fixes and a liveness-only check
+  hides. It is deliberately *not* `/api/health`, which requires a session —
+  correctly — and would mean poking a hole in the auth matrix for Docker.
+- **`web/`** holds the built apps, and `server.js` serves them on the same
+  origin as the API. This works with the production bundles and no rebuild,
+  because the POS already defaults to same-origin
+  (`VITE_API_URL || ''`): the session cookie stays first-party, no CORS.
+  Layout: the POS built with `--base=/` at the root, the backoffice with
+  `--base=/backoffice/` in a subdirectory. Client-side routes get the nearest
+  app's shell (the shell-walk), `/api/*` always wins over any stray file, and
+  a missing asset is a miss — never index.html dressed up as JavaScript.
+- **`backup.js`** takes a consistent snapshot with `VACUUM INTO` — copying
+  `fufut.sqlite` with `cp` is wrong in WAL mode — and verifies the result by
+  opening it before claiming success. The backup container runs it nightly at
+  03:00 Africa/Addis_Ababa. Until the sync engine exists, this is the entire
+  disaster plan: lose the box and you lose everything since the last one.
+  Restoring is in the [runbook](RUNBOOK.md).
 
 ## Tests
 
@@ -80,22 +130,28 @@ A fresh `FUFUT_DATA_DIR` gets the schema applied automatically, and nothing else
   real handlers survive contact with real SQLite: sign-in, session, an order
   with batched lines, the atomic table claim returning 409 to the second
   waiter, KV, image serving, and the scheduled sweep.
+- `test/local-http.test.js` — the HTTP layer around the Worker, against a real
+  child process: `/_local/health` in both its states (database answering, and
+  database present but blind → 503), the static server's routing (shells,
+  immutable assets, `/api/*` precedence, traversal contained), and the SSE
+  stream's connected event.
 
 Verified by hand too: over HTTP, and across a restart on the same data
 directory — session, order and table state all survive, which is what a power
-cut looks like.
+cut looks like. The Docker path was verified end to end on the development
+machine: image builds, `docker compose up` goes healthy, the box serves the
+built apps and answers the API on the same origin, and a backup taken inside
+the container lands on the host verified.
 
 ## Not yet true
 
-This is a runtime, not a deployment. Still outstanding from the design doc:
+This is a deployment, not a sync target. Still outstanding from the design doc:
 
 - **No sync.** Nothing moves between this box and Cloudflare in either
   direction. Run it against production data and you have a fork, not a mirror.
-- **No packaging.** Docker, the bind mount, `restart: unless-stopped` and the
-  nightly copy off the box are stage 3.
-- **API only.** The POS and backoffice bundles are still served from
-  Cloudflare Pages; tablets would reach the app over the internet and only the
-  API locally. Serving the built apps from this box is part of stage 3.
+  The nightly backup is a snapshot, not a reconciliation.
+- **Untested on the actual box.** Everything Docker-side is verified on the
+  development machine; stage 3 ends on hardware in the cafe.
 
 ## One warning
 

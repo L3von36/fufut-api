@@ -203,6 +203,64 @@ describe('KV and R2 stand in for the real bindings', () => {
   });
 });
 
+describe('live updates', () => {
+  /**
+   * The kitchen board and the table map subscribe to these. They are the only
+   * streaming responses in the system, and they were the only thing that did
+   * not survive the move off Cloudflare: sse.js carried `__name(...)`, an
+   * esbuild helper that only exists once wrangler has bundled the code. In
+   * production the bundler supplies it; running the source directly, the whole
+   * endpoint threw ReferenceError.
+   */
+  it('streams events rather than throwing', async () => {
+    const aborter = new AbortController();
+    const request = new Request('http://localhost:8787/api/events/tables', {
+      headers: { Cookie: cookie, Accept: 'text/event-stream' },
+      signal: aborter.signal,
+    });
+    const response = await worker.fetch(request, env, { waitUntil() {}, passThroughOnException() {} });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('Content-Type')).toBe('text/event-stream');
+
+    const reader = response.body.getReader();
+    const first = new TextDecoder().decode((await reader.read()).value);
+    expect(first).toContain('event: connected');
+
+    aborter.abort();
+    await reader.cancel().catch(() => {});
+  });
+});
+
+describe('src/ is source, not bundler output', () => {
+  /**
+   * `__name` reaching a committed file is how SSE broke. It works on
+   * Cloudflare, where esbuild injects the helper, and nowhere else — so the
+   * local box was the first thing to notice. Guarding it here keeps the next
+   * paste of bundler output from quietly costing us the same endpoint again.
+   */
+  it('carries no esbuild helpers', () => {
+    const root = new URL('../src/', import.meta.url);
+    const offenders = [];
+
+    const walk = (dirUrl) => {
+      for (const entry of fs.readdirSync(dirUrl, { withFileTypes: true })) {
+        const child = new URL(entry.name + (entry.isDirectory() ? '/' : ''), dirUrl);
+        if (entry.isDirectory()) walk(child);
+        else if (entry.name.endsWith('.js')) {
+          const text = fs.readFileSync(child, 'utf8');
+          if (/\b(__name|__toESM|__commonJS|__defProp)\b/.test(text)) {
+            offenders.push(entry.name);
+          }
+        }
+      }
+    };
+    walk(root);
+
+    expect(offenders).toEqual([]);
+  });
+});
+
 describe('the scheduled trigger runs', () => {
   it('completes without error', async () => {
     await expect(

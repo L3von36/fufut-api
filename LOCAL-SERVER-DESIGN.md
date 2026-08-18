@@ -1,7 +1,8 @@
 # Running without the internet — local server design
 
-**Status:** proposal, for review. Stages 1 and 2 are built (see the staged plan
-at the end); stages 3 to 5 are not, and the four decisions below are still open.
+**Status:** proposal, for review. Stages 1 to 3 are built (see the staged plan
+at the end); stages 4 and 5 are not, and the four decisions below are still
+open.
 **Date:** 2026-08-18
 
 ## The problem
@@ -227,10 +228,15 @@ mid-transaction is a worse problem than losing internet.
    the atomic table claim, KV, images, the cron sweep. Verified over HTTP and
    across a restart. It is a runtime, not a deployment: there is still no sync
    and no packaging.
-3. **Docker packaging, one box in the cafe**, pointed at by a single tablet with
-   the cloud still primary. A rehearsal, not a migration. Should also serve the
-   POS and backoffice bundles, which stage 2 does not — today only the API is
-   local.
+3. ~~**Docker packaging, one box in the cafe**~~ — **done**, and verified end to
+   end on the development machine: image builds, `docker compose up` goes
+   healthy, the box serves the built POS and backoffice on the same origin as
+   the API (the production bundles, no rebuild — the apps default to
+   same-origin), and a backup taken inside the container lands on the host
+   verified. `/_local/health` reads SQLite so a restart actually fixes
+   something; nightly `VACUUM INTO` backups at 03:00; a seeding script for the
+   rehearsal; `local/RUNBOOK.md` for the owner. Stage 3 still ends on hardware
+   in the cafe — see `local/README.md`.
 4. **Sync engine** — outbox on both sides, reconciliation list.
 5. **Cut over**: tablets default to the local box; the cloud becomes the front
    door.

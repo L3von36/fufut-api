@@ -18,6 +18,7 @@
 
 import http from 'node:http';
 import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import worker from '../src/index.js';
 import { createLocalEnv } from './env.js';
 import { createStaticHandler } from './static.js';
@@ -81,14 +82,31 @@ function createContext() {
   };
 }
 
-function toRequest(req) {
+/**
+ * Build the Request, with its abort signal wired to the socket closing.
+ *
+ * This is not a detail. `/api/events/tables` and `/api/events/kitchen` hold a
+ * stream open and poll on a 10-second interval, and the handler only clears
+ * that interval when `request.signal` aborts or the stream is cancelled. On
+ * Cloudflare the signal aborts by itself when the client goes away; a Request
+ * built by hand has no such connection to the socket, so without this every
+ * tablet that closed its screen would leave a timer querying SQLite forever.
+ * A Worker gets torn down and hides that. This box runs for months.
+ */
+function toRequest(req, res) {
   const url = `http://${req.headers.host || 'localhost'}${req.url}`;
   const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
+  const aborter = new AbortController();
+  // 'close' on the response fires whether the client hung up or the response
+  // finished. Aborting after a completed response is harmless; failing to
+  // abort after a client vanishes is the leak.
+  res.on('close', () => aborter.abort());
   return new Request(url, {
     method: req.method,
     headers: req.headers,
     body: hasBody ? Readable.toWeb(req) : undefined,
     duplex: 'half',
+    signal: aborter.signal,
   });
 }
 
@@ -105,9 +123,18 @@ async function writeResponse(response, res) {
   }
   res.writeHead(response.status, headers);
   if (!response.body) return res.end();
-  await new Promise((resolve, reject) => {
-    Readable.fromWeb(response.body).pipe(res).on('finish', resolve).on('error', reject);
-  });
+  // pipeline, not pipe: pipe leaves its source running when the destination
+  // dies, so a tablet hanging up mid-stream would never cancel the underlying
+  // ReadableStream and never run the handler's cleanup. pipeline destroys both
+  // ends, which is what makes an SSE client disconnecting actually stop the
+  // work behind it.
+  try {
+    await pipeline(Readable.fromWeb(response.body), res);
+  } catch (err) {
+    // A client that hangs up mid-response is normal, not an error worth
+    // logging on every kitchen screen refresh.
+    if (!['ERR_STREAM_PREMATURE_CLOSE', 'ECONNRESET', 'ERR_STREAM_DESTROYED'].includes(err.code)) throw err;
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -121,7 +148,7 @@ const server = http.createServer(async (req, res) => {
     // offline by intercepting its requests.
     if (serveStatic && !req.url.startsWith('/api/') && serveStatic(req, res)) return;
 
-    const response = await worker.fetch(toRequest(req), env, ctx);
+    const response = await worker.fetch(toRequest(req, res), env, ctx);
     await writeResponse(response, res);
     await settled();
     console.log(`${req.method} ${req.url} ${response.status} ${Date.now() - started}ms`);

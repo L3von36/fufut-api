@@ -58,6 +58,13 @@ services:
     depends_on:
       - api
     restart: unless-stopped
+    # This container runs no server, so it must not inherit the image's
+    # port-probing HEALTHCHECK — it would sit "unhealthy" forever, and the
+    # runbook tells the owner to trust that colour. There is nothing to
+    # probe: the loop either runs its script nightly or the container is
+    # down, which `restart` and the log line both cover.
+    healthcheck:
+      test: ["NONE"]
     environment:
       FUFUT_DATA_DIR: /data
       FUFUT_BACKUP_DIR: /backups

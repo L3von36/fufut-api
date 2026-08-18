@@ -5,3 +5,7 @@ dist/
 # The local server keeps its SQLite database and image bucket here. Trading
 # data, never committed.
 data/
+
+# Runtime dirs on the box: the served app bundles and the nightly snapshots.
+web/
+backups/
