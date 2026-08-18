@@ -2,6 +2,7 @@ import { d1Query, d1Run, json, readBody } from '../lib/db.js';
 import { holdsTable, blocksSeating, isNewSeating, ACTIVE_STATUSES, GRACE_MIN, SEATING_LEAD_MIN } from '../lib/booking.js';
 import { actorName } from '../auth.js';
 import { writeAudit } from '../lib/audit.js';
+import { tableOverstayed, DEFAULT_TABLE_MAX_HOURS } from '../lib/staleness.js';
 
 const ACTIVE_LIST = ACTIVE_STATUSES.map((s) => `'${s}'`).join(', ');
 
@@ -125,6 +126,71 @@ async function claimSeat(env, table, data, claimingNewSeat) {
   }
 
   return null; // claimed - let the generic handler write the remaining fields
+}
+
+/**
+ * Put back tables that nobody cleared.
+ *
+ * Runs on the cron. Production had a table showing occupied four days after it
+ * was seated: the floor plan had lost a table and no screen would ever say so,
+ * because occupied is a state somebody has to leave and on a busy evening
+ * nobody does.
+ *
+ * Two rules keep this from doing harm:
+ *
+ *  - A table with money still owed on it is never released. Freeing it would
+ *    take the bill off the floor plan, which is exactly how an unpaid check
+ *    stops being anybody's problem — the opposite of what this is for.
+ *  - A table occupied with no seated_at is not aged, because there is nothing
+ *    to age it from. It gets stamped instead, so it starts counting from when
+ *    it was noticed rather than staying stuck forever. Production has one.
+ */
+async function releaseOverstayedTables(env, maxHours = DEFAULT_TABLE_MAX_HOURS, nowMs = Date.now()) {
+  const nowIso = new Date(nowMs).toISOString();
+  const released = [];
+  const stamped = [];
+
+  const { results: tables } = await d1Query(
+    env,
+    "SELECT id, number, status, seated_at, guests, server FROM tables WHERE LOWER(status) = 'occupied'"
+  );
+
+  for (const table of tables || []) {
+    if (!String(table.seated_at || '').trim()) {
+      await d1Run(env, 'UPDATE tables SET seated_at = ? WHERE id = ?', [nowIso, table.id]);
+      stamped.push(table.number);
+      continue;
+    }
+    if (!tableOverstayed(table, nowMs, maxHours)) continue;
+
+    const { results: owing } = await d1Query(
+      env,
+      `SELECT COUNT(*) AS n FROM orders
+        WHERE TRIM(table_id) = TRIM(?)
+          AND payment_status IN ('unpaid', 'partial')
+          AND COALESCE(status, '') <> 'cancelled'`,
+      [String(table.number)]
+    );
+    if ((owing && owing[0] && owing[0].n) > 0) continue;
+
+    await d1Run(
+      env,
+      "UPDATE tables SET status = 'available', seated_at = '', guests = 0, server = '' WHERE id = ?",
+      [table.id]
+    );
+    released.push(table.number);
+
+    await writeAudit(env, null, {
+      action: 'update',
+      entity: 'tables',
+      entityId: table.id,
+      before: { status: 'occupied', seated_at: table.seated_at },
+      after: { status: 'available', released_by_sweep: true },
+      reason: `Occupied for more than ${maxHours}h with nothing owed — released automatically`,
+    });
+  }
+
+  return { released, stamped };
 }
 
 /**
@@ -297,4 +363,4 @@ async function handleTables(pathname, method, url, request, env, auth) {
   return null;
 }
 
-export { handleTables, listTablesWithHolds, SEATING_STATUSES };
+export { handleTables, listTablesWithHolds, releaseOverstayedTables, SEATING_STATUSES };

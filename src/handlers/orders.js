@@ -5,6 +5,12 @@ import { refreshPaymentStatus } from './payments.js';
 import { syncDeliveryToOrderStatus } from './delivery.js';
 import { consumeForOrder, reverseOrderConsumption } from '../lib/ledger.js';
 import { blocksSeating, ACTIVE_STATUSES } from '../lib/booking.js';
+import {
+  normaliseTableId,
+  ticketStale,
+  DEFAULT_KITCHEN_STALE_HOURS,
+  DEFAULT_TABLE_MAX_HOURS,
+} from '../lib/staleness.js';
 
 const ACTIVE_LIST = ACTIVE_STATUSES.map((s) => `'${s}'`).join(', ');
 
@@ -534,6 +540,34 @@ async function transferCheck(orderId, request, env, auth) {
   return json({ ok: true, moved: true, from, to: target, sourceFreed });
 }
 
+/**
+ * How long before a table and a kitchen ticket are treated as abandoned.
+ *
+ * Settings rather than constants: a cafe that turns tables in forty minutes and
+ * a restaurant that seats for two hours do not want the same number, and the
+ * person who knows which is not the one deploying Workers.
+ */
+async function loadStaleHours(env) {
+  const fallback = { table: DEFAULT_TABLE_MAX_HOURS, kitchen: DEFAULT_KITCHEN_STALE_HOURS };
+  try {
+    const { results } = await d1Query(
+      env,
+      "SELECT key, value FROM settings WHERE key IN ('tables.max_occupied_hours', 'kitchen.stale_hours')"
+    );
+    const map = {};
+    for (const r of results || []) map[r.key] = Number(String(r.value).replace(/"/g, ''));
+    return {
+      table: Number.isFinite(map['tables.max_occupied_hours']) && map['tables.max_occupied_hours'] > 0
+        ? map['tables.max_occupied_hours'] : fallback.table,
+      kitchen: Number.isFinite(map['kitchen.stale_hours']) && map['kitchen.stale_hours'] > 0
+        ? map['kitchen.stale_hours'] : fallback.kitchen,
+    };
+  } catch {
+    // Before migration 007 there is no settings table. Defaults are correct.
+    return fallback;
+  }
+}
+
 async function handleOrders(pathname, method, url, request, env, auth) {
   const m = method.toUpperCase();
   const sub = pathname.replace(/^\/api\/orders/, "");
@@ -559,7 +593,9 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     try {
       const id = data.id || "O" + crypto.randomUUID().slice(0, 7);
       const items = typeof data.items === "string" ? data.items : JSON.stringify(data.items || []);
-      const tableId = data.tableNum || data.table_number || data.table_id || null;
+      // Normalised on the way in: "7.0" and "07" are the same table as "7",
+      // and every screen compares this as a string.
+      const tableId = normaliseTableId(data.tableNum || data.table_number || data.table_id);
       const notes = typeof data.notes === "string" ? data.notes.trim() : "";
       const nowIso = new Date().toISOString();
       const orderType = data.order_type || data.type || null;
@@ -688,14 +724,24 @@ async function handleOrders(pathname, method, url, request, env, auth) {
   // lines per order would fan one refresh out into a request per ticket.
   // Declared before the /:id/items route so "items" is not read as an order id.
   if (m === "GET" && sub === "/items/active") {
+    // `o.created` comes back too, so a ticket nobody ever closed can be left
+    // off the board. Six orders were sitting here as `new` from as far back as
+    // 31 July; a chef scrolling past three weeks of dead tickets stops reading
+    // the board at all. The orders themselves are untouched and still show in
+    // Orders and, where money is owed, in Open Checks.
     const { results } = await d1Query(
       env,
-      `SELECT oi.* FROM order_items oi
+      `SELECT oi.*, o.created AS order_created FROM order_items oi
          JOIN orders o ON o.id = oi.order_id
         WHERE o.status NOT IN ('completed', 'cancelled', 'fulfilled')
         ORDER BY oi.order_id, oi.line_no`
     );
-    return json((results || []).map((i) => Object.assign({}, i, { durations: itemDurations(i) })));
+    const staleHours = (await loadStaleHours(env)).kitchen;
+    const nowMs = Date.now();
+    const live = (results || []).filter(
+      (i) => !ticketStale({ created: i.order_created }, nowMs, staleHours)
+    );
+    return json(live.map((i) => Object.assign({}, i, { durations: itemDurations(i) })));
   }
 
   // GET /api/orders/:id/items
@@ -932,7 +978,7 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     }
     if (data.table_id !== void 0 || data.table_number !== void 0) {
       fields.push("table_id = ?");
-      values.push(data.tableNum || data.table_id || data.table_number || null);
+      values.push(normaliseTableId(data.tableNum || data.table_id || data.table_number));
     }
     if (data.customer !== void 0 || data.name !== void 0) {
       fields.push("customer = ?");
@@ -1147,4 +1193,4 @@ async function handleOrders(pathname, method, url, request, env, auth) {
   }
   return null;
 }
-export { mapOrderRow, handleOrders, resetOrderColumns, resetOrderItemColumns, round2, openChecksForStaff };
+export { mapOrderRow, handleOrders, loadStaleHours, resetOrderColumns, resetOrderItemColumns, round2, openChecksForStaff };

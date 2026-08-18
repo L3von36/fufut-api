@@ -18,7 +18,7 @@ import { json } from './lib/db.js';
 import { authorize, redactStaffForRole } from './auth.js';
 
 import { handleContent, checkScheduledPublish } from './handlers/content.js';
-import { handleOrders } from './handlers/orders.js';
+import { handleOrders, loadStaleHours } from './handlers/orders.js';
 import { handlePayments } from './handlers/payments.js';
 import { handleAudit } from './handlers/audit.js';
 import { handleDelivery } from './handlers/delivery.js';
@@ -34,7 +34,7 @@ import { handleGallery } from './handlers/gallery.js';
 import { handleUpload } from './handlers/upload.js';
 import { handleMigration } from './handlers/migration.js';
 import { handleResources } from './handlers/resources.js';
-import { handleTables } from './handlers/tables.js';
+import { handleTables, releaseOverstayedTables } from './handlers/tables.js';
 import { handleStaff } from './handlers/staff.js';
 import { handleSSE } from './handlers/sse.js';
 import {
@@ -213,8 +213,17 @@ export default {
     return response;
   },
 
-  // Cron: publish any content scheduled for now.
+  // Cron: publish any content scheduled for now, and put back tables that
+  // nobody cleared. Both are things that only happen if something asks.
   async scheduled(event, env, ctx) {
     await checkScheduledPublish(env);
+    try {
+      const { table } = await loadStaleHours(env);
+      await releaseOverstayedTables(env, table);
+    } catch (e) {
+      // A sweep that fails must not stop the scheduled publish, and there is
+      // nobody to tell — the next minute tries again.
+      console.error('[SWEEP] tables', e);
+    }
   },
 };
