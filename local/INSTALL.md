@@ -42,10 +42,23 @@ works on the box, which is one more thing to get wrong for no gain.
 The bundles reference Google Fonts. With no internet the browser falls back to
 a system font: the till looks slightly different and works identically.
 
+### Export the venue's data now, not there
+
+```
+npx wrangler d1 export fufut-db --remote --output fufut-dump.sql -y
+```
+
+Do this on a machine already signed in to Cloudflare. It cannot be done on the
+box: wrangler is not in the Docker image — there is no `npm ci`, which is what
+keeps the image small and free of a runtime supply chain — and exporting needs
+credentials anyway, with `wrangler login` wanting a browser that a headless mini
+PC behind a counter does not have.
+
 Take with you:
 
 - the `fufut-api` repository
 - `pos/dist` and `backoffice/dist`
+- **`fufut-dump.sql`**
 - the Docker install for the box's OS
 - the `SYNC_TOKEN`, if sync is being switched on (see the design doc)
 
@@ -100,16 +113,21 @@ server.
 
 ### 4. Put the real venue in it
 
-An empty box proves nothing. Fill it from the live database:
+An empty box proves nothing. Fill it from the dump you brought:
 
 ```
-docker compose exec api node /app/local/seed-from-cloud.js
+cp /media/usb/fufut-dump.sql ~/fufut/data/
+docker compose exec api node /app/local/seed-from-cloud.js --from-file /data/fufut-dump.sql
 ```
 
-This needs the internet, so do it while the line is up. It copies **real staff,
-customer and payment records onto this machine** — from here the box deserves
-the same care as the cloud database: a password on the machine, disk encryption
-if the hardware supports it, and somewhere lockable to sit.
+No network, no credentials on the box. It refuses to run if the database
+already holds orders, so it cannot quietly undo a day's trading — pass `--force`
+only when you mean it.
+
+It copies **real staff, customer and payment records onto this machine**. From
+here the box deserves the same care as the cloud database: a password on the
+machine, disk encryption if the hardware supports it, and somewhere lockable to
+sit. Delete the dump from the USB stick when you are done with it.
 
 ### 5. Point one tablet at it
 
@@ -186,4 +204,4 @@ Written on a card, by the till, in the language the staff use:
 | `healthy` never arrives | `docker compose logs --tail 50 api`. Usually a mount path or a permission on `data/`. |
 | The app loads but the API 401s | The bundle is being served from somewhere other than the box, so the cookie is not first-party. Check the URL is the box's address. |
 | Assets 404 but the page loads | The bundle is in the wrong folder. `/pos/` bundles must be in `web/pos/`, `/backoffice/` in `web/backoffice/` — the base a bundle was built with has to match where it is mounted. |
-| Seeding fails | It needs the internet. Do it while the line is up. |
+| Seeding fails | Use `--from-file` with the dump you brought. The container has no wrangler and no Cloudflare credentials, by design. |
