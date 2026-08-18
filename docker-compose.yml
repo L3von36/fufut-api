@@ -25,6 +25,13 @@ services:
       # talk to the local API with no rebuild and a first-party cookie.
       FUFUT_WEB_DIR: /web
       TZ: Africa/Addis_Ababa
+      # Sync, off until both are set. Put them in a .env file beside this one
+      # rather than here: SYNC_TOKEN is a shared secret, and this file is
+      # committed.
+      #   CLOUD_URL=https://fufut-api.fufutcoffee.workers.dev
+      #   SYNC_TOKEN=<the same value as the Worker secret>
+      CLOUD_URL: ${CLOUD_URL:-}
+      SYNC_TOKEN: ${SYNC_TOKEN:-}
     volumes:
       # HOST BIND MOUNTS, NOT NAMED VOLUMES. This is deliberate and it matters:
       # one `docker compose down -v` on a named volume and the trading history

@@ -27,15 +27,19 @@
  *
  * - `sessions`: auth state for whichever side issued it. A token that works
  *   on the box must not work on the cloud; that is the point of the boundary.
- * - `sync_*`: the protocol's own bookkeeping. Journalling it would make the
- *   journal recursive.
+ * - `sync_*` and `venue_heartbeat`: the protocol's own bookkeeping. Journalling
+ *   it would make the journal recursive — and the heartbeat is written every
+ *   thirty seconds, so capturing it would have the cloud handing the box ~2,880
+ *   entries a day that say nothing except that the box is alive, which the box
+ *   already knows.
  * - `d1_migrations`: each side manages its own schema.
  * - `_cf_KV`: the local KV shim's storage. On the cloud these namespaces are
  *   real Cloudflare KV, not D1 rows, so there is nothing on the other side
  *   for a captured row to land in. Content in KV stays cloud-authoritative.
  */
 const EXCLUDED = new Set([
-  'sessions', 'sync_outbox', 'sync_cursors', 'sync_reconciliation', 'd1_migrations', '_cf_kv',
+  'sessions', 'sync_outbox', 'sync_cursors', 'sync_reconciliation', 'venue_heartbeat',
+  'd1_migrations', '_cf_kv',
 ]);
 
 const WRITE_RE = /^\s*(INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+"?([A-Za-z_][A-Za-z0-9_]*)"?/i;

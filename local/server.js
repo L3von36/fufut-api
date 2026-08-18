@@ -22,6 +22,7 @@ import { pipeline } from 'node:stream/promises';
 import worker from '../src/index.js';
 import { createLocalEnv } from './env.js';
 import { createStaticHandler } from './static.js';
+import { createSyncEngine } from './sync.js';
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -184,10 +185,18 @@ const cron = setInterval(async () => {
   }
 }, CRON_INTERVAL_MS);
 
+/**
+ * The sync daemon. Inert unless CLOUD_URL and SYNC_TOKEN are set, so a box that
+ * has not been connected to the cloud behaves exactly as it did before.
+ */
+const sync = createSyncEngine({ env });
+sync.start();
+
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
     console.log(`\n[fufut] ${signal} — closing`);
     clearInterval(cron);
+    sync.stop();
     server.close(() => process.exit(0));
   });
 }
