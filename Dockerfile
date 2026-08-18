@@ -23,6 +23,7 @@ FROM node:24-slim
 # needs without an experimental flag.
 ENV NODE_ENV=production \
     FUFUT_DATA_DIR=/data \
+    FUFUT_BACKUP_DIR=/backups \
     PORT=8787 \
     HOST=0.0.0.0
 

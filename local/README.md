@@ -9,8 +9,9 @@ npm run local            # http://0.0.0.0:8787
 FUFUT_DATA_DIR=/data PORT=8787 npm run local
 ```
 
-For the box itself, prefer Docker — see below, and
-[RUNBOOK.md](RUNBOOK.md) for the day-to-day.
+For the box itself, prefer Docker — see below.
+[INSTALL.md](INSTALL.md) is the one-time setup in the cafe;
+[RUNBOOK.md](RUNBOOK.md) is the day-to-day.
 
 ## What this is
 
@@ -252,8 +253,12 @@ Everything in the design doc is built. What remains is not code:
   exercised against local SQLite pretending to be D1. D1 is remote, and a push
   that times out mid-batch is a case these tests cannot produce.
 - **Untested on the actual box.** Everything Docker-side is verified on the
-  development machine. The cafe has different hardware, a different network and
-  nobody technical in the building.
+  development machine — image builds, container goes healthy, the apps are
+  served on the same origin as the API, a backup lands on the host, and the
+  documented restore procedure was walked end to end (the pre-backup order came
+  back, the post-backup order did not). The cafe still has different hardware, a
+  different network and nobody technical in the building, which is what
+  [INSTALL.md](INSTALL.md) is for.
 
 ## One warning
 
