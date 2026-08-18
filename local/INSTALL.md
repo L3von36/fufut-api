@@ -154,9 +154,21 @@ cp /media/usb/fufut-dump.sql ~/fufut/data/
 docker compose exec api node /app/local/seed-from-cloud.js --from-file /data/fufut-dump.sql
 ```
 
-No network, no credentials on the box. It refuses to run if the database
-already holds orders, so it cannot quietly undo a day's trading — pass `--force`
-only when you mean it.
+Then the photographs, which the dump does not contain:
+
+```
+docker compose exec api node /app/local/mirror-images.mjs
+```
+
+Seeding brings the database, and the database holds only *references* to
+images — the pictures live in Cloudflare R2, and on the box that is an empty
+directory. Skip this and every dish on the till renders with a broken image
+while the data looks complete. This step needs the internet, so do it before
+the tablets go live.
+
+No network for the seed itself, and no credentials on the box. It refuses to run
+if the database already holds orders, so it cannot quietly undo a day's
+trading — pass `--force` only when you mean it.
 
 It copies **real staff, customer and payment records onto this machine**. From
 here the box deserves the same care as the cloud database: a password on the
