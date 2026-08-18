@@ -13,11 +13,5 @@
     "disappearance was intended. Entries become unnecessary the moment the deploy",
     "lands; the check says which ones can go."
   ],
-  "removed": [
-    {
-      "name": "cursor",
-      "why": "src/handlers/sync.js — replaced by cursorRow, which reads the epoch alongside last_seq so a rebuilt box's journal is recognised. Left unused and tree-shaken out of the bundle.",
-      "commit": "d1ca18c"
-    }
-  ]
+  "removed": []
 }
