@@ -61,7 +61,30 @@ nobody has exercised.
 
 Needs the internet, so it belongs here with the other before-you-travel steps.
 
-If you do build by hand, **ignore `vite.config.js`.** Both configs say `/pos/` and `/backoffice/`, and
+### Building the POS by hand
+
+**Restore the source template first, exactly as CI does:**
+
+```
+cd fufut-management/pos
+cp index.html.source index.html      # <- without this the build is a no-op
+npx vite build --base=/
+```
+
+`pos/index.html` in the repository is **build output**, not a template: the
+deploy workflow overwrites it and commits it back. It points at
+`/assets/index-<hash>.js` rather than `/src/main.js`, so a build started from it
+re-bundles the previously built app — it transforms 43 modules instead of 113,
+finishes in a second, silently ignores every change in `src/`, and emits chunks
+with two hashes (`AppLayout-dRSWbmr3-Gibc_EBk.js`) because it treats an
+already-hashed filename as a module name. CI restores the template on the line
+before it builds, so production is unaffected; only local builds are.
+
+On Git Bash, put `MSYS_NO_PATHCONV=1` in front, or `--base=/` becomes
+`/Program Files/Git/` and every asset URL in index.html is wrong. Building from
+PowerShell avoids it entirely.
+
+Also, when building by hand, **ignore `vite.config.js`.** Both configs say `/pos/` and `/backoffice/`, and
 neither is what production uses: `.github/workflows/build-pos.yml` overrides
 both with `--base /`, and each app is deployed to its own subdomain root. The
 config is a trap — it looks authoritative and is dead.
