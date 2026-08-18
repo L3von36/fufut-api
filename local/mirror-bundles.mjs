@@ -22,9 +22,23 @@ import path from 'node:path';
 
 const WEB = path.resolve(process.argv[2] || 'web');
 
+/**
+ * The POS only, and deliberately.
+ *
+ * The backoffice is built locally with `--base /backoffice/`, which produces a
+ * bundle whose asset URLs already point where it is mounted. Mirroring it
+ * instead means taking a bundle built for a subdomain root and trying to
+ * rewrite `/assets/` to `/backoffice/assets/` inside minified JavaScript — I
+ * tried that, it silently missed occurrences, and the backoffice loaded its
+ * shell and then asked the POS's directory for its own chunks.
+ *
+ * The POS cannot be treated the same way: its service worker registration and
+ * cache list are root-absolute, so it has to sit at the origin root, and the
+ * one currently deployed is the only bundle that works (see the vite 8.1.5 note
+ * in INSTALL.md).
+ */
 const APPS = [
   { name: 'pos', origin: 'https://pos.fufutcoffee.com', dir: WEB },
-  { name: 'backoffice', origin: 'https://backoffice.fufutcoffee.com', dir: path.join(WEB, 'backoffice') },
 ];
 
 /** Root-level files a build ships that nothing links to from the HTML. */
@@ -124,24 +138,8 @@ for (const app of APPS) ok = (await mirror(app)) && ok;
 
 if (!ok) process.exit(1);
 
-/**
- * The backoffice is served from its own subdomain root in production and from
- * /backoffice/ on the box, so its absolute asset URLs have to be shifted. The
- * POS needs no such treatment — it sits at the root in both places, which is
- * also why its root-absolute service worker keeps working.
- */
-const boDir = path.join(WEB, 'backoffice');
-let rewritten = 0;
-const walk = (dir) => {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) { walk(full); continue; }
-    if (!/\.(html|js|css|json|webmanifest)$/.test(entry.name)) continue;
-    const before = fs.readFileSync(full, 'utf8');
-    const after = before.replace(/(["'`(])\/assets\//g, '$1/backoffice/assets/');
-    if (after !== before) { fs.writeFileSync(full, after); rewritten += 1; }
-  }
-};
-walk(boDir);
-console.log(`[mirror] rebased ${rewritten} backoffice files onto /backoffice/`);
-console.log('[mirror] done. These are the bundles the cafe is already running.');
+console.log('[mirror] the POS is done. Build the backoffice separately:');
+console.log('[mirror]   cd ../fufut-management/backoffice && npx vite build --base /backoffice/');
+console.log('[mirror]   cp -r dist/. ../../fufut-api/web/backoffice/');
+
+console.log('[mirror] this is the bundle the cafe is already running.');

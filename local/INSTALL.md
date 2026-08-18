@@ -31,7 +31,21 @@ anything there.
 
 ```
 cd fufut-api && node local/mirror-bundles.mjs web
+cd ../fufut-management/backoffice && npx vite build --base /backoffice/
+cp -r dist/. ../../fufut-api/web/backoffice/
 ```
+
+The two apps are handled differently on purpose. The **POS is copied from
+production and sits at the origin root**, because its service worker
+registration and cache list are root-absolute and the deployed bundle is
+currently the only one that works. The **backoffice is built with
+`--base /backoffice/`**, which puts its asset URLs where it is actually
+mounted; it has no service worker, and its local build is unaffected by the
+vite fault below.
+
+Do not mirror the backoffice and rewrite its paths. Rewriting `/assets/` inside
+minified JavaScript misses occurrences, and the result loads its shell and then
+fetches the POS's directory for its own chunks.
 
 **Copy what is deployed; do not build.** Vite 8.1.5 — the version the lockfile
 pins — emits chunk files with an extra hash segment
