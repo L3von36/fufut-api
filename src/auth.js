@@ -42,6 +42,9 @@ const PUBLIC = [
 
   // Website CMS + catalogue reads.
   { method: 'GET', exact: '/api/content' },
+  // Whether the venue can take an order at all. Public because the website
+  // needs it before a customer has done anything.
+  { method: 'GET', exact: '/api/venue/status' },
   { method: 'GET', exact: '/api/menu' },
   { method: 'GET', exact: '/api/menus' },
   { method: 'GET', exact: '/api/reviews' },

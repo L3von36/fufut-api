@@ -5,6 +5,8 @@ import { refreshPaymentStatus } from './payments.js';
 import { syncDeliveryToOrderStatus } from './delivery.js';
 import { consumeForOrder, reverseOrderConsumption } from '../lib/ledger.js';
 import { blocksSeating, ACTIVE_STATUSES } from '../lib/booking.js';
+import { venueStatus } from '../lib/venue.js';
+import { getAuthUser } from './session.js';
 import {
   normaliseTableId,
   ticketStale,
@@ -590,6 +592,40 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     return json(rows.map(mapOrderRow));
   }
   if (m === "POST" && sub === "") {
+    /**
+     * An order nobody can cook is worse than an order not taken.
+     *
+     * This route is anonymous — it is how the website orders — so when the
+     * venue has gone quiet the cloud accepts orders into a database the kitchen
+     * cannot see. The customer pays and waits for food that was never started.
+     * Refusing is the kinder failure, and it is the decision recorded in the
+     * design doc.
+     *
+     * Only anonymous orders. A signed-in member of staff reaching the cloud is
+     * the fallback when the box is down but the line is up, and closing that
+     * would take the till offline at precisely the wrong moment.
+     */
+    // `auth` is null here even for a signed-in waiter: this route is in PUBLIC,
+    // so the gate returns before it ever looks for a session. Resolving it
+    // explicitly is the only way to tell a customer from a member of staff,
+    // and getting that wrong would refuse the till instead of the website.
+    const actor = auth || (await getAuthUser(request, env));
+
+    if (!actor) {
+      const venue = await venueStatus(env);
+      if (!venue.online) {
+        return json(
+          {
+            ok: false,
+            error: 'Online ordering is closed at the moment. Please call the shop or try again shortly.',
+            reason: 'venue-offline',
+            since: venue.lastSeen,
+          },
+          503
+        );
+      }
+    }
+
     const data = await readBody(request);
     if (!data) return json({ ok: false, error: "Invalid JSON body" }, 400);
     try {

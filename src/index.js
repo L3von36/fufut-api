@@ -38,6 +38,7 @@ import { handleTables, releaseOverstayedTables } from './handlers/tables.js';
 import { handleStaff } from './handlers/staff.js';
 import { handleSSE } from './handlers/sse.js';
 import { handleSync } from './handlers/sync.js';
+import { venueStatus } from './lib/venue.js';
 import {
   handleStaffLogin,
   handleSessionCheck,
@@ -95,6 +96,24 @@ async function route(pathname, method, url, request, env, ctx, auth) {
   // machine routes by SYNC_TOKEN, the reconciliation list by a manager session.
   if (pathname.startsWith('/api/sync/')) {
     return handleSync(pathname, method, url, request, env, auth);
+  }
+
+  /**
+   * Public: can the venue actually take an order right now?
+   *
+   * The website reads this to close its ordering UI before a customer fills a
+   * basket, rather than letting them reach checkout and be refused. The refusal
+   * itself lives on POST /api/orders — this is the courtesy, that is the
+   * guarantee.
+   */
+  if (pathname === '/api/venue/status' && upper === 'GET') {
+    const venue = await venueStatus(env);
+    return json({
+      ok: true,
+      online_ordering: venue.online,
+      venue_online: venue.online,
+      last_seen: venue.lastSeen,
+    });
   }
 
   if (pathname.startsWith('/api/orders')) {
