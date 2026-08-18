@@ -147,22 +147,25 @@ middle of service is the wrong risk on a till.
 The built apps live in `./web`, served straight off the disk:
 
 ```
-web/index.html             the POS, built with --base=/
-web/backoffice/index.html  the backoffice, built with --base=/backoffice/
+web/index.html             a redirect, so the bare address opens the till
+web/pos/                   the POS,        reached at /pos/
+web/backoffice/            the backoffice, reached at /backoffice/
 ```
 
-Replace the files and reload the tablet. No rebuild and no restart — the server
-reads from disk on every request.
+Replace the contents of `web/pos/` or `web/backoffice/` and reload the tablet.
+No rebuild and no restart — the server reads from disk on every request.
 
-The base a bundle is built with has to match where it is mounted, because that
-is what its asset URLs point at. A POS built with `--base=/` cannot be served
-from a subfolder.
+Each app must go in the folder matching the path it was built for, because that
+is what its asset URLs point at. Both are built with plain `npm run build`; the
+paths come from their own vite configs and are the same ones Cloudflare serves
+them at, so there is no box-specific build to keep track of.
 
 ---
 
 ## Pointing a tablet at the box
 
-Open `http://<the box's address>:8787/` in the tablet's browser.
+Open `http://<the box's address>:8787/` in the tablet's browser — it redirects
+to the till. The backoffice is at `/backoffice/`.
 
 Give the box a **fixed address** on the cafe's router first, or it will move and
 the tablets will stop finding it.
