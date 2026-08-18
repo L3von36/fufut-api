@@ -111,8 +111,10 @@ anything about Docker.
   origin as the API. This works with the production bundles and no rebuild,
   because the POS already defaults to same-origin
   (`VITE_API_URL || ''`): the session cookie stays first-party, no CORS.
-  Layout: the POS built with `--base=/` at the root, the backoffice with
-  `--base=/backoffice/` in a subdirectory. Client-side routes get the nearest
+  Layout: `web/pos/` and `web/backoffice/`, each built with the base its own
+  vite config already sets — the same one Cloudflare serves it at, so no
+  box-specific build exists. A one-line `web/index.html` redirects the bare
+  address to the till. Client-side routes get the nearest
   app's shell (the shell-walk), `/api/*` always wins over any stray file, and
   a missing asset is a miss — never index.html dressed up as JavaScript.
 - **`backup.js`** takes a consistent snapshot with `VACUUM INTO` — copying
