@@ -2,6 +2,9 @@
 
 **Status:** sketch, for review. Nothing here is built.
 **Date:** 2026-08-19
+**Revised** after checking how Toast, Square and the sit-down QR products
+actually work — which changed the reasoning behind two of the decisions and
+added a risk the first draft had not considered at all.
 
 A printed code on each table. A guest scans it, sees the menu, orders, and the
 order arrives against that table.
@@ -90,33 +93,53 @@ out to need it.
 
 ## Does it go straight to the kitchen?
 
-The sharpest question here, and it is about trust, not code.
+**What the established systems do:** straight to the kitchen, by default. Toast
+has you nominate an "auto-firing device" so orders fire with nobody touching
+them; Square's orders "feed directly to your kitchen ticket printer or kitchen
+display system". Toast can be configured to hold orders for staff review, but
+that is a setting somebody turns on, not how it arrives.
 
-**Straight to the kitchen** is fastest and feels modern. It also means anyone
-who photographs a code can send food to a pass at any time, and the kitchen has
-no idea whether a human is sitting there.
+So the obvious reading is that a waiter-accepts step is unnecessary caution.
+That reading misses why it works for them.
 
-**A waiter accepts it first** costs seconds and removes that entirely. The order
-appears on the floor screen, a waiter glances at the table, taps accept, and
-only then does it print. It also gives the guest something honest to look at:
-*sent · seen by the floor · being cooked*.
+**Their product is called Mobile Order *and Pay*.** On those systems the guest
+normally pays when they order. That payment is what makes direct firing safe: a
+prank order costs the prankster, not the restaurant. The card is the check on
+abuse, and the kitchen never needed one.
 
-The existing status vocabulary is `new → confirmed → fulfilled`, and `confirmed`
-is sitting there unused by the customer flow. A QR order can land as `new` and
-become `confirmed` when a waiter accepts it, with the kitchen board filtering on
-`confirmed` for QR-sourced orders only. Staff-entered orders keep going straight
-through, exactly as now.
+This design has the guest paying at the end (below). Combining that with direct
+firing removes the only thing standing between a photographed code and the pass,
+and puts nothing in its place.
 
-**Recommendation: waiter accepts.** The delay is a few seconds. The alternative
-is a stranger being able to cook food.
+So the two decisions are really one:
 
----
+| Payment | Firing |
+|---|---|
+| **When ordering** | straight to the kitchen is fine — this is Toast's and Square's model |
+| **At the end** | keep a human in the loop, because nothing else is protecting the kitchen |
+
+The existing status vocabulary already suits it: orders run `new → confirmed →
+fulfilled`, and `confirmed` is unused by the customer flow. A QR order lands as
+`new` and becomes `confirmed` when a waiter accepts it, with the kitchen board
+filtering on `confirmed` for QR-sourced orders only. Staff-entered orders keep
+going straight through exactly as now.
+
+**Recommendation: waiter accepts, while payment is at the end.** Not because a
+human check is always right — because dropping both safeguards at once is what
+would be wrong. If the café later moves to paying up front, drop this step
+deliberately rather than discovering it is gone.
 
 ## Who pays, and when
 
 **Pay at the end, on the table's open check.** The order joins the check, the
 guest pays a person, and nothing about money handling changes. Everything needed
 already exists — open checks, split payments, tips, the shift-close gate.
+
+This is also the norm for sit-down restaurants rather than a compromise. The
+standard pattern is exactly the one sketched here: rounds ordered through the
+evening all attach to the same table and build a single running bill, settled
+once at the end. Guests adding a second round without a second payment is the
+expected behaviour, not an edge case.
 
 **Pay online at order time** means integrating Telebirr or CBE properly:
 gateway, verification, evidence, refunds, reconciliation, and the question of
@@ -152,6 +175,37 @@ That is the arrangement worth aiming at eventually. It is not day-one work.
 
 ---
 
+## The risk that actually happens: somebody else's sticker
+
+The threat this design spent its length on is a forged order. The threat the
+industry actually loses money and reputation to is the opposite direction:
+**quishing** — a criminal sticks their own QR sticker over yours, and the
+guest lands on a convincing fake payment page and hands over card details.
+
+Reported QR phishing rose from 7.6 million attacks in January 2026 to 18.7
+million in March — a 146% increase in a single quarter, the fastest-growing
+phishing technique currently tracked.
+
+The damage is not a wasted plate of food. It is a guest defrauded in your
+dining room, believing it was you.
+
+Two defences, both cheap, both physical rather than technical.
+
+**One code per table, not three.** A table carrying separate codes for the
+menu, for ordering and for paying is exactly where a fake sticker hides — a
+fourth code looks like it belongs. With a single known code per table, anything
+extra is obviously wrong to staff and guests alike. This is a design constraint
+on the whole feature, not a printing detail: resist adding a second code later.
+
+**Make it hard to cover, and look at it.** Under table glass, engraved, or
+printed as part of the table card rather than a loose sticker that peels. Then
+a glance at every table when opening, the way the floor is already checked for
+anything else out of place. Staff should know what the real code looks like —
+if it carries the table name in plain text, they will.
+
+Neither of these is code. Both belong in the opening routine and in
+[local/RUNBOOK.md](local/RUNBOOK.md) once this is built.
+
 ## What the guest sees
 
 Roughly, and worth designing properly with someone who knows the room:
@@ -173,7 +227,8 @@ and course work already supports exactly that.
   judgement; that is the point of the accept step.
 - **Table numbers that disagree with reality.** If cards are moved between
   tables, the system is confidently wrong. Print the table name on the card,
-  large — a human check beats a clever one.
+  large — a human check beats a clever one, and it doubles as the tell that a
+  code has been tampered with.
 - **Language.** The menu is English today. A café in Addis may want Amharic on
   the guest-facing page even if staff screens stay as they are.
 - **Allergens and modifiers.** Modifiers exist in the POS; whether guests should
@@ -197,8 +252,23 @@ would stop and watch a real service before adding anything.
 
 ## Decisions needed before building
 
-1. **Waiter accepts, or straight to the kitchen?**
+1. **Waiter accepts, or straight to the kitchen?** Bound to decision 3: direct
+   firing is what Toast and Square do, and it is safe there because the guest
+   has already paid. Both safeguards should not go at once.
 2. **Does the first scan seat the table, or must a waiter seat it first?**
 3. **Pay at the end, or online at order time?** (Strong recommendation: at the
-   end, to begin with.)
+   end, to begin with — it is also the norm for sit-down service.)
 4. **Should guests see modifiers and notes**, or a simplified menu?
+
+---
+
+## Sources
+
+Checked rather than recalled:
+
+- [Toast — Mobile Order & Pay setup](https://support.toasttab.com/en/article/Setting-Up-Toast-Mobile-Order-and-Pay) — the auto-firing device
+- [Square — QR code ordering](https://squareup.com/help/us/en/article/7142-set-up-self-serve-ordering-and-qr-codes-with-square-online) — orders feed straight to the KDS
+- [Sunday — how QR ordering works](https://sundayapp.com/how-does-qr-code-ordering-work/) — payment at the end for sit-down service
+- [HungryHungry — adding to an order mid-meal](https://www.hungryhungry.com/en/blogs/add-to-qr-code-order-during-meal) — rounds on one running bill
+- [Sapaad — the one-code standard](https://www.sapaad.com/one-qr-code-standard/) — why multiple codes per table invite a fake one
+- [QR menu safety checks](https://allblogs.in/post/restaurant-qr-code-menu-safety-privacy-scam-checks) — quishing, and what staff should look for
