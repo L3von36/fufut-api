@@ -10,8 +10,12 @@ FUFUT_DATA_DIR=/data PORT=8787 npm run local
 ```
 
 For the box itself, prefer Docker — see below.
-[INSTALL.md](INSTALL.md) is the one-time setup in the cafe;
-[RUNBOOK.md](RUNBOOK.md) is the day-to-day.
+
+| | |
+|---|---|
+| [SETUP.md](SETUP.md) | the full manual reference: every option, every step |
+| [INSTALL.md](INSTALL.md) | the abbreviated sequence for installation day |
+| [RUNBOOK.md](RUNBOOK.md) | day-to-day once it is running |
 
 ## What this is
 
