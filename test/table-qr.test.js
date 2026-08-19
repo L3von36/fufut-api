@@ -201,3 +201,76 @@ describe('the key itself', () => {
     expect(keysMatch('abc23xyz78', '')).toBe(false);
   });
 });
+
+describe("a guest's order waits for a waiter", () => {
+  async function guestOrder() {
+    const res = await call('POST', '/api/orders', { body: { ...ORDER, table_number: '4', table_key: KEY } });
+    return res.body.id;
+  }
+
+  const onKitchenBoard = async (cookie) =>
+    (await call('GET', '/api/orders/items/active', { cookie })).body || [];
+
+  it('does not reach the kitchen board before it is accepted', async () => {
+    // The whole reason the accept step exists: a photographed code must not
+    // put food on the pass by itself.
+    const id = await guestOrder();
+
+    const board = await onKitchenBoard(managerCookie);
+    expect(board.some((i) => i.order_id === id)).toBe(false);
+  });
+
+  it('reaches the board once a waiter accepts it', async () => {
+    const id = await guestOrder();
+
+    const accepted = await call('POST', `/api/orders/${id}/accept`, { cookie: managerCookie });
+    expect(accepted.status).toBe(200);
+    expect(accepted.body.status).toBe('confirmed');
+
+    const board = await onKitchenBoard(managerCookie);
+    expect(board.some((i) => i.order_id === id)).toBe(true);
+  });
+
+  it('lists what is waiting, and stops listing it once accepted', async () => {
+    const id = await guestOrder();
+
+    let pending = (await call('GET', '/api/orders/pending', { cookie: managerCookie })).body;
+    expect(pending.map((o) => o.id)).toContain(id);
+
+    await call('POST', `/api/orders/${id}/accept`, { cookie: managerCookie });
+
+    pending = (await call('GET', '/api/orders/pending', { cookie: managerCookie })).body;
+    expect(pending.map((o) => o.id)).not.toContain(id);
+  });
+
+  it('cannot be accepted by somebody with no session', async () => {
+    const id = await guestOrder();
+    const res = await call('POST', `/api/orders/${id}/accept`);
+    expect(res.status).toBe(401);
+  });
+
+  it('is harmless to accept twice', async () => {
+    // Two waiters can tap at once; the second must not be an error thrown at
+    // somebody who did nothing wrong.
+    const id = await guestOrder();
+    await call('POST', `/api/orders/${id}/accept`, { cookie: managerCookie });
+    const again = await call('POST', `/api/orders/${id}/accept`, { cookie: managerCookie });
+
+    expect(again.status).toBe(200);
+    expect(again.body.alreadyAccepted).toBe(true);
+  });
+
+  it('leaves staff-entered orders going straight through', async () => {
+    // Nothing about the floor's own workflow changes.
+    const staff = await call('POST', '/api/orders', {
+      cookie: managerCookie,
+      body: { ...ORDER, type: 'dine-in', tableNum: '5' },
+    });
+
+    const board = await onKitchenBoard(managerCookie);
+    expect(board.some((i) => i.order_id === staff.body.id)).toBe(true);
+
+    const refused = await call('POST', `/api/orders/${staff.body.id}/accept`, { cookie: managerCookie });
+    expect(refused.status).toBe(400);
+  });
+});

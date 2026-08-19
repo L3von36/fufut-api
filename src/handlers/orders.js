@@ -862,6 +862,18 @@ async function handleOrders(pathname, method, url, request, env, auth) {
       `SELECT oi.*, o.created AS order_created FROM order_items oi
          JOIN orders o ON o.id = oi.order_id
         WHERE o.status NOT IN ('completed', 'cancelled', 'fulfilled')
+          -- A guest's own order waits for a waiter.
+          --
+          -- The QR code on a table is a photograph anyone can keep, so an
+          -- order arriving from one is a request, not an instruction. It
+          -- reaches the pass once somebody on the floor has looked at the
+          -- table and accepted it, which moves the order to 'confirmed'.
+          --
+          -- Staff-entered orders have no source and are unaffected: they go
+          -- straight through exactly as before. If the cafe later takes
+          -- payment at the time of ordering, this line is what to remove —
+          -- the card becomes the check on abuse instead.
+          AND (COALESCE(o.source, '') <> 'qr' OR o.status <> 'new')
         ORDER BY oi.order_id, oi.line_no`
     );
     const staleHours = (await loadStaleHours(env)).kitchen;
@@ -986,6 +998,21 @@ async function handleOrders(pathname, method, url, request, env, auth) {
   // list orders but never look one up, so the only way back to an open tab was
   // re-typing the whole cart. Declared after the /:id/items routes so "items" is
   // not swallowed as an order id.
+  /**
+   * GET /api/orders/pending — guests' orders waiting for somebody to accept.
+   *
+   * Its own route rather than a filter on the orders list, because this is a
+   * question the floor asks constantly and the answer must be small and fast.
+   */
+  if (m === "GET" && sub === "/pending") {
+    if (!auth) return json({ ok: false, error: "Authentication required" }, 401);
+    const { results } = await d1Query(
+      env,
+      `SELECT * FROM orders WHERE COALESCE(source, '') = 'qr' AND status = 'new' ORDER BY created`
+    );
+    return json((results || []).map(mapOrderRow));
+  }
+
   if (m === "GET" && /^\/[^/]+$/.test(sub)) {
     const orderId = sub.slice(1);
     const { results } = await d1Query(env, "SELECT * FROM orders WHERE id = ?", [orderId]);
@@ -1003,6 +1030,50 @@ async function handleOrders(pathname, method, url, request, env, auth) {
   }
 
   // POST /api/orders/:id/transfer  { tableNumber }
+  /**
+   * POST /api/orders/:id/accept — a waiter takes responsibility for a guest's
+   * order, and only then does the kitchen see it.
+   *
+   * This is the human check that a printed code cannot provide. The floor
+   * screen lists what is waiting, somebody glances at the table, and taps once.
+   *
+   * Requires a session: the point of the step is that a person did it. It is
+   * audited for the same reason — "who let this into the kitchen" is a
+   * question worth being able to answer.
+   */
+  if (m === "POST" && /^\/[^/]+\/accept$/.test(sub)) {
+    const orderId = sub.split("/")[1];
+    if (!auth) return json({ ok: false, error: "Authentication required" }, 401);
+
+    const { results } = await d1Query(env, "SELECT * FROM orders WHERE id = ?", [orderId]);
+    const order = results && results[0];
+    if (!order) return json({ ok: false, error: "Order not found" }, 404);
+
+    // Accepting anything else is meaningless rather than harmful, but saying so
+    // is better than pretending something happened.
+    if (String(order.source || "") !== "qr") {
+      return json({ ok: false, error: "That order did not come from a table code." }, 400);
+    }
+    if (String(order.status) !== "new") {
+      return json({ ok: true, alreadyAccepted: true, id: orderId, status: order.status });
+    }
+
+    await d1Run(env, "UPDATE orders SET status = 'confirmed', updated_at = ? WHERE id = ? AND status = 'new'", [
+      new Date().toISOString(),
+      orderId,
+    ]);
+    await writeAudit(env, auth, {
+      action: "update",
+      entity: "orders",
+      entityId: orderId,
+      before: { status: "new" },
+      after: { status: "confirmed" },
+      reason: `Table order accepted by ${actorName(auth)}`,
+    });
+
+    return json({ ok: true, id: orderId, status: "confirmed" });
+  }
+
   if (m === "POST" && /^\/[^/]+\/transfer$/.test(sub)) {
     return transferCheck(sub.split("/")[1], request, env, auth);
   }
