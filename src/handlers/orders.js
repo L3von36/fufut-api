@@ -716,7 +716,14 @@ async function handleOrders(pathname, method, url, request, env, auth) {
         total: round2(data.total),
         payment: data.payment || null,
         type: qr.table ? 'dine-in' : orderType,
-        table_id: qr.table ? String(qr.table.id) : tableId,
+        /* Normalised like every other reference. Filing a QR order under
+         * the raw `tables.id` put it under "Table 6" while the POS filed the
+         * same table under "6", and the floor plan compares these as strings —
+         * so the guest's order existed and no screen showed it. The number
+         * column is the reliable half of the row; the id is free text. */
+        table_id: qr.table
+          ? normaliseTableId(qr.table.number ?? qr.table.id)
+          : tableId,
         source: qr.table ? 'qr' : null,
         customer: data.name || data.customer || null,
         status: data.status || "new",

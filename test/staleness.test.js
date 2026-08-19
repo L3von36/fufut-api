@@ -26,11 +26,30 @@ describe('normaliseTableId', () => {
     expect(normaliseTableId(' 7 ')).toBe('7');
   });
 
+  it('collapses the prefixed spellings onto the same table', () => {
+    // `tables.id` is free text: "T6" in the seeded rows, "Table 6" in the
+    // live ones. A QR order was filed under the raw id and a POS order under
+    // the number, so the floor plan showed nothing against the table.
+    for (const v of ['T6', 't6', 'Table 6', 'table 6', 'TABLE 6',
+                     'Table-6', 'Table_6', 'Table.6', 'tbl 6', ' Table 6 ']) {
+      expect(normaliseTableId(v)).toBe('6');
+    }
+    expect(normaliseTableId('Table 12')).toBe('12');
+    expect(normaliseTableId('TABLE 03')).toBe('3');
+  });
+
   it('leaves a table that is not a plain number exactly as typed', () => {
     expect(normaliseTableId('A1')).toBe('A1');
     expect(normaliseTableId('Patio 2')).toBe('Patio 2');
     // Not a whole number, so not ours to reinterpret.
     expect(normaliseTableId('2.5')).toBe('2.5');
+    // A prefix is only a prefix when a number follows it. These are names,
+    // and collapsing them would merge two real tables into one.
+    expect(normaliseTableId('T')).toBe('T');
+    expect(normaliseTableId('Table')).toBe('Table');
+    expect(normaliseTableId('Table A')).toBe('Table A');
+    expect(normaliseTableId('Takeaway')).toBe('Takeaway');
+    expect(normaliseTableId('Terrace')).toBe('Terrace');
   });
 
   it('treats blank and missing as no table', () => {

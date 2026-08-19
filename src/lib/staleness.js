@@ -35,14 +35,23 @@ export const DEFAULT_KITCHEN_STALE_HOURS = 4;
  * as a string, so an order written as "7.0" belongs to no table: the floor
  * plan shows no open tab and Add Round cannot find it.
  *
- * Only unambiguous numeric forms are touched. A venue that labels a table
- * "A1" or "Patio 2" keeps exactly what it typed.
+ * The prefixed forms are the same problem wearing a word. `tables.id` is free
+ * text and has been written "T6" in the seeded rows and "Table 6" in the live
+ * ones, while an order for that same table is filed under "6". A QR order was
+ * filed under the raw id and a POS order under the number, so the two never
+ * met: a guest ordered, and the waiter's floor plan showed nothing against
+ * their table.
+ *
+ * Only unambiguous numeric forms are touched, prefix or no prefix. A venue
+ * that labels a table "A1" or "Patio 2" keeps exactly what it typed — those
+ * are names, and guessing at them would merge two real tables into one.
  */
 export function normaliseTableId(value) {
   if (value === null || value === undefined) return null;
   const raw = String(value).trim();
   if (!raw) return null;
-  if (/^\d+(\.0+)?$/.test(raw)) return String(parseInt(raw, 10));
+  const m = raw.match(/^(?:table|tbl|t)?[\s._-]*(\d+)(?:\.0+)?$/i);
+  if (m) return String(parseInt(m[1], 10));
   return raw;
 }
 

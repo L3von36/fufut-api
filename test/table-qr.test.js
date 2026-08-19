@@ -70,7 +70,10 @@ describe('the key is what identifies the table', () => {
 
     expect(res.status).toBeLessThan(300);
     const row = orderRow(res.body.id);
-    expect(row.table_id).toBe('T4');
+    // Filed under the normalised reference, not the raw `tables.id`. The id
+    // is free text — "T4" here, "Table 4" in production — and filing a QR
+    // order under it put the guest's order where no screen looked for it.
+    expect(row.table_id).toBe('4');
     expect(row.source).toBe('qr');
   });
 
@@ -101,7 +104,11 @@ describe('the key is what identifies the table', () => {
     });
 
     const row = orderRow(res.body.id);
-    expect(row.table_id).toBe('T4');
+    // Table 4, whatever that table's id happens to be spelled like — and
+    // emphatically not the table 9 the payload asked for.
+    expect(row.table_id).toBe('4');
+    expect(row.table_id).not.toBe('9');
+    expect(row.table_id).not.toBe('T9');
     // A code on table 4 is not a delivery.
     expect(row.type).toBe('dine-in');
   });
