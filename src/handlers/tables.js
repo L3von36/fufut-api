@@ -3,6 +3,7 @@ import { holdsTable, blocksSeating, isNewSeating, ACTIVE_STATUSES, GRACE_MIN, SE
 import { actorName } from '../auth.js';
 import { writeAudit } from '../lib/audit.js';
 import { tableOverstayed, DEFAULT_TABLE_MAX_HOURS } from '../lib/staleness.js';
+import { generateTableKey, tableOrderUrl } from '../lib/tablekey.js';
 
 const ACTIVE_LIST = ACTIVE_STATUSES.map((s) => `'${s}'`).join(', ');
 
@@ -208,6 +209,73 @@ async function handleTables(pathname, method, url, request, env, auth) {
 
   if (m === 'GET' && parts.length === 2) {
     return json(await listTablesWithHolds(env));
+  }
+
+  /**
+   * GET /api/tables/qr — the cards to print, one per table.
+   *
+   * Manager-only, because the response contains every table's key and that is
+   * the whole point of the feature. It is a read of secrets, so it is never
+   * cached and never logged.
+   *
+   * Tables without a key are returned with `url: null` rather than omitted, so
+   * a manager printing cards can see at a glance which tables still need one
+   * instead of wondering why the list is short.
+   */
+  if (m === 'GET' && parts.length === 3 && parts[2] === 'qr') {
+    if (!isManager(auth)) {
+      return json({ ok: false, error: 'Manager access required' }, 403);
+    }
+    const origin = url.searchParams.get('origin') || 'https://fufutcoffee.com';
+    const { results } = await d1Query(env, 'SELECT id, number, name, qr_key FROM tables ORDER BY CAST(number AS INTEGER)');
+    return json({
+      ok: true,
+      tables: (results || []).map((t) => ({
+        id: t.id,
+        number: t.number,
+        name: t.name || `Table ${t.number}`,
+        hasKey: Boolean(t.qr_key),
+        url: t.qr_key ? tableOrderUrl(origin, t) : null,
+      })),
+    });
+  }
+
+  /**
+   * POST /api/tables/:id/qr — mint or replace one table's key.
+   *
+   * Replacing is the point as much as minting: if a card is photographed,
+   * damaged or walks off, a manager regenerates that table and reprints one
+   * card. Every other table keeps working, which is why the key is per-table
+   * rather than one secret for the room.
+   *
+   * Audited, because rotating a key silently invalidates a printed card and
+   * somebody will need to know when that happened.
+   */
+  if (m === 'POST' && parts.length === 4 && parts[3] === 'qr') {
+    if (!isManager(auth)) {
+      return json({ ok: false, error: 'Manager access required' }, 403);
+    }
+    const tableId = parts[2];
+    const { results } = await d1Query(env, 'SELECT id, number, name, qr_key FROM tables WHERE id = ?', [tableId]);
+    const table = results && results[0];
+    if (!table) return json({ ok: false, error: 'Table not found' }, 404);
+
+    const key = generateTableKey();
+    await d1Run(env, 'UPDATE tables SET qr_key = ? WHERE id = ?', [key, tableId]);
+    await writeAudit(env, auth, {
+      action: table.qr_key ? 'update' : 'create',
+      entity: 'tables',
+      entityId: tableId,
+      reason: table.qr_key ? 'QR code regenerated — the previous printed card no longer works' : 'QR code created',
+    });
+
+    const origin = url.searchParams.get('origin') || 'https://fufutcoffee.com';
+    return json({
+      ok: true,
+      table: { id: table.id, number: table.number, name: table.name || `Table ${table.number}` },
+      replaced: Boolean(table.qr_key),
+      url: tableOrderUrl(origin, { ...table, qr_key: key }),
+    });
   }
 
   if (m === 'PUT' && parts.length === 3) {

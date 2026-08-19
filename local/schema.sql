@@ -576,3 +576,9 @@ CREATE TABLE IF NOT EXISTS venue_heartbeat (
   last_seen TEXT NOT NULL,
   detail    TEXT
 );
+
+-- Table QR ordering (migration 015). See migrations/015-table-qr.sql.
+-- ALTERs rather than columns in the CREATE above, so this file stays a
+-- faithful dump of production plus the migrations applied on top of it.
+ALTER TABLE tables ADD COLUMN qr_key TEXT;
+ALTER TABLE orders ADD COLUMN source TEXT;

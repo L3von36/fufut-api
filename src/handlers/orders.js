@@ -6,6 +6,7 @@ import { syncDeliveryToOrderStatus } from './delivery.js';
 import { consumeForOrder, reverseOrderConsumption } from '../lib/ledger.js';
 import { blocksSeating, ACTIVE_STATUSES } from '../lib/booking.js';
 import { venueStatus } from '../lib/venue.js';
+import { keysMatch } from '../lib/tablekey.js';
 import { getAuthUser } from './session.js';
 import {
   normaliseTableId,
@@ -88,6 +89,43 @@ function resolveCategory(line, lookup) {
     return lookup.byId.get(String(line.menuItemId));
   }
   return lookup.byName.get(line.name.toLowerCase()) || '';
+}
+
+/**
+ * Turn a `table_key` into a table, or refuse.
+ *
+ * Returns `{ table: null }` when no key was sent — that is not an error, it is
+ * every order the system takes today.
+ *
+ * The refusals are deliberately vague to the caller ("that code is not valid")
+ * and specific in the code, because a guest cannot act on the difference
+ * between a wrong key and an unknown table, and an attacker should not learn
+ * which tables exist.
+ */
+async function resolveTableKey(env, data) {
+  const key = data && (data.table_key || data.tableKey || data.k);
+  if (!key) return { table: null };
+
+  const wanted = normaliseTableId(data.tableNum || data.table_number || data.table_id || data.t);
+  if (!wanted) return { error: 'That table code is not valid.' };
+
+  let results;
+  try {
+    ({ results } = await d1Query(env, 'SELECT * FROM tables WHERE id = ? OR number = ?', [
+      String(wanted),
+      Number(wanted) || -1,
+    ]));
+  } catch {
+    // The column arrives by migration 015. Until it is applied, a key cannot
+    // be checked, and accepting one unchecked would be worse than refusing.
+    return { error: 'Table ordering is not set up yet.' };
+  }
+
+  const table = results && results[0];
+  if (!table || !table.qr_key || !keysMatch(key, table.qr_key)) {
+    return { error: 'That table code is not valid.' };
+  }
+  return { table };
 }
 
 /**
@@ -628,6 +666,22 @@ async function handleOrders(pathname, method, url, request, env, auth) {
 
     const data = await readBody(request);
     if (!data) return json({ ok: false, error: "Invalid JSON body" }, 400);
+
+    /**
+     * An order placed by a guest from the code on their table.
+     *
+     * Present only when the request carries a `table_key`, so nothing that
+     * exists today changes: the website's own form, and every staff-entered
+     * order, take the path below untouched.
+     *
+     * What the key buys is that the table is *established* rather than
+     * *claimed*. Without it a stranger can post an order naming any table;
+     * with it, the order can only attach to the table whose printed card they
+     * are sitting in front of.
+     */
+    const qr = await resolveTableKey(env, data);
+    if (qr.error) return json({ ok: false, error: qr.error, reason: 'bad-table-code' }, 403);
+
     try {
       const id = data.id || "O" + crypto.randomUUID().slice(0, 7);
       const items = typeof data.items === "string" ? data.items : JSON.stringify(data.items || []);
@@ -648,13 +702,22 @@ async function handleOrders(pathname, method, url, request, env, auth) {
       // (see orderColumns), which replaces the previous insert-and-retry: with
       // this many new columns, one try/catch per column would be unreadable,
       // and the filter keeps ordering working either side of migration 005.
+      /**
+       * A verified code overrides whatever the body claimed.
+       *
+       * The guest's phone sends the table it read off the card, but the key is
+       * what proves it. Taking the table from the row we just authenticated
+       * means a tampered payload cannot name one table and be filed under
+       * another, and it forces dine-in: a code on table 4 is not a delivery.
+       */
       const row = {
         id,
         items,
         total: round2(data.total),
         payment: data.payment || null,
-        type: orderType,
-        table_id: tableId,
+        type: qr.table ? 'dine-in' : orderType,
+        table_id: qr.table ? String(qr.table.id) : tableId,
+        source: qr.table ? 'qr' : null,
         customer: data.name || data.customer || null,
         status: data.status || "new",
         email: data.email || "",
@@ -689,6 +752,33 @@ async function handleOrders(pathname, method, url, request, env, auth) {
       // human-readable items string; it is preferred because it carries the
       // menu id, the unit price and the modifiers. Falling back to items keeps
       // tracking working for any client that only posts the summary.
+      /**
+       * The first scan seats the table.
+       *
+       * The alternative — refusing until a waiter has seated it — is right for
+       * a room where staff walk guests to their table, and wrong for one where
+       * people sit themselves down: the guest's first experience of the new
+       * system would be an error. Seating on scan also makes the floor plan
+       * more accurate rather than less, since it records the moment somebody
+       * actually sat down.
+       *
+       * The conditional UPDATE is the same atomic claim the POS uses, so two
+       * guests scanning at once cannot both seat the table, and a table already
+       * occupied is simply left alone — a second round from the same table must
+       * not reset who is sitting there.
+       */
+      if (qr.table) {
+        try {
+          await d1Run(
+            env,
+            "UPDATE tables SET status = 'occupied', seated_at = ? WHERE id = ? AND status <> 'occupied'",
+            [nowIso, String(qr.table.id)]
+          );
+        } catch {
+          // A table that will not seat must never cost the guest their order.
+        }
+      }
+
       const tracking = await insertOrderItems(
         env,
         id,
