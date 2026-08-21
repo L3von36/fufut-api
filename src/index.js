@@ -36,6 +36,7 @@ import { handleMigration } from './handlers/migration.js';
 import { handleResources } from './handlers/resources.js';
 import { handleTables, releaseOverstayedTables } from './handlers/tables.js';
 import { handleStaff } from './handlers/staff.js';
+import { handleCustomers } from './handlers/customers.js';
 import { handleSSE } from './handlers/sse.js';
 import { handleSync } from './handlers/sync.js';
 import { venueStatus } from './lib/venue.js';
@@ -137,6 +138,10 @@ async function route(pathname, method, url, request, env, ctx, auth) {
   }
   if (pathname.startsWith('/api/reviews')) {
     const r = await handleReviews(pathname, method, request, env);
+    if (r !== null) return r;
+  }
+  if (pathname.startsWith('/api/customers')) {
+    const r = await handleCustomers(pathname, method, url, request, env, auth);
     if (r !== null) return r;
   }
 

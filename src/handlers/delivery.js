@@ -304,7 +304,40 @@ export async function handleDelivery(pathname, method, url, request, env, auth) 
   const settleMatch = sub.match(/^\/([^/]+)\/settle$/);
   if (m === 'POST' && settleMatch) return settle(request, env, auth, settleMatch[1]);
 
-  // Anything else — plain PUT edits to address, phone, eta and notes — falls
-  // through to the generic resource handler, which already does that correctly.
+  // POST /api/delivery/batch-assign
+  if (m === 'POST' && sub === '/batch-assign') {
+    const data = await readBody(request);
+    if (!data || !Array.isArray(data.deliveryIds) || !data.driverName) {
+      return json({ ok: false, error: 'deliveryIds array and driverName required' }, 400);
+    }
+    const nowIso = new Date().toISOString();
+    for (const id of data.deliveryIds) {
+      await d1Run(env, `
+        UPDATE delivery
+           SET driver = ?, driver_id = ?, status = 'assigned', assigned_at = ?, updated_at = ?
+         WHERE id = ? AND status IN ('new', 'confirmed', 'preparing', 'ready')
+      `, [data.driverName, data.driverId || null, nowIso, nowIso, id]);
+    }
+    await writeAudit(env, auth, { action: 'batch-assign', entity: 'delivery', after: { count: data.deliveryIds.length, driver: data.driverName } });
+    return json({ ok: true, assignedCount: data.deliveryIds.length, driver: data.driverName });
+  }
+
+  // POST /api/delivery/:id/proof
+  const proofMatch = sub.match(/^\/([^/]+)\/proof$/);
+  if (m === 'POST' && proofMatch) {
+    const id = proofMatch[1];
+    const data = await readBody(request);
+    if (!data) return json({ ok: false, error: 'Invalid JSON body' }, 400);
+    const nowIso = new Date().toISOString();
+    const notes = data.signatureNote ? `Proof: ${data.signatureNote}` : null;
+    await d1Run(env, `
+      UPDATE delivery
+         SET notes = COALESCE(notes, '') || CASE WHEN notes IS NOT NULL THEN ' | ' ELSE '' END || ?,
+             updated_at = ?
+       WHERE id = ?
+    `, [notes || 'Proof uploaded', nowIso, id]);
+    return json({ ok: true, id, proofRecorded: true });
+  }
+
   return null;
 }

@@ -858,5 +858,54 @@ export async function handleHR(pathname, method, url, request, env, auth) {
     }
   }
 
+  if (pathname.startsWith('/api/hr/schedule')) {
+    const sub = pathname.replace(/^\/api\/hr\/schedule/, '');
+    if (m === 'GET' && (sub === '' || sub === '/')) {
+      const from = url.searchParams.get('from') || today();
+      const to = url.searchParams.get('to') || today();
+      const { results: shifts } = await d1Query(env, `
+        SELECT s.*, st.firstName, st.lastName, st.role
+          FROM shifts s JOIN staff st ON st.id = s.staff_id
+         WHERE date(s.start_time) >= ? AND date(s.start_time) <= ?
+         ORDER BY s.start_time ASC
+      `, [from, to]).catch(() => ({ results: [] }));
+
+      const { results: leaves } = await d1Query(env, `
+        SELECT * FROM leave_requests WHERE status = 'approved' AND start_date <= ? AND end_date >= ?
+      `, [to, from]).catch(() => ({ results: [] }));
+
+      return json({ ok: true, schedule: shifts || [], conflicts: leaves || [] });
+    }
+
+    if (m === 'POST' && (sub === '' || sub === '/')) {
+      if (!isManager((auth && (auth.sessionRole || auth.role)) || '')) {
+        return json({ ok: false, error: 'Only a manager can assign shifts' }, 403);
+      }
+      const data = await readBody(request);
+      if (!data || !data.staffId || !data.startTime || !data.endTime) {
+        return json({ ok: false, error: 'staffId, startTime, and endTime required' }, 400);
+      }
+      const id = `SHF-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+      const nowIso = new Date().toISOString();
+      await d1Run(env, `
+        INSERT INTO shifts (id, staff_id, role, start_time, end_time, status, notes, created_at)
+        VALUES (?, ?, ?, ?, ?, 'scheduled', ?, ?)
+      `, [id, data.staffId, data.role || 'staff', data.startTime, data.endTime, data.notes || null, nowIso]);
+
+      await writeAudit(env, auth, { action: 'create', entity: 'shifts', entityId: id, after: { staffId: data.staffId, startTime: data.startTime } });
+      return json({ ok: true, id, staffId: data.staffId, startTime: data.startTime, endTime: data.endTime });
+    }
+
+    const one = sub.match(/^\/([^/]+)$/);
+    if (m === 'DELETE' && one) {
+      if (!isManager((auth && (auth.sessionRole || auth.role)) || '')) {
+        return json({ ok: false, error: 'Only a manager can delete shifts' }, 403);
+      }
+      await d1Run(env, 'DELETE FROM shifts WHERE id = ?', [one[1]]);
+      await writeAudit(env, auth, { action: 'delete', entity: 'shifts', entityId: one[1] });
+      return json({ ok: true, id: one[1] });
+    }
+  }
+
   return null;
 }

@@ -997,6 +997,101 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     });
   }
 
+  // POST /api/orders/:id/split — split an order by seat count or item buckets
+  if (m === "POST" && /^\/[^/]+\/split$/.test(sub)) {
+    const orderId = sub.split("/")[1];
+    const data = await readBody(request);
+    if (!data) return json({ ok: false, error: "Invalid JSON body" }, 400);
+
+    const { results } = await d1Query(env, "SELECT * FROM orders WHERE id = ?", [orderId]);
+    const order = results && results[0];
+    if (!order) return json({ ok: false, error: "Order not found" }, 404);
+
+    const nowIso = new Date().toISOString();
+    const seatCount = Math.max(2, parseInt(data.seatCount || 2, 10));
+    const total = parseFloat(order.total || 0);
+    const splitTotal = round2(total / seatCount);
+
+    const createdSplits = [];
+    for (let i = 0; i < seatCount; i++) {
+      const splitId = `ORD-SPLIT-${Date.now().toString(36)}-${i+1}`;
+      const splitRow = {
+        id: splitId,
+        type: order.type || 'dine-in',
+        table_id: order.table_id || order.table_number || null,
+        table_number: order.table_number || null,
+        status: 'new',
+        payment_status: 'unpaid',
+        items: `Split ${i+1}/${seatCount} of Order #${orderId.slice(-4)}`,
+        subtotal: splitTotal,
+        total: splitTotal,
+        created: nowIso,
+        created_at: nowIso,
+        notes: `Split bill ${i+1} of ${seatCount} from #${orderId.slice(-4)}`
+      };
+      await d1Run(env, `INSERT INTO orders (id, type, table_id, table_number, status, payment_status, items, subtotal, total, created, created_at, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+        splitRow.id, splitRow.type, splitRow.table_id, splitRow.table_number, splitRow.status, splitRow.payment_status, splitRow.items, splitRow.subtotal, splitRow.total, splitRow.created, splitRow.created_at, splitRow.notes
+      ]);
+      createdSplits.push(splitRow);
+    }
+
+    // Mark original order as merged/split (fulfilled/cancelled)
+    await d1Run(env, "UPDATE orders SET status = 'fulfilled', payment_status = 'split', notes = COALESCE(notes, '') || ' [Split into sub-orders]', updated_at = ? WHERE id = ?", [nowIso, orderId]);
+    await writeAudit(env, auth, { action: "split", entity: "orders", entityId: orderId, after: { splitsCount: seatCount, createdSplits: createdSplits.map(s => s.id) } });
+
+    return json({ ok: true, parentOrderId: orderId, splits: createdSplits });
+  }
+
+  // POST /api/orders/merge — merge two open checks/orders into one
+  if (m === "POST" && sub === "/merge") {
+    const data = await readBody(request);
+    if (!data || !data.sourceOrderId || !data.targetOrderId) {
+      return json({ ok: false, error: "sourceOrderId and targetOrderId required" }, 400);
+    }
+
+    const { results: srcRows } = await d1Query(env, "SELECT * FROM orders WHERE id = ?", [data.sourceOrderId]);
+    const { results: tgtRows } = await d1Query(env, "SELECT * FROM orders WHERE id = ?", [data.targetOrderId]);
+    const src = srcRows && srcRows[0];
+    const tgt = tgtRows && tgtRows[0];
+
+    if (!src || !tgt) return json({ ok: false, error: "One or both orders not found" }, 404);
+
+    const nowIso = new Date().toISOString();
+    // Move all items from source order to target order
+    await d1Run(env, "UPDATE order_items SET order_id = ? WHERE order_id = ?", [tgt.id, src.id]);
+
+    // Recalculate target order total
+    const { results: allItems } = await d1Query(env, "SELECT unit_price, qty FROM order_items WHERE order_id = ? AND status <> 'cancelled'", [tgt.id]);
+    const newSubtotal = round2((allItems || []).reduce((s, l) => s + (Number(l.unit_price) || 0) * (Number(l.qty) || 0), 0) || (parseFloat(tgt.total || 0) + parseFloat(src.total || 0)));
+    const newTotal = newSubtotal;
+
+    await d1Run(env, "UPDATE orders SET subtotal = ?, total = ?, updated_at = ? WHERE id = ?", [newSubtotal, newTotal, nowIso, tgt.id]);
+    await d1Run(env, "UPDATE orders SET status = 'cancelled', void_reason = 'Merged into order " + tgt.id + "', updated_at = ? WHERE id = ?", [nowIso, src.id]);
+
+    await writeAudit(env, auth, { action: "merge", entity: "orders", entityId: tgt.id, after: { mergedFrom: src.id, newTotal } });
+    return json({ ok: true, targetOrderId: tgt.id, mergedFrom: src.id, newTotal });
+  }
+
+  // PATCH /api/orders/:id/move-item — move a line item from one order to another
+  if (m === "PATCH" && /^\/[^/]+\/move-item$/.test(sub)) {
+    const orderId = sub.split("/")[1];
+    const data = await readBody(request);
+    if (!data || !data.itemId || !data.targetOrderId) {
+      return json({ ok: false, error: "itemId and targetOrderId required" }, 400);
+    }
+    const nowIso = new Date().toISOString();
+    await d1Run(env, "UPDATE order_items SET order_id = ? WHERE id = ? AND order_id = ?", [data.targetOrderId, data.itemId, orderId]);
+
+    // Recalculate totals for both orders
+    for (const oid of [orderId, data.targetOrderId]) {
+      const { results: lines } = await d1Query(env, "SELECT unit_price, qty FROM order_items WHERE order_id = ? AND status <> 'cancelled'", [oid]);
+      const sub = round2((lines || []).reduce((s, l) => s + (Number(l.unit_price) || 0) * (Number(l.qty) || 0), 0));
+      await d1Run(env, "UPDATE orders SET subtotal = ?, total = ?, updated_at = ? WHERE id = ?", [sub, sub, nowIso, oid]);
+    }
+
+    return json({ ok: true, itemId: data.itemId, fromOrder: orderId, toOrder: data.targetOrderId });
+  }
+
   // GET /api/orders/:id — one order with its lines attached.
   //
   // This is the single-order endpoint the open-tab flow needs: a waiter who has

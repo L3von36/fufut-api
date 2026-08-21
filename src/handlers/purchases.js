@@ -487,6 +487,68 @@ export async function handlePurchases(pathname, method, url, request, env, auth)
     if (m === 'POST' && sub === '') return createPurchase(request, env, auth);
     if (m === 'POST' && sub === '/analyse') return analyse(request, env);
 
+    // GET /api/purchases/reorder-suggestions — items below min_level
+    if (m === 'GET' && sub === '/reorder-suggestions') {
+      const { results } = await d1Query(env, `
+        SELECT id, name, unit, stock, min_level, reorder_point, cost_per_unit, preferred_supplier_id
+          FROM inventory
+         WHERE (active IS NULL OR active = 1)
+           AND stock <= COALESCE(reorder_point, min_level, 0)
+         ORDER BY (stock / CASE WHEN min_level > 0 THEN min_level ELSE 1 END) ASC
+      `).catch(() => ({ results: [] }));
+
+      const suggestions = (results || []).map(i => {
+        const minL = num(i.min_level, 10);
+        const stock = num(i.stock, 0);
+        const suggestedQty = Math.max(minL * 2 - stock, minL);
+        const cost = num(i.cost_per_unit, 0);
+        return {
+          inventoryId: i.id,
+          name: i.name,
+          unit: i.unit,
+          currentStock: stock,
+          minLevel: minL,
+          suggestedQty,
+          estimatedCost: round2(suggestedQty * cost),
+          preferredSupplierId: i.preferred_supplier_id || null
+        };
+      });
+
+      return json({ ok: true, suggestions });
+    }
+
+    // POST /api/purchases/generate-po — create a draft purchase order
+    if (m === 'POST' && sub === '/generate-po') {
+      const data = await readBody(request);
+      if (!data || !data.supplierId || !Array.isArray(data.items) || !data.items.length) {
+        return json({ ok: false, error: 'supplierId and non-empty items array required' }, 400);
+      }
+      const nowIso = new Date().toISOString();
+      const poId = `PO-${Date.now().toString(36)}`;
+      let totalCost = 0;
+
+      for (const line of data.items) {
+        const lineId = `POL-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+        const qty = Math.max(0.1, num(line.qty));
+        const unitCost = num(line.unitCost);
+        const lineTotal = round2(qty * unitCost);
+        totalCost += lineTotal;
+
+        await d1Run(env, `
+          INSERT INTO purchase_order_lines (id, po_id, inventory_id, qty_ordered, unit_cost, line_total)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `, [lineId, poId, line.inventoryId, qty, unitCost, lineTotal]).catch(() => {});
+      }
+
+      await d1Run(env, `
+        INSERT INTO purchase_orders (id, supplier_id, status, total_cost, notes, created_at, created_by)
+        VALUES (?, ?, 'draft', ?, ?, ?, ?)
+      `, [poId, data.supplierId, round2(totalCost), data.notes || 'Auto-generated PO', nowIso, actorName(auth)]).catch(() => {});
+
+      await writeAudit(env, auth, { action: 'create', entity: 'purchase_orders', entityId: poId, after: { supplierId: data.supplierId, totalCost } });
+      return json({ ok: true, poId, status: 'draft', totalCost: round2(totalCost) });
+    }
+
     const pay = sub.match(/^\/([^/]+)\/pay$/);
     if (m === 'POST' && pay) return payPurchase(request, env, auth, pay[1]);
 

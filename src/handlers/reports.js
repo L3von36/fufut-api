@@ -437,5 +437,71 @@ export async function handleReports(pathname, method, url, request, env, auth) {
   const ing = sub.match(/^\/ingredient\/([^/]+)$/);
   if (ing) return ingredientAnswers(env, url, ing[1]);
 
+  // GET /api/reports/staff-performance
+  if (sub === '/staff-performance') {
+    const { from, to } = resolveWindow(url);
+    const w = [from, to];
+    const { results } = await d1Query(env, `
+      SELECT COALESCE(created_by, 'Unassigned') AS staff_name,
+             COUNT(*) AS order_count,
+             SUM(COALESCE(total,0) - COALESCE(tip,0)) AS total_sales,
+             SUM(COALESCE(tip,0)) AS total_tips
+        FROM orders o WHERE ${REAL_ORDERS} AND ${DATE_CLAUSE}
+       GROUP BY created_by ORDER BY total_sales DESC
+    `, w).catch(() => ({ results: [] }));
+
+    const staff = (results || []).map(r => ({
+      name: r.staff_name,
+      ordersCount: num(r.order_count),
+      totalSales: round2(r.total_sales),
+      totalTips: round2(r.total_tips),
+      averageOrder: num(r.order_count) ? round2(r.total_sales / r.order_count) : 0
+    }));
+
+    return json({ ok: true, period: { from, to }, staff });
+  }
+
+  // GET /api/reports/top-items
+  if (sub === '/top-items') {
+    const { from, to } = resolveWindow(url);
+    const limit = parseInt(url.searchParams.get('limit') || '10', 10);
+    const w = [from, to];
+    const { results } = await d1Query(env, `
+      SELECT oi.name, oi.category, SUM(oi.qty) AS quantity, SUM(oi.qty * oi.unit_price) AS total_revenue
+        FROM order_items oi JOIN orders o ON o.id = oi.order_id
+       WHERE ${REAL_ORDERS} AND oi.status <> 'cancelled' AND ${DATE_CLAUSE}
+       GROUP BY oi.name, oi.category
+       ORDER BY total_revenue DESC LIMIT ?
+    `, [...w, limit]).catch(() => ({ results: [] }));
+
+    return json({ ok: true, period: { from, to }, items: (results || []).map(r => ({ name: r.name, category: r.category, quantity: num(r.quantity), revenue: round2(r.total_revenue) })) });
+  }
+
+  // GET /api/reports/hourly-heatmap
+  if (sub === '/hourly-heatmap') {
+    const { from, to } = resolveWindow(url);
+    const w = [from, to];
+    const { results } = await d1Query(env, `
+      SELECT strftime('%H', created) AS hour, COUNT(*) AS orders_count, ${NET_SALES} AS revenue
+        FROM orders o WHERE ${REAL_ORDERS} AND ${DATE_CLAUSE}
+       GROUP BY hour ORDER BY hour ASC
+    `, w).catch(() => ({ results: [] }));
+
+    const hoursMap = {};
+    for (let h = 0; h < 24; h++) {
+      const pad = h.toString().padStart(2, '0');
+      hoursMap[pad] = { hour: pad, orders: 0, revenue: 0 };
+    }
+    for (const r of (results || [])) {
+      if (r.hour && hoursMap[r.hour]) {
+        hoursMap[r.hour].orders = num(r.orders_count);
+        hoursMap[r.hour].revenue = round2(r.revenue);
+      }
+    }
+
+    return json({ ok: true, period: { from, to }, hours: Object.values(hoursMap) });
+  }
+
   return null;
 }
+
