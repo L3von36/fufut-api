@@ -21,7 +21,14 @@ import { canonicalRole, ROLES } from '../auth.js';
  */
 
 /** Columns a client may set. Deliberately excludes password_hash and the flags. */
-const WRITABLE = ['firstName', 'lastName', 'email', 'phone', 'role', 'status'];
+const WRITABLE = [
+  'firstName', 'lastName', 'email', 'phone', 'role', 'status',
+  // HR / payroll fields — added by migration 007
+  'base_salary', 'salary_period', 'employment_type',
+  'hire_date', 'end_date',
+  'bank_account', 'tin', 'pension_id',
+  'emergency_contact', 'emergency_phone', 'address', 'notes',
+];
 
 function pick(data) {
   const out = {};
