@@ -83,6 +83,19 @@ async function route(pathname, method, url, request, env, ctx, auth) {
   if (pathname === '/api/upload' && upper === 'POST') return handleUpload(request, env);
   if (pathname.startsWith('/api/images/') && upper === 'GET') return serveImage(env, pathname);
 
+  if (pathname === '/api/payments/proxy' && upper === 'GET') {
+    const targetUrl = url.searchParams.get('url');
+    if (!targetUrl) return json({ ok: false, error: 'URL required' }, 400);
+    try {
+      const res = await fetch(targetUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' } });
+      const contentType = res.headers.get('Content-Type') || 'application/octet-stream';
+      const body = await res.arrayBuffer();
+      return new Response(body, { headers: { 'Content-Type': contentType } });
+    } catch (e) {
+      return json({ ok: false, error: String(e) }, 500);
+    }
+  }
+
   const migration = await handleMigration(request, env);
   if (migration !== null) return migration;
 
