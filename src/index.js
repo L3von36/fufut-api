@@ -36,6 +36,7 @@ import { handleMigration } from './handlers/migration.js';
 import { handleResources } from './handlers/resources.js';
 import { handleTables, releaseOverstayedTables } from './handlers/tables.js';
 import { handleStaff } from './handlers/staff.js';
+import { handlePublicStats } from './handlers/stats.js';
 import { handleCustomers } from './handlers/customers.js';
 import { handleSSE } from './handlers/sse.js';
 import { handleSync } from './handlers/sync.js';
@@ -101,6 +102,10 @@ async function route(pathname, method, url, request, env, ctx, auth) {
 
   const content = await handleContent(pathname, method, url, request, env);
   if (content !== null) return content;
+
+  if (pathname === '/api/stats' && upper === 'GET') {
+    return handlePublicStats(env);
+  }
 
   if (pathname === '/api/events/tables' || pathname === '/api/events/kitchen') {
     return handleSSE(request, env, pathname.endsWith('tables') ? 'tables' : 'kitchen');
