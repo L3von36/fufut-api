@@ -2,6 +2,7 @@ import { d1Query, d1Run, d1Batch, json, readBody } from '../lib/db.js';
 import { writeAudit } from '../lib/audit.js';
 import { actorName, isManager } from '../auth.js';
 import { refreshPaymentStatus } from './payments.js';
+import { addToOpenDrawerCash } from '../lib/drawer.js';
 import { syncDeliveryToOrderStatus } from './delivery.js';
 import { consumeForOrder, reverseOrderConsumption } from '../lib/ledger.js';
 import { blocksSeating, ACTIVE_STATUSES } from '../lib/booking.js';
@@ -354,6 +355,15 @@ async function recordSubmittedPayments(env, auth, orderId, data) {
     if (!statements.length) return { inserted: 0, warning: null };
     await d1Batch(env, statements);
     await refreshPaymentStatus(env, orderId);
+    // Cash from this settlement belongs in the open till's tally, so the
+    // Z-count's "expected" figure includes it. Transfer legs never enter the
+    // drawer and are skipped. Guarded by the idempotency check above: a retried
+    // PUT returns before reaching here, so the same cash cannot count twice.
+    const cashPortion = statements.reduce(
+      (sum, s) => (String(s.params[2]).toLowerCase() === 'cash' ? sum + Number(s.params[3]) : sum),
+      0
+    );
+    if (cashPortion > 0) await addToOpenDrawerCash(env, cashPortion);
     return { inserted: statements.length, warning: null };
   } catch (e) {
     return {

@@ -27,6 +27,7 @@
 import { d1Query, d1Run, json, readBody } from '../lib/db.js';
 import { writeAudit } from '../lib/audit.js';
 import { actorName, isManager } from '../auth.js';
+import { addToOpenDrawerCash } from '../lib/drawer.js';
 
 /** Methods the business accepts. Anything else is refused rather than stored. */
 const METHODS = new Set(['cash', 'telebirr', 'cbe', 'bank', 'card', 'mobile', 'other']);
@@ -198,6 +199,10 @@ async function recordPayment(request, env, auth) {
     after: { order_id: orderId, method, amount, reference: data.reference || null, status },
   });
 
+  // A cash payment made directly against an order (a driver collecting on the
+  // doorstep, a cashier taking a part-payment) lands in the same open till.
+  if (method === 'cash' && amount > 0) await addToOpenDrawerCash(env, amount);
+
   return json({
     ok: true,
     id,
@@ -309,6 +314,13 @@ async function refundPayment(request, env, auth, paymentId) {
   );
 
   await d1Run(env, "UPDATE payments SET status = 'refunded' WHERE id = ?", [paymentId]);
+
+  // Cash handed back leaves the till it went into, so an open drawer's tally
+  // comes down by the same figure. A refund after the drawer closed leaves no
+  // drawer to adjust — the Z-report stands as counted.
+  if (String(original.method || '').toLowerCase() === 'cash') {
+    await addToOpenDrawerCash(env, -requested);
+  }
 
   const fin = await refreshPaymentStatus(env, original.order_id);
   await writeAudit(env, auth, {
