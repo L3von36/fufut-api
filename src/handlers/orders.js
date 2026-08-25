@@ -932,8 +932,19 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     if (order.voided_at) {
       return json({ ok: false, error: "Order has been voided and cannot take new items" }, 409);
     }
-    if (["completed", "cancelled", "fulfilled"].includes(String(order.status || "").toLowerCase())) {
+    // Food served is not the check closed. 'fulfilled' (the whole-ticket
+    // Served button) and 'served' (the per-line roll-up) only say the last
+    // round reached the table — dessert and after-dinner coffee are added to
+    // a served ticket all night long. Blocking them here made the POS silently
+    // open a second ticket for the same table: two checks to settle at the
+    // till, and the first one leaks. Only cancellation, completion or actual
+    // payment close a check to new lines.
+    const orderStatus = String(order.status || "").toLowerCase();
+    if (["completed", "cancelled"].includes(orderStatus)) {
       return json({ ok: false, error: "Order is closed and cannot take new items" }, 409);
+    }
+    if (String(order.payment_status || "").toLowerCase() === "paid") {
+      return json({ ok: false, error: "Order has been paid and cannot take new items" }, 409);
     }
 
     // Continue the ticket's numbering where the last round left off. Note the
@@ -963,9 +974,14 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     // Recompute the running bill from the lines now on the order, so the total
     // always matches the sum of what the kitchen has been fired. The flat
     // summary the receipt reads is rebuilt by appending this round's lines.
+    // The same re-read carries each line's status, because appending a round
+    // has to put a served ticket back into the kitchen flow: a status of
+    // 'fulfilled' or 'served' with unfired lines on it is invisible to the
+    // board (items/active and the SSE feed both exclude terminal states), and
+    // the chef would never see the round fire.
     const { results: allLines } = await d1Query(
       env,
-      "SELECT unit_price, qty FROM order_items WHERE order_id = ? AND status <> 'cancelled'",
+      "SELECT unit_price, qty, status FROM order_items WHERE order_id = ? AND status <> 'cancelled'",
       [orderId]
     );
     const subtotal = round2(
@@ -983,11 +999,26 @@ async function handleOrders(pathname, method, url, request, env, auth) {
       ? String(order.items).trim() + (flat ? ", " + flat : "")
       : flat;
 
-    await d1Run(
-      env,
-      "UPDATE orders SET items = ?, subtotal = ?, total = ?, updated_at = ? WHERE id = ?",
-      [itemsSummary, subtotal, total, nowIso, orderId]
-    );
+    // Roll the order's own status forward from its lines — the same rule the
+    // per-line route uses — so a re-opened ticket re-enters the kitchen flow at
+    // the state its lines actually describe. Two served lines plus two new
+    // ones read as 'preparing': the board shows the ticket with the new lines
+    // tappable and the old ones struck through.
+    const rolled = deriveOrderStatus((allLines || []).map((l) => l.status));
+
+    if (rolled) {
+      await d1Run(
+        env,
+        "UPDATE orders SET items = ?, subtotal = ?, total = ?, status = ?, updated_at = ? WHERE id = ?",
+        [itemsSummary, subtotal, total, rolled, nowIso, orderId]
+      );
+    } else {
+      await d1Run(
+        env,
+        "UPDATE orders SET items = ?, subtotal = ?, total = ?, updated_at = ? WHERE id = ?",
+        [itemsSummary, subtotal, total, nowIso, orderId]
+      );
+    }
 
     await writeAudit(env, auth, {
       action: "update",
@@ -1003,6 +1034,7 @@ async function handleOrders(pathname, method, url, request, env, auth) {
       items: tracking.inserted,
       subtotal,
       total,
+      orderStatus: rolled || orderStatus,
       warning: tracking.warning || undefined,
     });
   }

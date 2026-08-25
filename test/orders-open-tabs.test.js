@@ -157,6 +157,54 @@ describe('PATCH /api/orders/:id/items (append a round)', () => {
     const res = await handleOrders(pathname, method, url, request, env, { staff_id: 'S1' });
     expect(res.status).toBe(409);
   });
+
+  // Food served is not the check closed. A ticket marked 'fulfilled' (the
+  // whole-ticket Served button) with money still owed is an open check by the
+  // API's own definition — blocking the append made the POS silently open a
+  // second ticket for the table, leaving two checks to settle at the till.
+  it('re-opens a served-but-unpaid order when a round is appended', async () => {
+    const served = {
+      ...OPEN_ORDER, status: 'fulfilled', payment_status: 'unpaid',
+      items: '1xMacchiato', total: 130,
+    };
+    const { env, boundParams } = makeEnv({
+      orderRows: [served],
+      itemRows: [
+        // What the post-insert re-read sees: the served line plus the round
+        // this request just appended.
+        { ...EXISTING_LINE, status: 'served' },
+        { id: 'OI2', order_id: 'Oopen01', line_no: 1, name: 'Tea', qty: 1, unit_price: 70, status: 'new' },
+      ],
+      maxLineNo: 0,
+    });
+    const body = {
+      items: '1xTea',
+      orderItems: [{ name: 'Tea', basePrice: 70, qty: 1 }],
+    };
+    const { pathname, method, url, request } = makeRequest('/api/orders/Oopen01/items', 'PATCH', body);
+    const res = await handleOrders(pathname, method, url, request, env, { staff_id: 'S1' });
+    expect(res.status).toBe(200);
+    const parsed = await res.json();
+    expect(parsed.ok).toBe(true);
+    // A served line plus a new one reads as 'preparing' — the ticket is back
+    // in the kitchen flow, so the new round actually fires on the board.
+    expect(parsed.orderStatus).toBe('preparing');
+
+    const update = boundParams.find((b) => /UPDATE orders SET items/.test(b.sql));
+    expect(update).toBeTruthy();
+    expect(update.params).toContain('preparing');
+  });
+
+  it('refuses to append to an order that has already been paid', async () => {
+    const paid = { ...OPEN_ORDER, payment_status: 'paid' };
+    const { env } = makeEnv({ orderRows: [paid], maxLineNo: 0 });
+    const body = { orderItems: [{ name: 'Tea', basePrice: 70 }] };
+    const { pathname, method, url, request } = makeRequest('/api/orders/Oopen01/items', 'PATCH', body);
+    const res = await handleOrders(pathname, method, url, request, env, { staff_id: 'S1' });
+    expect(res.status).toBe(409);
+    const parsed = await res.json();
+    expect(parsed.error).toMatch(/paid/i);
+  });
 });
 
 describe('settlement payment idempotency (open tab)', () => {
