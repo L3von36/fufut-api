@@ -2,7 +2,7 @@ import { d1Query, d1Run, json, readBody } from '../lib/db.js';
 import { holdsTable, blocksSeating, isNewSeating, ACTIVE_STATUSES, GRACE_MIN, SEATING_LEAD_MIN } from '../lib/booking.js';
 import { actorName } from '../auth.js';
 import { writeAudit } from '../lib/audit.js';
-import { tableOverstayed, DEFAULT_TABLE_MAX_HOURS } from '../lib/staleness.js';
+import { tableOverstayed, normaliseTableId, DEFAULT_TABLE_MAX_HOURS } from '../lib/staleness.js';
 import { generateTableKey, tableOrderUrl } from '../lib/tablekey.js';
 
 const ACTIVE_LIST = ACTIVE_STATUSES.map((s) => `'${s}'`).join(', ');
@@ -137,11 +137,23 @@ async function claimSeat(env, table, data, claimingNewSeat) {
  * because occupied is a state somebody has to leave and on a busy evening
  * nobody does.
  *
- * Two rules keep this from doing harm:
+ * Three rules keep this from doing harm:
  *
- *  - A table with money still owed on it is never released. Freeing it would
- *    take the bill off the floor plan, which is exactly how an unpaid check
- *    stops being anybody's problem — the opposite of what this is for.
+ *  - The max is four hours (venue's decision — a cafe turns in under an hour).
+ *    Past it, the table comes off the floor plan no matter what, because a
+ *    table held for days is a lie the whole room is paying for. What happens
+ *    next depends on the bill:
+ *      - nothing owed -> 'available', exactly as before;
+ *      - money owed   -> 'cleaning', so it is not instantly re-seated over an
+ *        unsettled check, and a human has to look at it. The check itself is
+ *        untouched and stays in Open Checks — the bill is never hidden, it
+ *        just stops holding the table hostage. (The first version of this
+ *        sweep skipped owed tables entirely, which is how a 300-hour-old
+ *        unpaid TEA kept one table occupied for 114 hours straight.)
+ *  - The owed match is done on normalised table references. orders.table_id
+ *    holds "T-01", "Table 1" and "1" for the same table, and a plain string
+ *    compare misses two of the three — which releases a table that still has
+ *    a bill, or holds one that has none.
  *  - A table occupied with no seated_at is not aged, because there is nothing
  *    to age it from. It gets stamped instead, so it starts counting from when
  *    it was noticed rather than staying stuck forever. Production has one.
@@ -149,14 +161,30 @@ async function claimSeat(env, table, data, claimingNewSeat) {
 async function releaseOverstayedTables(env, maxHours = DEFAULT_TABLE_MAX_HOURS, nowMs = Date.now()) {
   const nowIso = new Date(nowMs).toISOString();
   const released = [];
+  const releasedOwing = [];
   const stamped = [];
 
   const { results: tables } = await d1Query(
     env,
     "SELECT id, number, status, seated_at, guests, server FROM tables WHERE LOWER(status) = 'occupied'"
   );
+  if (!(tables || []).length) return { released, releasedOwing, stamped };
 
-  for (const table of tables || []) {
+  // One read for every open bill's table reference, normalised in JS: D1 has
+  // no cheap way to fold "T-01" and "1" together in SQL, and running the
+  // lookup per table meant the spellings above never matched.
+  const { results: owingRows } = await d1Query(
+    env,
+    `SELECT table_id FROM orders
+      WHERE payment_status IN ('unpaid', 'partial')
+        AND COALESCE(status, '') <> 'cancelled'
+        AND table_id IS NOT NULL`
+  );
+  const owedTables = new Set(
+    (owingRows || []).map((r) => normaliseTableId(r.table_id)).filter(Boolean)
+  );
+
+  for (const table of tables) {
     if (!String(table.seated_at || '').trim()) {
       await d1Run(env, 'UPDATE tables SET seated_at = ? WHERE id = ?', [nowIso, table.id]);
       stamped.push(table.number);
@@ -164,34 +192,29 @@ async function releaseOverstayedTables(env, maxHours = DEFAULT_TABLE_MAX_HOURS, 
     }
     if (!tableOverstayed(table, nowMs, maxHours)) continue;
 
-    const { results: owing } = await d1Query(
-      env,
-      `SELECT COUNT(*) AS n FROM orders
-        WHERE TRIM(table_id) = TRIM(?)
-          AND payment_status IN ('unpaid', 'partial')
-          AND COALESCE(status, '') <> 'cancelled'`,
-      [String(table.number)]
-    );
-    if ((owing && owing[0] && owing[0].n) > 0) continue;
+    const owes = owedTables.has(normaliseTableId(table.number) || String(table.number));
+    const nextStatus = owes ? 'cleaning' : 'available';
 
     await d1Run(
       env,
-      "UPDATE tables SET status = 'available', seated_at = '', guests = 0, server = '' WHERE id = ?",
-      [table.id]
+      "UPDATE tables SET status = ?, seated_at = '', guests = 0, server = '' WHERE id = ?",
+      [nextStatus, table.id]
     );
-    released.push(table.number);
+    (owes ? releasedOwing : released).push(table.number);
 
     await writeAudit(env, null, {
       action: 'update',
       entity: 'tables',
       entityId: table.id,
       before: { status: 'occupied', seated_at: table.seated_at },
-      after: { status: 'available', released_by_sweep: true },
-      reason: `Occupied for more than ${maxHours}h with nothing owed — released automatically`,
+      after: { status: nextStatus, released_by_sweep: true },
+      reason: owes
+        ? `Occupied for more than ${maxHours}h with a check still open — released to cleaning; the check remains in Open Checks`
+        : `Occupied for more than ${maxHours}h with nothing owed — released automatically`,
     });
   }
 
-  return { released, stamped };
+  return { released, releasedOwing, stamped };
 }
 
 /**
