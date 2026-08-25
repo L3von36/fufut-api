@@ -204,7 +204,16 @@ function categorizedToFlat(cat) {
         available: item.available !== false,
         modifiers: item.modifiers || [],
         tags: item.tags || [],
-        ...item.created ? { created: item.created } : {}
+        ...item.created ? { created: item.created } : {},
+        // Who 86'd a dish (or put it back) and when is written to the KV blob
+        // by the availability endpoint. Leaving it out of the flat list made
+        // the attribution vanish on the next GET: the POS showed "by Chef ·
+        // 10:08" right after the tap, then lost it on reload, even though the
+        // record was still in the blob and in /api/menus.
+        ...(item.availabilityChangedBy ? {
+          availabilityChangedBy: item.availabilityChangedBy,
+          availabilityChangedAt: item.availabilityChangedAt || null,
+        } : {}),
       });
     }
   }

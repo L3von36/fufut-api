@@ -123,6 +123,46 @@ describe('menu item ids', () => {
   });
 });
 
+describe('availability attribution survives the flat list', () => {
+  // The availability endpoint records who 86'd a dish (or put it back) on the
+  // KV blob and returns it in the PUT response, so the POS can show it right
+  // after the tap. categorizedToFlat used to drop the fields, and the
+  // attribution vanished on the next GET — the record was in the blob, but the
+  // only screen that reads it never saw it again.
+  const blobWithTrail = () => ({
+    restaurant: 'FU FUT COFFEE',
+    categories: [
+      {
+        name: 'HOT DRINKS',
+        items: [
+          {
+            id: 'MI1', name: 'TEA', price: 70,
+            available: false,
+            availabilityChangedBy: 'Selam Wondimu',
+            availabilityChangedAt: '2026-08-25T10:08:07.000Z',
+          },
+          { id: 'MI2', name: 'Espresso', price: 150 },
+        ],
+      },
+    ],
+  });
+
+  it('keeps who changed availability and when', () => {
+    const flat = categorizedToFlat(blobWithTrail());
+    const tea = flat.find((i) => i.name === 'TEA');
+    expect(tea.available).toBe(false);
+    expect(tea.availabilityChangedBy).toBe('Selam Wondimu');
+    expect(tea.availabilityChangedAt).toBe('2026-08-25T10:08:07.000Z');
+  });
+
+  it('adds no attribution fields to an item nobody has touched', () => {
+    const flat = categorizedToFlat(blobWithTrail());
+    const espresso = flat.find((i) => i.name === 'Espresso');
+    expect(espresso.availabilityChangedBy).toBeUndefined();
+    expect(espresso.availabilityChangedAt).toBeUndefined();
+  });
+});
+
 describe('backfilling ids onto pre-existing menu data', () => {
   // D1 already holds an id for every item; KV holds none. Adopting D1's ids
   // keeps the two stores agreeing, so the next /api/menus/save is a no-op
