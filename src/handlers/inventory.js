@@ -514,7 +514,10 @@ async function recordWaste(request, env, auth) {
   if (!data) return json({ ok: false, error: 'Invalid JSON body' }, 400);
 
   const invId = String(data.inventoryId || data.inventory_id || data.item_id || '');
-  const qty = Math.abs(num(data.qty));
+  // The POS form has always sent `quantity`; this route read `qty`, so a
+  // tracked waste entry failed with "quantity must be greater than zero" and
+  // the chef could not log spoilage against stock at all.
+  const qty = Math.abs(num(data.qty !== undefined ? data.qty : data.quantity));
   if (!invId) return json({ ok: false, error: 'inventoryId required' }, 400);
   if (qty <= 0) return json({ ok: false, error: 'Waste quantity must be greater than zero' }, 400);
 
@@ -573,14 +576,77 @@ async function recordWaste(request, env, auth) {
   });
 }
 
+/**
+ * Waste on something the stock system does not track — a cracked egg from a
+ * tray bought at the market, a jug that turned. These used to fall through to
+ * the generic resource handler, which quietly dropped the item name (the table
+ * had no column for it), the quantity (the form says `quantity`, the column
+ * says `qty`) and the cost: the log filled up with rows that had a reason and
+ * a date and nothing else, and the screen showed a blank item at ETB 0.
+ */
+async function recordFreeTextWaste(data, env, auth) {
+  const name = String(data.name || '').trim();
+  if (!name) return json({ ok: false, error: 'A waste entry needs an item name' }, 400);
+  const qty = Math.abs(num(data.quantity !== undefined ? data.quantity : data.qty));
+  if (qty <= 0) return json({ ok: false, error: 'Waste quantity must be greater than zero' }, 400);
+  const reason = String(data.reason || '').trim();
+  if (!reason) {
+    // Same rule as tracked waste: a log entry that cannot say why it happened
+    // cannot be acted on.
+    return json({ ok: false, error: 'A reason is required to record waste' }, 400);
+  }
+  const cost = Math.round(Math.abs(num(data.cost !== undefined ? data.cost : data.est_cost)) * 100) / 100;
+  const category = String(data.category || '').trim() || null;
+
+  const nowIso = new Date().toISOString();
+  const id = 'W' + crypto.randomUUID().slice(0, 8);
+  await d1Run(
+    env,
+    `INSERT INTO waste (id, item_id, name, category, qty, reason, est_cost, logged_by, date, created)
+     VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, name, category, qty, reason, cost, auth ? actorName(auth) : null,
+     data.date || nowIso.slice(0, 10), nowIso]
+  );
+  await writeAudit(env, auth, {
+    action: 'create', entity: 'waste', entityId: id,
+    after: { name, category, qty, reason, est_cost: cost },
+    reason,
+  });
+  return json({ ok: true, id, item: name, qty, cost, untracked: true });
+}
+
 export async function handleWaste(pathname, method, request, env, auth) {
-  if (pathname !== '/api/waste' || method.toUpperCase() !== 'POST') return null;
-  const body = await readBody(request.clone());
-  // Legacy rows name an item as free text with no inventory link. Those still
-  // go through the generic handler so the existing screen keeps working; only a
-  // waste record that names a real ingredient can move stock.
-  if (!body || !(body.inventoryId || body.inventory_id)) return null;
-  return recordWaste(new Request(request.url, { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' } }), env, auth);
+  if (pathname !== '/api/waste') return null;
+  const m = method.toUpperCase();
+
+  if (m === 'GET') {
+    // The list both POS screens and the backoffice read. Raw columns are kept
+    // alongside the aliases each screen reads (`item`/`name`, `quantity`,
+    // `cost`), because three consumers grew three different names for the same
+    // fields; a tracked entry resolves its item name from the inventory join,
+    // a free-text one from the name it was logged with.
+    const { results } = await d1Query(
+      env,
+      `SELECT w.*, w.qty AS quantity, w.est_cost AS cost,
+              COALESCE(i.name, w.name) AS item
+         FROM waste w LEFT JOIN inventory i ON w.inventory_id = i.id
+        ORDER BY w.created DESC`
+    );
+    return json(results || []);
+  }
+
+  if (m === 'POST') {
+    const body = await readBody(request.clone());
+    if (!body) return null;
+    // Only a waste record that names a real ingredient can move stock; a
+    // free-text entry is recorded as itself, without touching inventory.
+    if (body.inventoryId || body.inventory_id) {
+      return recordWaste(new Request(request.url, { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' } }), env, auth);
+    }
+    return recordFreeTextWaste(body, env, auth);
+  }
+
+  return null;
 }
 
 export async function handleInventory(pathname, method, url, request, env, auth) {
