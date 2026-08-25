@@ -21,6 +21,15 @@ describe('status helpers', () => {
     expect(stampColumnFor('nonsense')).toBeNull();
   });
 
+  // 'fulfilled' is the order-level word for a completed order — the status the
+  // kitchen's whole-ticket "Served" button sends. It lands on the same column
+  // 'served' does, because a completed order with orders.served_at NULL is a
+  // row a future report will read as "never reached the guest".
+  it('stamps order-level completion words onto served_at', () => {
+    expect(stampColumnFor('fulfilled')).toBe('served_at');
+    expect(stampColumnFor('completed')).toBe('served_at');
+  });
+
   it('validates and orders states', () => {
     expect(ITEM_FLOW).toEqual(['new', 'preparing', 'ready', 'served']);
     expect(isValidItemStatus('READY')).toBe(true);

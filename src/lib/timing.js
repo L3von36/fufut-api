@@ -12,11 +12,22 @@
 /** The order a line moves through. Index position defines "further along". */
 export const ITEM_FLOW = ['new', 'preparing', 'ready', 'served'];
 
-/** Which column records the moment a line entered a given state. */
+/**
+ * Which column records the moment a line entered a given state.
+ *
+ * 'fulfilled' and 'completed' are order-level words — a line is 'served' — but
+ * they map to the same column so that orders.served_at is stamped whichever
+ * path completes the ticket: per-line roll-up (status 'served') or the
+ * whole-ticket button (status 'fulfilled'). A completed order with served_at
+ * NULL reads as "never reached the guest" to anything reporting on it later.
+ * Line-level writes never see these words: isValidItemStatus rejects them.
+ */
 const STAMP_COLUMN = {
   preparing: 'preparing_at',
   ready: 'ready_at',
   served: 'served_at',
+  fulfilled: 'served_at',
+  completed: 'served_at',
 };
 
 export function stampColumnFor(status) {
