@@ -882,25 +882,46 @@ async function handleOrders(pathname, method, url, request, env, auth) {
       // table that has a seated reservation with no order_id yet, set the
       // reservation.order_id to this order. Best-effort — a missed link does
       // not break ordering, only nightly reporting.
+      //
+      // Tables are stored with both an `id` ("T5") and a `number` (5). The
+      // order's table_id column carries whichever the caller sent, normalised
+      // (so "5", "05", "T5" all become "5"); the reservation's table_id
+      // column carries the row's `id` ("T5") because resolveTableId in the
+      // reservations handler returns the explicit `id`. Look up the row to
+      // get both forms and try each — order id, table number as a string, and
+      // the raw value the caller sent.
       if (tableId) {
         try {
+          const tableRow = await resolveTableRow(env, tableId);
+          const tableIdCandidates = new Set();
+          tableIdCandidates.add(String(tableId));
+          if (tableRow) {
+            if (tableRow.id) tableIdCandidates.add(String(tableRow.id));
+            if (tableRow.number !== undefined && tableRow.number !== null) {
+              tableIdCandidates.add(String(tableRow.number));
+            }
+          }
+          // Build IN (?, ?, ?) with the same number of placeholders as candidates.
+          const candidates = Array.from(tableIdCandidates);
+          const placeholders = candidates.map(() => '?').join(', ');
           await d1Run(
             env,
             `UPDATE reservations
                 SET order_id = ?, updated_at = ?
               WHERE id = (
                 SELECT id FROM reservations
-                 WHERE table_id = ?
+                 WHERE table_id IN (${placeholders})
                    AND status = 'seated'
                    AND order_id IS NULL
                    AND released_at IS NULL
                    AND no_show_at IS NULL
                  ORDER BY updated_at DESC LIMIT 1
               )`,
-            [id, nowIso, String(tableId)]
+            [id, nowIso, ...candidates]
           );
-        } catch {
+        } catch (e) {
           // A reservation-link failure must never cost the guest their order.
+          console.error('[ORDERS] reservation link failed:', e);
         }
       }
 

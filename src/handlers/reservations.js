@@ -318,26 +318,49 @@ async function handleReservations(pathname, method, request, env, auth) {
     // order on that same table that has no reservation link yet, and set
     // reservations.order_id to it. This catches the case where the waiter
     // fires the order before the host marks the reservation seated.
+    //
+    // Tables store both `id` ("T5") and `number` (5). The reservations handler
+    // resolves to the explicit `id` ("T5"); orders store the normalised form
+    // ("5"). Match either form.
     const newStatus = data.status !== undefined ? String(data.status).toLowerCase() : String(existing.status || '').toLowerCase();
-    const seatedTableId =
+    let seatedTableId =
       (data.tableId !== undefined || data.table_id !== undefined || data.tableNum !== undefined)
         ? (await resolveTableId(env, data)).tableId
         : existing.table_id;
+    let tableNumber = null;
+    if (seatedTableId) {
+      try {
+        const { results: tableRows } = await d1Query(
+          env,
+          'SELECT id, number FROM tables WHERE id = ?',
+          [String(seatedTableId)]
+        );
+        if (tableRows && tableRows[0] && tableRows[0].number !== undefined && tableRows[0].number !== null) {
+          tableNumber = String(tableRows[0].number);
+        }
+      } catch (e) {
+        // Fall back to the single-form lookup.
+      }
+    }
     if (newStatus === 'seated' && seatedTableId) {
       try {
+        const candidates = tableNumber && tableNumber !== seatedTableId
+          ? [String(seatedTableId), tableNumber]
+          : [String(seatedTableId)];
+        const placeholders = candidates.map(() => '?').join(', ');
         await d1Run(
           env,
           `UPDATE reservations
               SET order_id = (
                 SELECT id FROM orders
-                 WHERE table_id = ?
+                 WHERE table_id IN (${placeholders})
                    AND COALESCE(status, '') NOT IN ('cancelled', 'completed')
                    AND COALESCE(payment_status, '') IN ('unpaid', 'partial')
                    AND voided_at IS NULL
                  ORDER BY created DESC LIMIT 1
               )
             WHERE id = ? AND order_id IS NULL`,
-          [String(seatedTableId), id]
+          [...candidates, id]
         );
       } catch (e) {
         // A link failure must never fail the reservation update.
