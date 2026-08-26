@@ -61,6 +61,25 @@ const PUBLIC = [
 ];
 
 /**
+ * The writes above, but seen from the other side: they are open to a caller
+ * with NO session, and to nobody else.
+ *
+ * PUBLIC is matched before the session is resolved, so before this set
+ * existed a signed-in member of staff hit the anonymous rule first: a cleaner,
+ * an accountant or a driver could POST /api/orders (or a reservation, or a
+ * review) even though their role holds no such write. Found live in the
+ * four-role smoke of 2026-08-26 — all three roles created an order with a 200.
+ *
+ * /api/auth/login is deliberately not here: it establishes the session and
+ * must work whatever stale session the request already carries.
+ */
+const ANONYMOUS_WRITES = new Set([
+  '/api/orders',
+  '/api/reservations',
+  '/api/reviews',
+]);
+
+/**
  * Operations restricted to managers regardless of session. These either expose
  * payroll-adjacent data, mutate other people's accounts, or can destroy data.
  */
@@ -465,14 +484,26 @@ export async function authorize(request, env, pathname, method) {
     return authorizeSync(request, env);
   }
 
+  // A session is never treated as anonymous. The anonymous writes — booking,
+  // ordering, reviewing from the website — stay open to a caller with no
+  // session, but a signed-in member of staff goes through the role matrix like
+  // any other request, so the anonymous rule cannot be used to sidestep a
+  // write the role does not hold. Reads stay public to everyone regardless of
+  // session, exactly as before.
+  const anonymousWrite =
+    String(method || '').toUpperCase() === 'POST' && ANONYMOUS_WRITES.has(pathname);
+
   // Checked before the public list, so a private key cannot be let through by
   // the broad /api/images/ prefix rule.
-  if (matches(PUBLIC, pathname, method) && !isPrivateImage(pathname)) {
+  if (matches(PUBLIC, pathname, method) && !isPrivateImage(pathname) && !anonymousWrite) {
     return { ok: true, auth: null };
   }
 
   const auth = await getAuthUser(request, env);
   if (!auth) {
+    if (anonymousWrite && !isPrivateImage(pathname)) {
+      return { ok: true, auth: null };
+    }
     return {
       ok: false,
       response: json({ ok: false, error: 'Authentication required' }, 401),

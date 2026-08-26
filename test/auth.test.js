@@ -42,6 +42,59 @@ describe('public surface', () => {
   });
 });
 
+// Regression (four-role smoke, 2026-08-26): PUBLIC was matched before the
+// session was resolved, so a signed-in cleaner, accountant or delivery driver
+// could POST /api/orders (or a reservation, or a review) with a 200 — writes
+// their role does not hold. The anonymous rule now applies only to a caller
+// with no session; a session goes through the role matrix like any other
+// request.
+describe('anonymous writes vs signed-in sessions', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it.each(['cleaner', 'accountant', 'delivery-staff'])(
+    'refuses a signed-in %s the anonymous order write with 403',
+    async (role) => {
+      const d = await decide('/api/orders', 'POST', { staff_id: 'S10', sessionRole: role });
+      expect(d.ok).toBe(false);
+      expect(d.response.status).toBe(403);
+    }
+  );
+
+  it('refuses a signed-in cleaner the anonymous reservation and review writes', async () => {
+    for (const p of ['/api/reservations', '/api/reviews']) {
+      const d = await decide(p, 'POST', { staff_id: 'S10', sessionRole: 'cleaner' });
+      expect(d.ok).toBe(false);
+      expect(d.response.status).toBe(403);
+    }
+  });
+
+  it('still lets a waiter create an order — the POS fire path must not regress', async () => {
+    const d = await decide('/api/orders', 'POST', { staff_id: 'S6', sessionRole: 'head-waiter' });
+    expect(d.ok).toBe(true);
+  });
+
+  it('still lets a manager create an order and a reservation', async () => {
+    for (const p of ['/api/orders', '/api/reservations']) {
+      const d = await decide(p, 'POST', { staff_id: 'S1', sessionRole: 'manager' });
+      expect(d.ok).toBe(true);
+    }
+  });
+
+  it('still lets a signed-in staff member sign in again — login is session establishment, not an anonymous write', async () => {
+    const d = await decide('/api/auth/login', 'POST', { staff_id: 'S10', sessionRole: 'cleaner' });
+    expect(d.ok).toBe(true);
+  });
+
+  // A public read stays public even for a signed-in session — unchanged
+  // behaviour, pinned so the reordering cannot quietly narrow it.
+  it('still serves public reads to a signed-in session', async () => {
+    for (const p of ['/api/menu', '/api/content']) {
+      const d = await decide(p, 'GET', { staff_id: 'S10', sessionRole: 'cleaner' });
+      expect(d.ok).toBe(true);
+    }
+  });
+});
+
 describe('protected surface', () => {
   beforeEach(() => vi.clearAllMocks());
 
