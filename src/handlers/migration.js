@@ -1,9 +1,36 @@
-import { d1Run, json } from '../lib/db.js';
+import { d1Run, d1Query, json } from '../lib/db.js';
 import { kvGetMenu, kvSaveMenu, isCategorized, backfillMenuIdsFromD1 } from './menu.js';
 
 async function handleMigration(request, env) {
   const m = request.method.toUpperCase();
   const path = new URL(request.url).pathname;
+
+  // One-shot: apply the four additive ALTER statements from migration 020
+  // (B+ simulation findings). Safe to call repeatedly — each ALTER fails
+  // silently on "duplicate column name", which means it already applied.
+  // Manager-only via the /api/migrate/ prefix rule in auth.js.
+  if (path === "/api/migrate/bplus-020" && m === "POST") {
+    const statements = [
+      "ALTER TABLE reservations ADD COLUMN order_id TEXT",
+      "ALTER TABLE reservations ADD COLUMN completed_at TEXT",
+      "ALTER TABLE cashdrawers ADD COLUMN paid_in REAL DEFAULT 0",
+      "ALTER TABLE cashdrawers ADD COLUMN paid_out REAL DEFAULT 0",
+      "ALTER TABLE orders ADD COLUMN void_category TEXT",
+      "CREATE INDEX IF NOT EXISTS idx_reservations_order ON reservations(order_id) WHERE order_id IS NOT NULL AND order_id <> ''",
+    ];
+    const applied = [];
+    const skipped = [];
+    for (const sql of statements) {
+      try {
+        await d1Run(env, sql);
+        applied.push(sql);
+      } catch (e) {
+        // SQLite "duplicate column name" / "index already exists" — expected.
+        skipped.push({ sql, reason: String(e.message || e) });
+      }
+    }
+    return json({ ok: true, applied, skipped });
+  }
 
   // One-time repair: give every stored menu item a stable id.
   //
