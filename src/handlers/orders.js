@@ -1581,14 +1581,30 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     }
 
     const nowIso = new Date().toISOString();
+    // The void_category column arrives in migration 020. If the migration has
+    // not yet been applied (CI deploys on push, migrations are run by hand),
+    // the UPDATE would fail at the column reference. Two UPDATEs is uglier
+    // than one, but a missing column must never block a void — the cashier
+    // needs the order off the board, and the audit log will still carry the
+    // category in its `after` payload.
+    const orderCols = await orderColumns(env);
+    const hasVoidCategory = orderCols.includes('void_category');
     await d1Run(
       env,
-      `UPDATE orders
-          SET status = 'cancelled',
-              voided_at = ?, voided_by = ?, void_reason = ?, void_category = ?,
-              updated_at = ?
-        WHERE id = ?`,
-      [nowIso, auth ? actorName(auth) : null, reason || null, voidCategory, nowIso, id]
+      hasVoidCategory
+        ? `UPDATE orders
+              SET status = 'cancelled',
+                  voided_at = ?, voided_by = ?, void_reason = ?, void_category = ?,
+                  updated_at = ?
+            WHERE id = ?`
+        : `UPDATE orders
+              SET status = 'cancelled',
+                  voided_at = ?, voided_by = ?, void_reason = ?,
+                  updated_at = ?
+            WHERE id = ?`,
+      hasVoidCategory
+        ? [nowIso, auth ? actorName(auth) : null, reason || null, voidCategory, nowIso, id]
+        : [nowIso, auth ? actorName(auth) : null, reason || null, nowIso, id]
     );
     // The lines go with it, so the kitchen board clears and the timing report
     // does not average in food that was never served.
