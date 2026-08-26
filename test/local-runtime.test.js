@@ -53,6 +53,9 @@ beforeAll(async () => {
   db.prepare(
     "INSERT INTO tables (id, number, name, capacity, section, status, guests) VALUES ('9', 9, 'T9', 4, 'main', 'available', 0)"
   ).run();
+  db.prepare(
+    "INSERT INTO tables (id, number, name, capacity, section, status, guests) VALUES ('8', 8, 'T8', 2, 'window', 'available', 0)"
+  ).run();
 });
 
 afterAll(() => {
@@ -144,20 +147,31 @@ describe('taking an order', () => {
     expect(fetched.status).toBe(200);
     expect(Number(fetched.body.total)).toBe(260);
   });
+
+  it('auto-seated the dine-in table (Finding 1)', async () => {
+    // POST /api/orders now seats the table when type='dine-in', so T9 must
+    // be occupied at this point without any separate PUT.
+    const row = db.prepare("SELECT status, seated_at FROM tables WHERE id = '9'").get();
+    expect(row.status).toBe('occupied');
+    expect(row.seated_at).toBeTruthy();
+  });
 });
 
 describe('seating a table', () => {
   it('claims a free table and refuses the second claim', async () => {
-    const first = await call('PUT', '/api/tables/9', {
-      id: '9', number: 9, status: 'occupied', guests: 2, server: 'Local Manager',
+    // T9 is now auto-seated when a dine-in order is created on it (Finding 1
+    // from the B+ simulation), so this uses T8 — which the order test above
+    // never touches — to exercise the manual seating path.
+    const first = await call('PUT', '/api/tables/8', {
+      id: '8', number: 8, status: 'occupied', guests: 2, server: 'Local Manager',
     });
     expect(first.status).toBe(200);
 
     // The atomic claim relies on meta.changes coming back from the adapter. If
     // that were wrong this would wrongly succeed, and two waiters would seat
     // two parties at one table.
-    const second = await call('PUT', '/api/tables/9', {
-      id: '9', number: 9, status: 'occupied', guests: 4, server: 'Someone Else',
+    const second = await call('PUT', '/api/tables/8', {
+      id: '8', number: 8, status: 'occupied', guests: 4, server: 'Someone Else',
     });
     expect(second.status).toBe(409);
   });

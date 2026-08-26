@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS cashdrawers (
     expected REAL,
     variance REAL,
     status TEXT,
+    paid_in REAL DEFAULT 0,
+    paid_out REAL DEFAULT 0,
     created TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS categories (id TEXT PRIMARY KEY, name TEXT NOT NULL, sort_order INTEGER DEFAULT 0, name_am TEXT DEFAULT "");
@@ -40,9 +42,9 @@ CREATE TABLE IF NOT EXISTS content (
     updated_at TEXT DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS "d1_migrations"(
-		id         INTEGER PRIMARY KEY AUTOINCREMENT,
-		name       TEXT UNIQUE,
-		applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                name       TEXT UNIQUE,
+                applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 CREATE TABLE IF NOT EXISTS delivery (
     id TEXT PRIMARY KEY,
@@ -152,7 +154,7 @@ CREATE TABLE IF NOT EXISTS orders (
     customer TEXT,
     status TEXT DEFAULT 'new',
     created TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-, email TEXT DEFAULT '', notes TEXT, updated_at TEXT, preparing_at TEXT, ready_at TEXT, served_at TEXT, subtotal REAL, discount REAL DEFAULT 0, discount_type TEXT, discount_reason TEXT, tip REAL DEFAULT 0, tip_type TEXT, service_charge REAL DEFAULT 0, tax REAL DEFAULT 0, delivery_fee REAL DEFAULT 0, payment_status TEXT DEFAULT 'unpaid', paid_at TEXT, customer_phone TEXT, pickup_status TEXT, picked_up_at TEXT, created_by TEXT, created_by_name TEXT, voided_at TEXT, voided_by TEXT, void_reason TEXT, consumed_at TEXT);
+, email TEXT DEFAULT '', notes TEXT, updated_at TEXT, preparing_at TEXT, ready_at TEXT, served_at TEXT, subtotal REAL, discount REAL DEFAULT 0, discount_type TEXT, discount_reason TEXT, tip REAL DEFAULT 0, tip_type TEXT, service_charge REAL DEFAULT 0, tax REAL DEFAULT 0, delivery_fee REAL DEFAULT 0, payment_status TEXT DEFAULT 'unpaid', paid_at TEXT, customer_phone TEXT, pickup_status TEXT, picked_up_at TEXT, created_by TEXT, created_by_name TEXT, voided_at TEXT, voided_by TEXT, void_reason TEXT, consumed_at TEXT, void_category TEXT);
 CREATE TABLE IF NOT EXISTS overtime (
   id            TEXT PRIMARY KEY,
   staff_id      TEXT NOT NULL,
@@ -303,7 +305,7 @@ CREATE TABLE IF NOT EXISTS reservations (
     status TEXT,
     notes TEXT,
     created TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-, start_at TEXT, end_at TEXT, duration_min INTEGER DEFAULT 90, released_at TEXT, released_by TEXT, no_show_at TEXT, updated_at TEXT);
+, start_at TEXT, end_at TEXT, duration_min INTEGER DEFAULT 90, released_at TEXT, released_by TEXT, no_show_at TEXT, updated_at TEXT, order_id TEXT, completed_at TEXT);
 CREATE TABLE IF NOT EXISTS reviews (
     id TEXT PRIMARY KEY,
     author TEXT DEFAULT 'Anonymous',
@@ -520,6 +522,9 @@ CREATE INDEX IF NOT EXISTS idx_reservations_status_date ON reservations(status, 
 CREATE INDEX IF NOT EXISTS idx_reservations_window
   ON reservations(table_id, start_at, end_at)
   WHERE table_id IS NOT NULL AND table_id <> '';
+CREATE INDEX IF NOT EXISTS idx_reservations_order
+  ON reservations(order_id)
+  WHERE order_id IS NOT NULL AND order_id <> '';
 CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created);
 CREATE INDEX IF NOT EXISTS idx_reviews_rating ON reviews(rating);
 CREATE INDEX IF NOT EXISTS idx_reviews_status ON reviews(status);

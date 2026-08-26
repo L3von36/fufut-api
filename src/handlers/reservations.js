@@ -312,6 +312,39 @@ async function handleReservations(pathname, method, request, env, auth) {
       values
     );
     if (!meta.changes) return json({ ok: false, error: 'Reservation not found' }, 404);
+
+    // Finding 5 (B+ sim): the complement of the order-creation link. When a
+    // reservation is moved to "seated" with a table_id, look for a new unpaid
+    // order on that same table that has no reservation link yet, and set
+    // reservations.order_id to it. This catches the case where the waiter
+    // fires the order before the host marks the reservation seated.
+    const newStatus = data.status !== undefined ? String(data.status).toLowerCase() : String(existing.status || '').toLowerCase();
+    const seatedTableId =
+      (data.tableId !== undefined || data.table_id !== undefined || data.tableNum !== undefined)
+        ? (await resolveTableId(env, data)).tableId
+        : existing.table_id;
+    if (newStatus === 'seated' && seatedTableId) {
+      try {
+        await d1Run(
+          env,
+          `UPDATE reservations
+              SET order_id = (
+                SELECT id FROM orders
+                 WHERE table_id = ?
+                   AND COALESCE(status, '') NOT IN ('cancelled', 'completed')
+                   AND COALESCE(payment_status, '') IN ('unpaid', 'partial')
+                   AND voided_at IS NULL
+                 ORDER BY created DESC LIMIT 1
+              )
+            WHERE id = ? AND order_id IS NULL`,
+          [String(seatedTableId), id]
+        );
+      } catch (e) {
+        // A link failure must never fail the reservation update.
+        console.error('[RESERVATIONS] order_id link failed:', e);
+      }
+    }
+
     return json({ ok: true });
   }
 

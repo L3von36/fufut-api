@@ -98,7 +98,15 @@ async function handleResources(pathname, method, url, request, env, auth) {
         const drawerId = drawer.id;
         const opening = Number(drawer.opening_balance) || 0;
         const cashSales = Number(drawer.cash_sales) || 0;
-        const expected = opening + cashSales;
+        // Finding 6 (B+ sim): paid-in / paid-out used to ride the audit log
+        // only, so the drawer's `expected` was always `opening + cash_sales`
+        // and any paid-in surfaced as unexplained positive variance, any
+        // paid-out as unexplained negative variance, at Z-count. The columns
+        // are now kept in sync at the paid-in/paid-out handlers, so the
+        // expected figure carries them directly.
+        const paidIn = Number(drawer.paid_in) || 0;
+        const paidOut = Number(drawer.paid_out) || 0;
+        const expected = Math.round((opening + cashSales + paidIn - paidOut) * 100) / 100;
         const variance = Math.round((closingBal - expected) * 100) / 100;
         const denoms = data.denominations ? JSON.stringify(data.denominations) : null;
 
@@ -114,11 +122,11 @@ async function handleResources(pathname, method, url, request, env, auth) {
           entity: 'cashdrawer',
           entityId: drawerId,
           before: { status: 'open' },
-          after: { closing_balance: closingBal, expected, variance, status: 'closed' },
+          after: { closing_balance: closingBal, expected, variance, status: 'closed', paid_in: paidIn, paid_out: paidOut },
           reason: data.notes || (data.denominations ? 'Blind cash count' : 'Drawer close')
         });
 
-        return json({ ok: true, id: drawerId, expected, variance, closingBal, cashSales });
+        return json({ ok: true, id: drawerId, expected, variance, closingBal, cashSales, paidIn, paidOut });
       } catch (e) {
         return json({ ok: false, error: String(e.message || e) }, 500);
       }
@@ -134,6 +142,20 @@ async function handleResources(pathname, method, url, request, env, auth) {
         const { results } = await d1Query(env, "SELECT * FROM cashdrawers WHERE status = 'open' ORDER BY created DESC LIMIT 1");
         const drawer = results && results[0];
         if (!drawer) return json({ ok: false, error: "No active cash drawer open" }, 400);
+
+        // Finding 6 (B+ sim): keep the paid_in column on the drawer in sync so
+        // the expected-close formula includes it. Fail-open — the audit row is
+        // still written so the manager can read the movement even if the column
+        // is not yet present (migration 020 not applied).
+        try {
+          await d1Run(
+            env,
+            "UPDATE cashdrawers SET paid_in = COALESCE(paid_in, 0) + ? WHERE id = ?",
+            [amount, drawer.id]
+          );
+        } catch (e) {
+          console.error('[DRAWER] paid_in column not updated:', e);
+        }
 
         await writeAudit(env, auth, {
           action: 'paid_in',
@@ -159,6 +181,19 @@ async function handleResources(pathname, method, url, request, env, auth) {
         const { results } = await d1Query(env, "SELECT * FROM cashdrawers WHERE status = 'open' ORDER BY created DESC LIMIT 1");
         const drawer = results && results[0];
         if (!drawer) return json({ ok: false, error: "No active cash drawer open" }, 400);
+
+        // Finding 6 (B+ sim): mirror paid_in — keep the paid_out column on the
+        // drawer in sync so the expected-close formula subtracts it. Fail-open
+        // for the same reason.
+        try {
+          await d1Run(
+            env,
+            "UPDATE cashdrawers SET paid_out = COALESCE(paid_out, 0) + ? WHERE id = ?",
+            [amount, drawer.id]
+          );
+        } catch (e) {
+          console.error('[DRAWER] paid_out column not updated:', e);
+        }
 
         await writeAudit(env, auth, {
           action: 'paid_out',

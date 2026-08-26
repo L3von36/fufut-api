@@ -130,6 +130,29 @@ async function resolveTableKey(env, data) {
 }
 
 /**
+ * Look up a table row by id or number, regardless of who is asking.
+ *
+ * Used by the dine-in auto-seat path (Finding 1): a non-QR order carries the
+ * table only as a string, so the row has to be resolved before the conditional
+ * UPDATE can claim it. Returns null when the table is unknown — a number that
+ * does not exist is left alone rather than rejected, because the order is still
+ * a valid order without a floor plan slot.
+ */
+async function resolveTableRow(env, tableId) {
+  if (!tableId) return null;
+  try {
+    const { results } = await d1Query(
+      env,
+      'SELECT * FROM tables WHERE id = ? OR number = ?',
+      [String(tableId), Number(tableId) || -1]
+    );
+    return (results && results[0]) || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Write one tracking row per order line.
  *
  * Deliberately never throws: an order the kitchen cannot time is still an order
@@ -794,6 +817,27 @@ async function handleOrders(pathname, method, url, request, env, auth) {
         } catch {
           // A table that will not seat must never cost the guest their order.
         }
+      } else if (tableId && (row.type === 'dine-in' || (row.type === null && tableId))) {
+        // Finding 1 (B+ sim): a dine-in order with a table_id but no QR key
+        // used to leave the floor plan out of sync — the order carried the
+        // table but its status stayed 'available' until a separate PUT. The
+        // POS UI chained the writes; an API integrator (a kiosk, a delivery
+        // bridge, a third-party reservation system) did not, so the floor
+        // plan and the orders list drifted. The QR path above already seats
+        // its table; this seats every other dine-in the same way.
+        try {
+          const seatTarget = await resolveTableRow(env, tableId);
+          if (seatTarget && String(seatTarget.status || '').toLowerCase() !== 'occupied') {
+            await d1Run(
+              env,
+              "UPDATE tables SET status = 'occupied', seated_at = ? WHERE id = ? AND status <> 'occupied'",
+              [nowIso, String(seatTarget.id)]
+            );
+          }
+        } catch {
+          // Same fail-open rule as the QR path: a table that will not seat
+          // must never cost the guest their order.
+        }
       }
 
       const tracking = await insertOrderItems(
@@ -830,6 +874,35 @@ async function handleOrders(pathname, method, url, request, env, auth) {
           tip: row.tip,
         },
       });
+
+      // Finding 5 (B+ sim): a reservation marked "seated" on the same table
+      // carries no join key to the order that fulfilled it, so nightly
+      // "which reservations converted to revenue" reporting had no way to
+      // correlate the two. Link them here: when an order is created on a
+      // table that has a seated reservation with no order_id yet, set the
+      // reservation.order_id to this order. Best-effort — a missed link does
+      // not break ordering, only nightly reporting.
+      if (tableId) {
+        try {
+          await d1Run(
+            env,
+            `UPDATE reservations
+                SET order_id = ?, updated_at = ?
+              WHERE id = (
+                SELECT id FROM reservations
+                 WHERE table_id = ?
+                   AND status = 'seated'
+                   AND order_id IS NULL
+                   AND released_at IS NULL
+                   AND no_show_at IS NULL
+                 ORDER BY updated_at DESC LIMIT 1
+              )`,
+            [id, nowIso, String(tableId)]
+          );
+        } catch {
+          // A reservation-link failure must never cost the guest their order.
+        }
+      }
 
       const warnings = [tracking.warning, ...followUps].filter(Boolean);
       return json({
@@ -1472,6 +1545,20 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     try { body = await readBody(request); } catch { /* DELETE commonly has no body */ }
     const reason = body && body.reason ? String(body.reason).trim() : "";
 
+    // Finding 3 (B+ sim): a `void_category` tag distinguishes operator-error
+    // voids (training, mis-fired API calls, wrong method) from real customer-
+    // or kitchen-driven voids. The audit log treated every void the same, so
+    // a 33% operator-error void rate looked identical to a 33% walk-away rate.
+    // Categories: training | customer | kitchen | fraud | other. Optional —
+    // defaults to 'other' so existing callers keep working.
+    const VOID_CATEGORIES = new Set(['training', 'customer', 'kitchen', 'fraud', 'other']);
+    const voidCategory =
+      body && body.void_category
+        ? (VOID_CATEGORIES.has(String(body.void_category).toLowerCase())
+            ? String(body.void_category).toLowerCase()
+            : 'other')
+        : 'other';
+
     const { results } = await d1Query(env, "SELECT * FROM orders WHERE id = ?", [id]);
     const order = results && results[0];
     if (!order) return json({ ok: false, error: "Order not found" }, 404);
@@ -1482,7 +1569,7 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     // how a till reconciles short with nothing to point at.
     const { results: pays } = await d1Query(
       env,
-      "SELECT id, amount FROM payments WHERE order_id = ? AND status <> 'rejected'",
+      "SELECT id, amount, method, status FROM payments WHERE order_id = ? AND status <> 'rejected'",
       [id]
     );
     const taken = (pays || []).reduce((s, p) => s + (Number(p.amount) || 0), 0);
@@ -1497,9 +1584,11 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     await d1Run(
       env,
       `UPDATE orders
-          SET status = 'cancelled', voided_at = ?, voided_by = ?, void_reason = ?, updated_at = ?
+          SET status = 'cancelled',
+              voided_at = ?, voided_by = ?, void_reason = ?, void_category = ?,
+              updated_at = ?
         WHERE id = ?`,
-      [nowIso, auth ? actorName(auth) : null, reason || null, nowIso, id]
+      [nowIso, auth ? actorName(auth) : null, reason || null, voidCategory, nowIso, id]
     );
     // The lines go with it, so the kitchen board clears and the timing report
     // does not average in food that was never served.
@@ -1511,6 +1600,57 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     await d1Run(env, "UPDATE delivery SET status = 'cancelled', cancelled_at = ?, updated_at = ? WHERE orderId = ?", [
       nowIso, nowIso, id,
     ]);
+
+    // Finding 2 (B+ sim): voiding a paid cash order left the drawer's
+    // `cash_sales` carrying "phantom" cash that was actually handed back to
+    // the guest as a refund. The original cash sale row stayed verified, the
+    // drawer stayed inflated, and the manager saw variance at Z-count with no
+    // link back to the void. The fix: when a manager voids a paid order, every
+    // verified cash payment on it is auto-refunded — a negative payment row
+    // is inserted (mirroring the existing refundPayment path), the original is
+    // marked refunded, and `addToOpenDrawerCash` brings the drawer tally down
+    // by the same figure. Non-cash payments (telebirr/bank/card) are left
+    // alone here — their refund flow is settled outside the till.
+    let autoRefunded = 0;
+    let autoRefundIds = [];
+    for (const p of (pays || [])) {
+      const amount = round2(Number(p.amount) || 0);
+      if (amount <= 0) continue;
+      if (String(p.method || '').toLowerCase() !== 'cash') continue;
+      if (String(p.status || '').toLowerCase() === 'refunded') continue;
+
+      const refundId = 'PM' + crypto.randomUUID().slice(0, 10);
+      try {
+        await d1Run(
+          env,
+          `INSERT INTO payments
+             (id, order_id, method, amount, reference, status, collected_by, collected_by_name,
+              verified_by, verified_by_name, verified_at, notes, created_at)
+           VALUES (?, ?, ?, ?, ?, 'verified', ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            refundId,
+            id,
+            'cash',
+            -amount,
+            p.reference || null,
+            (auth && auth.staff_id) || null,
+            auth ? actorName(auth) : null,
+            (auth && auth.staff_id) || null,
+            auth ? actorName(auth) : null,
+            nowIso,
+            `Auto-refund for voided order ${id}: ${reason || 'no reason given'}`,
+            nowIso,
+          ]
+        );
+        await d1Run(env, "UPDATE payments SET status = 'refunded' WHERE id = ?", [p.id]);
+        await addToOpenDrawerCash(env, -amount);
+        autoRefunded = round2(autoRefunded + amount);
+        autoRefundIds.push(refundId);
+      } catch (e) {
+        // A refund failure must not undo the void. The manager will see the
+        // unrefunded payment row in the audit log and can settle it manually.
+      }
+    }
 
     // Put back what the order took. A reversal rather than a deletion: the
     // original sale movements stay and matching positive rows are added, so the
@@ -1528,11 +1668,11 @@ async function handleOrders(pathname, method, url, request, env, auth) {
       entity: "orders",
       entityId: id,
       before: { status: order.status, total: order.total },
-      after: { status: "cancelled", voided_at: nowIso },
+      after: { status: "cancelled", voided_at: nowIso, void_category: voidCategory, auto_refunded: autoRefunded },
       reason: reason || null,
     });
 
-    return json({ ok: true, voided: true, id, restocked });
+    return json({ ok: true, voided: true, id, restocked, void_category: voidCategory, auto_refunded: autoRefunded, refund_ids: autoRefundIds });
   }
   return null;
 }

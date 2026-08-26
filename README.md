@@ -69,6 +69,76 @@ those working pages. Closing the public hole is the urgent fix; tightening
 per-role reads needs the permission model reworked first — see
 `../fufut-management/FIX-PROMPT.md` Task 5.
 
+## Payment & refund endpoint contract
+
+The payments module exposes three operations on `POST /api/payments`. Each
+takes a different path shape — the B+ simulation's first attempts fired the
+wrong shape, so the contract is documented here to keep that from recurring.
+
+### `POST /api/payments` — record a tender against an order
+
+```json
+{ "orderId": "O...", "method": "cash|telebirr|cbe|bank|card|mobile|other",
+  "amount": 130,
+  "tendered": 200,   // cash only, optional
+  "changeDue": 70,   // cash only, optional
+  "reference": "...",  // for transfer methods
+  "evidenceKey": "...",  // R2 key of the screenshot, for transfer methods
+  "allowOverpayment": false }
+```
+
+Unknown `method` values are rejected with `400 Unknown payment method "..."`.
+The B+ simulation's `method:"transfer"` would have failed here — `transfer` is
+not in the accepted set; the correct value is `telebirr`.
+
+### `POST /api/payments/:id/verify` — confirm a digital transfer arrived
+
+Cashier or manager only. The id is the **payment row id**, not the order id.
+
+```json
+{ "reject": false }            // to confirm
+{ "reject": true, "reason": "Screenshot did not match the transfer" }  // to reject
+```
+
+The path is `/:id/verify`, **not** `/verify` with a body field. A
+`POST /api/payments/verify` returns `404` — that path matches no route, and
+the request body is ignored. The B+ simulation's first attempt used this
+shape; the correct path is `POST /api/payments/PM.../verify`.
+
+### `POST /api/payments/:id/refund` — manager-only refund
+
+Refunds are negative payments against the same order. The original row stays
+intact; a new row with a negative amount is inserted, the original is marked
+`refunded`, and (for cash) the drawer's `cash_sales` is decremented via
+`addToOpenDrawerCash(-amount)`.
+
+```json
+{ "amount": 130, "reason": "Cash refund issued at the table" }
+{ "reason": "Full refund — kitchen sent the wrong dish" }   // amount defaults to the original
+```
+
+A reason is always required. The amount must not exceed the original payment.
+
+## Void endpoint contract
+
+`DELETE /api/orders/:id` voids the order (it does not delete the row). The
+optional body:
+
+```json
+{
+  "reason": "Customer walked away before being served",
+  "void_category": "training|customer|kitchen|fraud|other",
+  "keepConsumption": false
+}
+```
+
+The `void_category` field (added 2026-08-26 from the B+ simulation's Finding 3)
+distinguishes operator-error voids from real customer-driven voids in the audit
+log. If a manager voids an order that has verified cash payments, those
+payments are auto-refunded (Finding 2) and the drawer's `cash_sales` is
+decremented; the response carries `auto_refunded` and `refund_ids`. Non-cash
+payments are left for the manager to refund manually.
+
 ## Development
 
 ```bash
