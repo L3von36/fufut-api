@@ -1328,7 +1328,18 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     });
   }
 
-  // POST /api/orders/:id/split — split an order by seat count or item buckets
+  // POST /api/orders/:id/split — split an open check evenly across seats
+  //
+  // The parent check is retired and N unpaid child orders carry its money,
+  // one payment each. Two invariants matter:
+  //   1. The parts sum to the whole: the last split absorbs the rounding
+  //      remainder, so a ETB 100 three-way split is 33.34 + 33.33 + 33.33.
+  //   2. Revenue is counted once: the parent is cancelled with a reason
+  //      (excluded from reports, open checks and the boards) and only the
+  //      splits remain as real money. The items stay attached to the parent
+  //      for history — an even seat split cannot divide dishes.
+  // The previous version INSERTed columns (table_number, created_at) that do
+  // not exist on `orders`, so every split attempt returned 500.
   if (m === "POST" && /^\/[^/]+\/split$/.test(sub)) {
     const orderId = sub.split("/")[1];
     const data = await readBody(request);
@@ -1337,38 +1348,54 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     const { results } = await d1Query(env, "SELECT * FROM orders WHERE id = ?", [orderId]);
     const order = results && results[0];
     if (!order) return json({ ok: false, error: "Order not found" }, 404);
+    if (order.voided_at) return json({ ok: false, error: "This check has been voided and cannot be split." }, 409);
+    if (String(order.payment_status || "").toLowerCase() === "paid") {
+      return json({ ok: false, error: "This check is already settled." }, 409);
+    }
+    const outstanding = parseFloat(order.total || 0);
+    if (!(outstanding > 0)) return json({ ok: false, error: "Nothing owed on this check to split." }, 409);
 
     const nowIso = new Date().toISOString();
-    const seatCount = Math.max(2, parseInt(data.seatCount || 2, 10));
-    const total = parseFloat(order.total || 0);
-    const splitTotal = round2(total / seatCount);
+    const seatCount = Math.max(2, Math.min(10, parseInt(data.seatCount || 2, 10) || 2));
+    const evenShare = round2(outstanding / seatCount);
 
     const createdSplits = [];
     for (let i = 0; i < seatCount; i++) {
       const splitId = `ORD-SPLIT-${Date.now().toString(36)}-${i+1}`;
-      const splitRow = {
-        id: splitId,
-        type: order.type || 'dine-in',
-        table_id: order.table_id || order.table_number || null,
-        table_number: order.table_number || null,
-        status: 'new',
-        payment_status: 'unpaid',
-        items: `Split ${i+1}/${seatCount} of Order #${orderId.slice(-4)}`,
-        subtotal: splitTotal,
-        total: splitTotal,
-        created: nowIso,
-        created_at: nowIso,
-        notes: `Split bill ${i+1} of ${seatCount} from #${orderId.slice(-4)}`
-      };
-      await d1Run(env, `INSERT INTO orders (id, type, table_id, table_number, status, payment_status, items, subtotal, total, created, created_at, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
-        splitRow.id, splitRow.type, splitRow.table_id, splitRow.table_number, splitRow.status, splitRow.payment_status, splitRow.items, splitRow.subtotal, splitRow.total, splitRow.created, splitRow.created_at, splitRow.notes
-      ]);
-      createdSplits.push(splitRow);
+      const share = i === seatCount - 1 ? round2(outstanding - evenShare * (seatCount - 1)) : evenShare;
+      await d1Run(
+        env,
+        `INSERT INTO orders (id, type, table_id, customer, status, payment_status, items, subtotal, total, created, notes)
+         VALUES (?, ?, ?, ?, 'new', 'unpaid', ?, ?, ?, ?, ?)`,
+        [
+          splitId,
+          order.type || "dine-in",
+          order.table_id || null,
+          order.customer || null,
+          `Split ${i+1}/${seatCount} of Order #${orderId.slice(-4)}`,
+          share,
+          share,
+          nowIso,
+          `Split bill ${i+1} of ${seatCount} from #${orderId.slice(-4)}`,
+        ]
+      );
+      createdSplits.push({ id: splitId, total: share });
     }
 
-    // Mark original order as merged/split (fulfilled/cancelled)
-    await d1Run(env, "UPDATE orders SET status = 'fulfilled', payment_status = 'split', notes = COALESCE(notes, '') || ' [Split into sub-orders]', updated_at = ? WHERE id = ?", [nowIso, orderId]);
-    await writeAudit(env, auth, { action: "split", entity: "orders", entityId: orderId, after: { splitsCount: seatCount, createdSplits: createdSplits.map(s => s.id) } });
+    await d1Run(
+      env,
+      `UPDATE orders SET status = 'cancelled', payment_status = 'split',
+              void_reason = ?, voided_at = ?, void_category = 'other', updated_at = ?
+        WHERE id = ?`,
+      [`Split into ${seatCount} checks`, nowIso, nowIso, orderId]
+    );
+    await writeAudit(env, auth, {
+      action: "split",
+      entity: "orders",
+      entityId: orderId,
+      before: { status: order.status, total: order.total },
+      after: { status: "cancelled", splitsCount: seatCount, createdSplits: createdSplits.map(s => s.id) },
+    });
 
     return json({ ok: true, parentOrderId: orderId, splits: createdSplits });
   }

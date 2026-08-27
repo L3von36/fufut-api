@@ -17,7 +17,8 @@ var RESOURCE_MAP = {
       closingBal: "closing_balance",
       cashSales: "cash_sales",
       expectedClose: "expected",
-      opened: "opened_at"
+      opened: "opened_at",
+      closed: "closed_at"
     }
   }
 };
@@ -112,8 +113,11 @@ async function handleResources(pathname, method, url, request, env, auth) {
 
         const { meta } = await d1Run(
           env,
-          "UPDATE cashdrawers SET closing_balance = ?, expected = ?, variance = ?, status = 'closed' WHERE id = ?",
-          [closingBal, expected, variance, drawerId]
+          // closed_at lands with the Z-count (migration 021) so the Z-Report
+          // History stops showing each session's opened time under a
+          // "Closed Time" header.
+          "UPDATE cashdrawers SET closing_balance = ?, expected = ?, variance = ?, status = 'closed', closed_at = ? WHERE id = ?",
+          [closingBal, expected, variance, new Date().toISOString(), drawerId]
         );
         if (!meta.changes) return json({ ok: false, error: "Drawer not found or already closed" }, 404);
 

@@ -32,6 +32,28 @@ async function handleMigration(request, env) {
     return json({ ok: true, applied, skipped });
   }
 
+  // One-shot: apply migration 021 — stamp when a drawer session was closed,
+  // so the Z-Report History can show a close time instead of reusing the
+  // opened timestamp. Idempotent for the same reason as bplus-020: a repeat
+  // call fails on "duplicate column name" and reports it as skipped.
+  // Manager-only via the /api/migrate/ prefix rule in auth.js.
+  if (path === "/api/migrate/drawer-021" && m === "POST") {
+    const statements = [
+      "ALTER TABLE cashdrawers ADD COLUMN closed_at TEXT",
+    ];
+    const applied = [];
+    const skipped = [];
+    for (const sql of statements) {
+      try {
+        await d1Run(env, sql);
+        applied.push(sql);
+      } catch (e) {
+        skipped.push({ sql, reason: String(e.message || e) });
+      }
+    }
+    return json({ ok: true, applied, skipped });
+  }
+
   // One-time repair: give every stored menu item a stable id.
   //
   // The KV blob was saved without per-item ids, so /api/menu served all 45 items
