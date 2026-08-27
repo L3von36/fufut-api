@@ -109,7 +109,7 @@ async function dashboard(env, url) {
                    WHERE p.status <> 'rejected' AND ${REAL_ORDERS} AND ${DATE_CLAUSE}
                    GROUP BY p.method ORDER BY total DESC`, w).catch(() => ({ results: [] })),
 
-    d1Query(env, 'SELECT SUM(amount) AS total FROM tips WHERE date >= ? AND date <= ?', w)
+    d1Query(env, "SELECT SUM(amount) AS total FROM tips WHERE date >= ? AND date <= ? AND COALESCE(status, 'recorded') <> 'refunded'", w)
       .catch(() => ({ results: [] })),
 
     d1Query(env, 'SELECT SUM(amount) AS total FROM expenses WHERE date >= ? AND date <= ?', w)
@@ -253,7 +253,7 @@ async function financial(env, url) {
                     JOIN orders o ON o.id = p.order_id
                    WHERE p.status <> 'rejected' AND ${REAL_ORDERS} AND ${DATE_CLAUSE}
                    GROUP BY p.method`, w).catch(() => ({ results: [] })),
-    d1Query(env, 'SELECT SUM(amount) AS total FROM tips WHERE date >= ? AND date <= ?', w)
+    d1Query(env, "SELECT SUM(amount) AS total FROM tips WHERE date >= ? AND date <= ? AND COALESCE(status, 'recorded') <> 'refunded'", w)
       .catch(() => ({ results: [] })),
     d1Query(env, `SELECT SUM(total) AS total, SUM(total - paid) AS owed FROM purchases
                    WHERE voided_at IS NULL AND date >= ? AND date <= ?`, w).catch(() => ({ results: [] })),

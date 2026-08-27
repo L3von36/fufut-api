@@ -1884,6 +1884,19 @@ async function handleOrders(pathname, method, url, request, env, auth) {
       }
     }
 
+    // The auto-refund hands back the whole cash payment, and on a paid order
+    // that amount includes the tip — so the tip is no longer staff money. The
+    // tips row used to stay 'recorded', keeping "Tips Earned" counting money
+    // that had gone back to the guest. Flip it to refunded; reporting sums
+    // only non-refunded tips, and the row itself keeps the history.
+    if (autoRefunded > 0) {
+      await d1Run(
+        env,
+        "UPDATE tips SET status = 'refunded' WHERE order_id = ? AND status <> 'refunded'",
+        [id]
+      ).catch(() => {});
+    }
+
     // Put back what the order took. A reversal rather than a deletion: the
     // original sale movements stay and matching positive rows are added, so the
     // ledger shows the stock going out and coming back, which is what happened.

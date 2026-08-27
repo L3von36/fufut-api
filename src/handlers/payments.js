@@ -496,10 +496,21 @@ export async function handlePayments(pathname, method, url, request, env, auth) 
         );
         return json(results || []);
       }
-      const { results } = await d1Query(
-        env,
-        'SELECT * FROM payments ORDER BY created_at DESC LIMIT 500'
-      );
+      // ?verified=false asks for the queue that still needs the till's say-so
+      // (status 'recorded'); ?verified=true for settled rows. The parameter
+      // used to be ignored entirely, so a caller asking "what is pending?"
+      // got the last 500 payments of every status — and the cashier dashboard
+      // rendered a Verify button on already-verified cash and on refunds.
+      const verified = url.searchParams.get('verified');
+      let sql = 'SELECT * FROM payments';
+      const params = [];
+      if (verified === 'false' || verified === '0') {
+        sql += " WHERE status = 'recorded'";
+      } else if (verified === 'true' || verified === '1') {
+        sql += " WHERE status = 'verified'";
+      }
+      sql += ' ORDER BY created_at DESC LIMIT 500';
+      const { results } = await d1Query(env, sql, params);
       return json(results || []);
     }
 
