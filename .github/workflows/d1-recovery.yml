@@ -1,0 +1,64 @@
+name: D1 Time Travel Recovery (temporary)
+
+# TEMPORARY ops workflow — added 2026-08-27 to recover timeclock rows deleted
+# by an over-broad cleanup script (see worklog Task 15). Restore is in-place
+# D1 Time Travel; it is gated behind an explicit confirm string and preceded by
+# a full database export so the pre-restore state is kept. REMOVE THIS FILE
+# once the recovery is verified.
+
+on:
+  workflow_dispatch:
+    inputs:
+      timestamp:
+        description: 'RFC3339 timestamp to restore to (within last 30 days)'
+        required: true
+      confirm:
+        description: 'Type RESTORE to actually restore; anything else only logs info + backup'
+        required: true
+        default: 'info-only'
+
+concurrency:
+  group: d1-recovery
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Pre-restore backup (full export)
+        run: npx wrangler d1 export fufut-db --remote --output pre-restore-backup.sql
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Time Travel info (bookmarks)
+        run: npx wrangler d1 time-travel info fufut-db --json || true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Restore to timestamp
+        if: github.event.inputs.confirm == 'RESTORE'
+        run: npx wrangler d1 time-travel restore fufut-db --timestamp "${{ github.event.inputs.timestamp }}" --json
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Post-restore verification
+        run: |
+          npx wrangler d1 execute fufut-db --remote --json --command \
+            "SELECT id, staff_id, date, clock_in, clock_out, hours, status, created FROM timeclock ORDER BY date DESC, clock_in DESC"
+          npx wrangler d1 execute fufut-db --remote --json --command \
+            "SELECT (SELECT COUNT(*) FROM orders) AS orders, (SELECT COUNT(*) FROM payments) AS payments, (SELECT COUNT(*) FROM reservations) AS reservations, (SELECT COUNT(*) FROM shifts) AS shifts, (SELECT COUNT(*) FROM tables) AS tables, (SELECT COUNT(*) FROM menu) AS menu, (SELECT COUNT(*) FROM staff) AS staff"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Upload backup artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: d1-pre-restore-backup
+          path: pre-restore-backup.sql
+          retention-days: 7
