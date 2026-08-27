@@ -686,6 +686,44 @@ async function whoIsOnShift(env, url, auth) {
   });
 }
 
+/**
+ * GET /api/timeclock/me/history — my own recent shifts, newest first.
+ *
+ * The Time Clock screen for a role without the roster grant showed the current
+ * state and the two buttons and nothing else: the only member of staff whose
+ * hours a waiter can affect is the one whose hours they could not see. This
+ * answers exactly the caller's own rows — subjectStaffId honours a staffId
+ * only for a manager, who already holds the roster — so nobody reads a
+ * colleague's record through it.
+ */
+async function myHistory(env, url, auth) {
+  const asked = url && url.searchParams ? url.searchParams.get('staffId') : null;
+  const staffId = subjectStaffId({ staffId: asked }, auth);
+  if (!staffId) return json({ ok: false, error: 'No staff record on this session' }, 400);
+
+  const limitRaw = parseInt((url && url.searchParams.get('limit')) || '14', 10);
+  const limit = Math.min(Math.max(Number.isFinite(limitRaw) ? limitRaw : 14, 1), 90);
+
+  const { results } = await d1Query(
+    env,
+    `SELECT * FROM timeclock
+      WHERE staff_id = ?
+      ORDER BY date DESC, clock_in DESC
+      LIMIT ?`,
+    [String(staffId), limit]
+  );
+
+  const entries = (results || []).map((r) => ({
+    ...r,
+    // The POS roster table reads both spellings; give it the one it prefers.
+    staffId: r.staff_id,
+    clockIn: r.clock_in,
+    clockOut: r.clock_out && String(r.clock_out).trim() !== '' ? r.clock_out : null,
+  }));
+
+  return json({ ok: true, staffId, entries });
+}
+
 /** POST /api/timeclock/clock-in */
 async function clockIn(request, env, auth) {
   const data = (await readBody(request)) || {};
@@ -801,6 +839,7 @@ export async function handleHR(pathname, method, url, request, env, auth) {
   // Self-service, ahead of the generic timeclock resource. See SELF_SERVICE in
   // auth.js for why these are reachable by every role.
   if (pathname === '/api/timeclock/me' && m === 'GET') return whoIsOnShift(env, url, auth);
+  if (pathname === '/api/timeclock/me/history' && m === 'GET') return myHistory(env, url, auth);
   if (pathname === '/api/timeclock/clock-in' && m === 'POST') return clockIn(request, env, auth);
   if (pathname === '/api/timeclock/clock-out' && m === 'POST') return clockOut(request, env, auth);
 

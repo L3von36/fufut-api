@@ -145,12 +145,17 @@ const ANY_STAFF_READ = new Set(['menu', 'content', 'gallery', 'reviews', 'units'
  * `timeclock` write through the generic handler is the power to rewrite
  * anybody's hours, which is a payroll figure.
  *
- * So these three routes are open to any signed-in member of staff, and the
+ * So these four routes are open to any signed-in member of staff, and the
  * handler restricts them to the caller's own record — a staffId is honoured
  * only for a manager, who is the person already trusted with the roster.
+ *
+ * `/me/history` is read-only and answers only the caller's own shifts, so a
+ * role with no `timeclock` grant (a waiter) can still see the hours they
+ * themselves worked without being able to see anybody else's.
  */
 const SELF_SERVICE = new Set([
   '/api/timeclock/me',
+  '/api/timeclock/me/history',
   '/api/timeclock/clock-in',
   '/api/timeclock/clock-out',
 ]);
