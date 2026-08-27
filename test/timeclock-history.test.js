@@ -116,6 +116,38 @@ describe('GET /api/timeclock/me/history', () => {
   });
 });
 
+describe('GET /api/timeclock (roster with filters)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('honours staff_id and the date window instead of answering everything', async () => {
+    // Regression: the generic resource handler ignored the query string, so
+    // ?staff_id=S6&from=…&to=… returned EVERY row. A cleanup script trusted
+    // that and deleted eight people's attendance records (recovered via D1
+    // Time Travel; worklog 2026-08-27).
+    const { env, boundParams } = makeEnv();
+    const url = new URL('https://pos.fufutcoffee.com/api/timeclock?staff_id=S6&from=2026-08-27&to=2026-08-27');
+    const res = await handleHR('/api/timeclock', 'GET', url, new Request(url.toString()), env, MANAGER);
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(body)).toBe(true); // bare array, like the generic handler
+    const roster = boundParams.find((b) => /FROM timeclock/.test(b.sql) && /WHERE/.test(b.sql));
+    expect(roster.params).toEqual(['2026-08-27', '2026-08-27', 'S6']);
+  });
+
+  it('with no filters returns the whole roster — the screens rely on that', async () => {
+    const { env, boundParams } = makeEnv();
+    const url = new URL('https://pos.fufutcoffee.com/api/timeclock');
+    const res = await handleHR('/api/timeclock', 'GET', url, new Request(url.toString()), env, MANAGER);
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(Array.isArray(body)).toBe(true);
+    const roster = boundParams.find((b) => /FROM timeclock/.test(b.sql));
+    expect(/WHERE/.test(roster.sql)).toBe(false);
+  });
+});
+
 describe('route reachability', () => {
   beforeEach(() => vi.clearAllMocks());
 

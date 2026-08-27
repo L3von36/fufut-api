@@ -724,6 +724,34 @@ async function myHistory(env, url, auth) {
   return json({ ok: true, staffId, entries });
 }
 
+/**
+ * GET /api/timeclock — the roster, honouring staff_id/staffId, from and to.
+ *
+ * Shape matches the generic handler it replaces: a bare array, newest first by
+ * created. No filters given is the whole roster, which is what the Time Clock
+ * and Shifts screens read.
+ */
+async function listTimeclock(env, url) {
+  const sp = url && url.searchParams ? url.searchParams : new URLSearchParams();
+  const staffId = sp.get('staff_id') || sp.get('staffId');
+  const from = sp.get('from');
+  const to = sp.get('to');
+
+  const clauses = [];
+  const params = [];
+  if (from) { clauses.push('date >= ?'); params.push(from); }
+  if (to) { clauses.push('date <= ?'); params.push(to); }
+  if (staffId) { clauses.push('staff_id = ?'); params.push(String(staffId)); }
+
+  const where = clauses.length ? ' WHERE ' + clauses.join(' AND ') : '';
+  const { results } = await d1Query(
+    env,
+    `SELECT * FROM timeclock${where} ORDER BY created DESC`,
+    params
+  );
+  return json(results || []);
+}
+
 /** POST /api/timeclock/clock-in */
 async function clockIn(request, env, auth) {
   const data = (await readBody(request)) || {};
@@ -842,6 +870,15 @@ export async function handleHR(pathname, method, url, request, env, auth) {
   if (pathname === '/api/timeclock/me/history' && m === 'GET') return myHistory(env, url, auth);
   if (pathname === '/api/timeclock/clock-in' && m === 'POST') return clockIn(request, env, auth);
   if (pathname === '/api/timeclock/clock-out' && m === 'POST') return clockOut(request, env, auth);
+
+  // The roster list, ahead of the generic resource handler. That handler
+  // ignores the query string entirely: a caller asking for
+  // /api/timeclock?staff_id=S6&from=…&to=… was answered with EVERY row, and a
+  // cleanup script trusted that and deleted eight people's attendance records
+  // on the strength of it (D1 Time Travel restored them; worklog 2026-08-27).
+  // An API that answers a filtered question with an unfiltered answer is a
+  // loaded footgun, so the filters are honoured here.
+  if (pathname === '/api/timeclock' && m === 'GET') return listTimeclock(env, url);
 
   if (pathname.startsWith('/api/attendance')) {
     const sub = pathname.replace(/^\/api\/attendance/, '');
