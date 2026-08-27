@@ -46,6 +46,9 @@ beforeEach(async () => {
   db.prepare("INSERT INTO tables (id, number, name, status, qr_key) VALUES ('T4', 4, 'Table 4', 'available', ?)").run(KEY);
   db.prepare("INSERT INTO tables (id, number, name, status) VALUES ('T5', 5, 'Table 5', 'available')").run();
 
+  // Guest orders are priced from the menu now, so the menu has to exist.
+  db.prepare("INSERT INTO menu_items (id, category_id, name, price, available) VALUES ('MI1', 'C1', 'Buna', 60, 1)").run();
+
   db.prepare(
     `INSERT INTO staff (id, firstName, lastName, email, role, status, password_hash, must_change_password, created)
      VALUES ('M1','A','B','mgr@local.test','manager','active',?,0,?)`

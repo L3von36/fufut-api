@@ -56,6 +56,11 @@ beforeAll(async () => {
   db.prepare(
     "INSERT INTO tables (id, number, name, capacity, section, status, guests) VALUES ('8', 8, 'T8', 2, 'window', 'available', 0)"
   ).run();
+
+  // Guest orders are priced from the menu now, so the dishes the runtime
+  // test orders have to be on it — at the prices the test always claimed.
+  db.prepare("INSERT INTO menu_items (id, category_id, name, price, available) VALUES ('MI1', 'C1', 'Macchiato', 60, 1)").run();
+  db.prepare("INSERT INTO menu_items (id, category_id, name, price, available) VALUES ('MI2', 'C1', 'Fut Breakfast Gebeta', 140, 1)").run();
 });
 
 afterAll(() => {

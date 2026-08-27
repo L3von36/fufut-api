@@ -54,6 +54,9 @@ beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fufut-venue-'));
   ({ env, db } = createLocalEnv({ dir, quiet: true }));
   env.SITE_ID = 'cloud';
+
+  // Guest orders are priced from the menu now, so the menu has to exist.
+  db.prepare("INSERT INTO menu_items (id, category_id, name, price, available) VALUES ('MI1', 'C1', 'Buna', 60, 1)").run();
 });
 
 afterEach(() => {

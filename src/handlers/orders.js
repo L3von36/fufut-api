@@ -153,6 +153,172 @@ async function resolveTableRow(env, tableId) {
 }
 
 /**
+ * The menu, keyed the two ways an order line can name a dish.
+ *
+ * Guests reach the cloud with lines that name a dish by menu id (what the
+ * website cart sends) or — for the oldest payloads — by name alone. Both
+ * spellings must resolve to the same row the till prices from, or the check
+ * below cannot tell a menu item from an invented one.
+ *
+ * Returns null when the menu cannot be read or holds nothing: both mean the
+ * caller has no honest price to charge against.
+ */
+async function guestMenu(env) {
+  try {
+    const { results } = await d1Query(
+      env,
+      'SELECT id, name, price, available FROM menu_items'
+    );
+    const rows = results || [];
+    if (!rows.length) return null;
+    const byId = new Map();
+    const byName = new Map();
+    for (const m of rows) {
+      if (m.id != null && !byId.has(String(m.id))) byId.set(String(m.id), m);
+      const nm = String(m.name || '').trim().toLowerCase();
+      if (nm && !byName.has(nm)) byName.set(nm, m);
+    }
+    return { byId, byName };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Price an anonymous order from the menu, not from the request.
+ *
+ * POST /api/orders is public on purpose — it is how the website and the QR
+ * table codes take an order — but until now every figure on the receipt came
+ * off the wire: the per-line price, the subtotal, the discount, the total,
+ * the status. A guest who edited the request (or wrote their own) could buy
+ * two espressos for one birr and mark the order completed and paid in the
+ * same POST, and the books would record it as settled cash. Confirmed live
+ * on 2026-08-27: three probe orders (Ocff9d5a, O16e8cab, O6d9a999) landed
+ * at attacker-chosen prices, one of them "paid".
+ *
+ * The fix is not to close the route — the website has no other way in — but
+ * to stop trusting the arithmetic of a stranger. A guest's order is priced
+ * here from menu_items: known dishes are repriced to what the menu says and
+ * renamed to the menu's spelling, unknown dishes are refused (the website
+ * can only ever send real ones), a discount is dropped (a guest cannot
+ * authorise one), every optional addition is clamped at zero or above, and
+ * the total is recomputed from the result. Status is forced to 'new' —
+ * served, completed and voided are the shop's words to say, not the
+ * requester's — and payment fields are stripped, because the only anonymous
+ * payment rows ever written were probes verified by nobody.
+ *
+ * Signed-in staff are exempt: the till computes its own totals, including
+ * discounts and service charge a manager has approved, and every write it
+ * makes is attributed and audited.
+ *
+ * Mutates `data` in place and returns `{ repriced }` — true when any line's
+ * price had to be corrected — or `{ status, reason, error }` for the caller
+ * to return as a refusal.
+ */
+async function priceGuestOrder(env, data) {
+  const lines = normaliseLines(data.orderItems || data.order_items || data.items, 0);
+  if (!lines.length) {
+    return {
+      status: 400,
+      reason: 'no-items',
+      error: 'Your order is empty. Please add something from the menu and try again.',
+    };
+  }
+
+  const menu = await guestMenu(env);
+  // Without the menu there is no honest price to charge a guest — and no
+  // guest with a cart, since the website renders its prices from this same
+  // table. Refusing here is telling the truth rather than taking a
+  // stranger's word for what the food costs.
+  if (!menu) {
+    return {
+      status: 503,
+      reason: 'menu-unavailable',
+      error: 'The menu is not available right now. Please try again shortly.',
+    };
+  }
+
+  const unknown = [];
+  const unavailable = [];
+  let repriced = false;
+  let subtotal = 0;
+
+  for (const line of lines) {
+    const hit =
+      (line.menuItemId && menu.byId.get(String(line.menuItemId))) ||
+      menu.byName.get(line.name.trim().toLowerCase()) ||
+      null;
+    if (!hit) {
+      unknown.push(line.name);
+      continue;
+    }
+    if (hit.available === false || hit.available === 0) {
+      unavailable.push(String(hit.name || line.name));
+      continue;
+    }
+    const menuPrice = Number(hit.price) || 0;
+    if (Math.abs(menuPrice - Number(line.unitPrice)) > 0.005) repriced = true;
+    line.name = String(hit.name || line.name);
+    line.unitPrice = menuPrice;
+    subtotal += menuPrice * line.qty;
+  }
+
+  if (unknown.length) {
+    return {
+      status: 400,
+      reason: 'unknown-item',
+      error: `"${unknown[0]}" is not on the menu. Please refresh the menu and try again.`,
+    };
+  }
+  if (unavailable.length) {
+    return {
+      status: 400,
+      reason: 'unavailable-item',
+      error: `${unavailable[0]} is unavailable right now. Please remove it and try again.`,
+    };
+  }
+
+  // A guest may round up — a tip, a delivery fee the site quotes — but never
+  // down: every optional addition is clamped at zero, and the discount is
+  // dropped entirely.
+  const tip = Math.max(0, round2(data.tip));
+  const serviceCharge = Math.max(0, round2(data.serviceCharge));
+  const tax = Math.max(0, round2(data.tax));
+  const deliveryFee = Math.max(0, round2(data.deliveryFee));
+  const total = round2(subtotal + tip + serviceCharge + tax + deliveryFee);
+
+  // The corrected lines go back in the client's own shape — id, name, qty,
+  // price — so the summary column and the per-line tracking rows both carry
+  // the menu's figures. normaliseLines reads `price` off this shape again
+  // downstream, which is why the normalised rows must not be passed through.
+  data.items = lines.map((l) => ({
+    id: l.menuItemId || undefined,
+    name: l.name,
+    qty: l.qty,
+    price: l.unitPrice,
+  }));
+  delete data.orderItems;
+  delete data.order_items;
+  data.subtotal = round2(subtotal);
+  data.total = total;
+  data.discount = 0;
+  data.discountType = null;
+  data.discountReason = null;
+  data.tip = tip;
+  data.serviceCharge = serviceCharge;
+  data.tax = tax;
+  data.deliveryFee = deliveryFee;
+  // A guest's order starts its life the way every guest order starts: new
+  // and unpaid. Status and settlement are the shop's to set, not the
+  // requester's — the live probe had one arrive "completed" and "paid".
+  data.status = 'new';
+  delete data.payment;
+  delete data.paymentBreakdown;
+
+  return { repriced };
+}
+
+/**
  * Write one tracking row per order line.
  *
  * Deliberately never throws: an order the kitchen cannot time is still an order
@@ -715,8 +881,23 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     const qr = await resolveTableKey(env, data);
     if (qr.error) return json({ ok: false, error: qr.error, reason: 'bad-table-code' }, 403);
 
+    // A stranger's arithmetic is not a price. Guests are repriced from the
+    // menu before anything is written; a signed-in member of staff keeps
+    // the totals the till computed — discounts, service charge and all —
+    // and stays attributed and audited.
+    let guestRepriced = false;
+    if (!actor) {
+      const priced = await priceGuestOrder(env, data);
+      if (priced.error) {
+        return json({ ok: false, error: priced.error, reason: priced.reason }, priced.status);
+      }
+      guestRepriced = priced.repriced;
+    }
+
     try {
-      const id = data.id || "O" + crypto.randomUUID().slice(0, 7);
+      // Staff may name the order (the till's offline queue keys on it); a
+      // guest cannot — a client-chosen id can only collide or impersonate.
+      const id = (actor && data.id) || "O" + crypto.randomUUID().slice(0, 7);
       const items = typeof data.items === "string" ? data.items : JSON.stringify(data.items || []);
       // Normalised on the way in: "7.0" and "07" are the same table as "7",
       // and every screen compares this as a string.
@@ -852,10 +1033,17 @@ async function handleOrders(pathname, method, url, request, env, auth) {
       // fail — same reasoning as insertOrderItems above. Each returns a warning
       // rather than throwing.
       const followUps = [];
-      const payments = await recordSubmittedPayments(env, auth, id, data);
+      // A guest cannot settle their own order: the only anonymous payment
+      // and tip rows ever written were probes, verified by and attributed to
+      // nobody. Settlement happens in store, signed in.
+      const payments = actor
+        ? await recordSubmittedPayments(env, auth, id, data)
+        : { inserted: 0, warning: null };
       if (payments.warning) followUps.push(payments.warning);
 
-      const tipResult = await recordSubmittedTip(env, auth, id, data, tip, orderType);
+      const tipResult = actor
+        ? await recordSubmittedTip(env, auth, id, data, tip, orderType)
+        : { inserted: 0, warning: null };
       if (tipResult.warning) followUps.push(tipResult.warning);
 
       const delivery = await createDeliveryJob(env, auth, id, data, orderType);
@@ -872,6 +1060,9 @@ async function handleOrders(pathname, method, url, request, env, auth) {
           subtotal: row.subtotal,
           discount: row.discount,
           tip: row.tip,
+          // Lets the books tell a stale cached menu (repriced once, honest
+          // guest) from a probing campaign (repriced every time).
+          ...(guestRepriced ? { guest_repriced: true } : {}),
         },
       });
 
@@ -926,12 +1117,16 @@ async function handleOrders(pathname, method, url, request, env, auth) {
       }
 
       const warnings = [tracking.warning, ...followUps].filter(Boolean);
+      if (guestRepriced) {
+        warnings.unshift('Prices were set from the menu, so the total may differ from what you saw.');
+      }
       return json({
         ok: true,
         id,
         items: tracking.inserted,
         payments: payments.inserted,
         deliveryId: delivery.id || undefined,
+        repriced: guestRepriced || undefined,
         warning: warnings.length ? warnings.join(" ") : undefined,
       });
     } catch (e) {
