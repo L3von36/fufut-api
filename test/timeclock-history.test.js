@@ -25,7 +25,7 @@ const WAITER = { staff_id: 'S1', sessionRole: 'head-waiter' };
 const MANAGER = { staff_id: 'S9', sessionRole: 'manager' };
 
 const SHIFTS = [
-  { id: 'TC1', staff_id: 'S1', date: '2026-08-27', clock_in: '08:20', clock_out: '12:04', hours: 3.7, status: 'completed' },
+  { id: 'TC1', staff_id: 'S1', firstName: 'Yonas', lastName: 'Girmay', date: '2026-08-27', clock_in: '08:20', clock_out: '12:04', hours: 3.7, status: 'completed' },
   { id: 'TC2', staff_id: 'S1', date: '2026-08-26', clock_in: '09:00', clock_out: '', hours: 0, status: 'active' },
   { id: 'TC3', staff_id: 'S2', date: '2026-08-26', clock_in: '10:00', clock_out: '18:00', hours: 8, status: 'completed' },
 ];
@@ -133,6 +133,22 @@ describe('GET /api/timeclock (roster with filters)', () => {
     expect(Array.isArray(body)).toBe(true); // bare array, like the generic handler
     const roster = boundParams.find((b) => /FROM timeclock/.test(b.sql) && /WHERE/.test(b.sql));
     expect(roster.params).toEqual(['2026-08-27', '2026-08-27', 'S6']);
+  });
+
+  it('joins the staff name the POS roster table displays', async () => {
+    // The generic handler returned raw rows: staff_id but never a name, so
+    // the roster's STAFF column has always read "—".
+    const { env } = makeEnv();
+    const url = new URL('https://pos.fufutcoffee.com/api/timeclock');
+    const res = await handleHR('/api/timeclock', 'GET', url, new Request(url.toString()), env, MANAGER);
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    const named = body.find((r) => r.id === 'TC1');
+    expect(named.staffName).toBe('Yonas Girmay');
+    // A row with no matching staff keeps the column honest rather than blank.
+    const unnamed = body.find((r) => r.id === 'TC3');
+    expect(unnamed.staffName).toBeNull();
   });
 
   it('with no filters returns the whole roster — the screens rely on that', async () => {

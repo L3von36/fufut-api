@@ -729,7 +729,9 @@ async function myHistory(env, url, auth) {
  *
  * Shape matches the generic handler it replaces: a bare array, newest first by
  * created. No filters given is the whole roster, which is what the Time Clock
- * and Shifts screens read.
+ * and Shifts screens read. The staff join is new: the generic handler returned
+ * raw rows, so the POS roster table's STAFF column has always read "—" —
+ * rows carry staff_id, never a name.
  */
 async function listTimeclock(env, url) {
   const sp = url && url.searchParams ? url.searchParams : new URLSearchParams();
@@ -739,17 +741,23 @@ async function listTimeclock(env, url) {
 
   const clauses = [];
   const params = [];
-  if (from) { clauses.push('date >= ?'); params.push(from); }
-  if (to) { clauses.push('date <= ?'); params.push(to); }
-  if (staffId) { clauses.push('staff_id = ?'); params.push(String(staffId)); }
+  if (from) { clauses.push('t.date >= ?'); params.push(from); }
+  if (to) { clauses.push('t.date <= ?'); params.push(to); }
+  if (staffId) { clauses.push('t.staff_id = ?'); params.push(String(staffId)); }
 
   const where = clauses.length ? ' WHERE ' + clauses.join(' AND ') : '';
   const { results } = await d1Query(
     env,
-    `SELECT * FROM timeclock${where} ORDER BY created DESC`,
+    `SELECT t.*, s.firstName, s.lastName
+       FROM timeclock t LEFT JOIN staff s ON s.id = t.staff_id${where}
+      ORDER BY t.created DESC`,
     params
   );
-  return json(results || []);
+  const rows = (results || []).map((r) => ({
+    ...r,
+    staffName: [r.firstName, r.lastName].filter(Boolean).join(' ') || null,
+  }));
+  return json(rows);
 }
 
 /** POST /api/timeclock/clock-in */
