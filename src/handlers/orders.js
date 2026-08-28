@@ -809,6 +809,111 @@ async function loadStaleHours(env) {
   }
 }
 
+/**
+ * ── Auto-close paid tickets nobody closed ─────────────────────────────────
+ *
+ * Closing a ticket is a manual last step, and the end of a busy service is
+ * exactly when it gets skipped. Production carried four such tickets at once:
+ * two served-and-paid on one table, two ready-and-paid takeaways from the
+ * previous evening — money taken, food gone, rows open forever, and nothing
+ * in the SLA rules covers them because there is nothing left to do except
+ * close the row.
+ *
+ * So the minute sweep finishes the job: an order that is `ready` or `served`,
+ * already paid, and has sat that way past the threshold is marked completed.
+ * The guards are the point:
+ *
+ *  - `payment_status = 'paid'` — unpaid tickets are money somebody still owes;
+ *    the served-unpaid alert handles those and only staff may resolve them.
+ *  - delivery orders are excluded — a ready delivery is waiting for a driver,
+ *    and completing it would lie about a job the delivery board still owns.
+ *  - never `new`/`confirmed`/`preparing` — food not yet made is a refund
+ *    conversation, not a housekeeping sweep.
+ *  - the UPDATE re-checks status and payment in its WHERE, so a waiter closing
+ *    the ticket at the same moment wins and the sweep's write is a no-op.
+ *
+ * Threshold is the manager's number, not the deploy's: `orders.autocomplete_min`
+ * in settings, default 4 hours, `0` turns the whole thing off. Every close is
+ * written to the audit log under a system actor so the accountant can see
+ * exactly what the sweep did and why.
+ */
+const AUTOCOMPLETE_KEY = "orders.autocomplete_min";
+const AUTOCOMPLETE_DEFAULT_MIN = 240;
+const AUTOCOMPLETE_BATCH = 25;
+
+/** The sweep is a system actor: named, role-tagged, and nobody's staff record. */
+const SYSTEM_ACTOR = { staff_id: "system", sessionRole: "system", firstName: "SLA", lastName: "Sweep" };
+
+export async function autoCompleteStaleOrders(env, nowMs = Date.now()) {
+  // Threshold from settings; unreadable or absent falls back to the default,
+  // and an explicit 0 (or any non-positive) disables the sweep entirely.
+  let minutes = AUTOCOMPLETE_DEFAULT_MIN;
+  try {
+    const { results } = await d1Query(env, "SELECT value FROM settings WHERE key = ?", [
+      AUTOCOMPLETE_KEY,
+    ]);
+    const row = results && results[0];
+    const raw = row ? String(row.value).replace(/"/g, "").trim() : "";
+    // Number("") is 0, not NaN — an absent row must stay on the default, not
+    // silently become "disabled", so only a row that actually holds a number
+    // is allowed to move the threshold.
+    if (raw !== "") {
+      const n = Number(raw);
+      if (Number.isFinite(n) && n >= 0) minutes = n;
+    }
+  } catch {
+    // Before migration 007 there is no settings table. The default is correct.
+  }
+  if (minutes <= 0) return { closed: 0, disabled: true };
+
+  const cutoff = new Date(nowMs - minutes * 60000).toISOString();
+  const { results } = await d1Query(
+    env,
+    `SELECT id, status, payment_status, type, served_at, ready_at, updated_at, created
+       FROM orders
+      WHERE COALESCE(voided_at, '') = ''
+        AND status IN ('ready', 'served')
+        AND payment_status = 'paid'
+        AND COALESCE(type, '') <> 'delivery'
+        AND COALESCE(served_at, ready_at, updated_at, created) < ?
+      LIMIT ${AUTOCOMPLETE_BATCH}`,
+    [cutoff]
+  );
+
+  const nowIso = new Date(nowMs).toISOString();
+  let closed = 0;
+  for (const o of results || []) {
+    // Conditional close: only lands if the order is still in the state we read.
+    const { meta } = await d1Run(
+      env,
+      `UPDATE orders SET status = 'completed', updated_at = ?
+        WHERE id = ? AND status IN ('ready', 'served') AND payment_status = 'paid'`,
+      [nowIso, o.id]
+    );
+    if (!meta || !meta.changes) continue;
+
+    // A completed order is fully served: any line still behind moves to served,
+    // mirroring what the PUT path does when a whole ticket is advanced.
+    await d1Run(
+      env,
+      `UPDATE order_items SET status = 'served', served_at = COALESCE(served_at, ?)
+        WHERE order_id = ? AND status IN ('new', 'preparing', 'ready')`,
+      [nowIso, o.id]
+    );
+
+    await writeAudit(env, SYSTEM_ACTOR, {
+      action: "update",
+      entity: "orders",
+      entityId: o.id,
+      before: { status: o.status },
+      after: { status: "completed" },
+      reason: `Auto-closed by the SLA sweep: ${o.status} and paid since before ${cutoff} (${AUTOCOMPLETE_KEY}=${minutes})`,
+    });
+    closed++;
+  }
+  return { closed, thresholdMin: minutes };
+}
+
 async function handleOrders(pathname, method, url, request, env, auth) {
   const m = method.toUpperCase();
   const sub = pathname.replace(/^\/api\/orders/, "");

@@ -18,7 +18,7 @@ import { json } from './lib/db.js';
 import { authorize, redactStaffForRole } from './auth.js';
 
 import { handleContent, checkScheduledPublish } from './handlers/content.js';
-import { handleOrders, loadStaleHours } from './handlers/orders.js';
+import { handleOrders, loadStaleHours, autoCompleteStaleOrders } from './handlers/orders.js';
 import { handleAlerts, runAlertSweep } from './handlers/alerts.js';
 import { handlePayments } from './handlers/payments.js';
 import { handleAudit } from './handlers/audit.js';
@@ -290,6 +290,14 @@ export default {
     } catch (e) {
       // Same contract as the tables sweep: fail alone, try again next minute.
       console.error('[SWEEP] alerts', e);
+    }
+    try {
+      const r = await autoCompleteStaleOrders(env);
+      // Quiet when nothing closed — a log line every minute would be noise.
+      if (r.closed) console.log('[SWEEP] auto-close', JSON.stringify(r));
+    } catch (e) {
+      // Same contract: fail alone, try again next minute.
+      console.error('[SWEEP] auto-close', e);
     }
   },
 };
