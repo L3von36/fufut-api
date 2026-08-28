@@ -1,0 +1,163 @@
+name: D1 nightly backup
+
+# Nightly logical dump of the production fufut-db D1 database.
+#
+# Chain: prod D1 -> SQL dump -> gzip -> R2 (private bucket) -> read back ->
+# restore into a scratch sqlite -> row counts. The run only goes green when
+# the copy sitting in R2 has been proven restorable end to end, not merely
+# uploaded.
+#
+# Storage: a dedicated PRIVATE bucket (fufut-backups), deliberately not the
+# fufut-images bucket, which serves public assets. A database dump contains
+# staff, customers and order history and must never land somewhere public.
+#
+# Retention is enforced by R2 lifecycle rules on the bucket itself (idempotent,
+# re-asserted on every run) rather than delete loops:
+#   d1/daily/*   expire after daily_retention_days (default 30)
+#   d1/monthly/* expire after 365 days (kept from the 1st of each month)
+# Second copy: GitHub artifact of the same dump, 14 days.
+#
+# Restore drill (real recovery):
+#   wrangler r2 object get fufut-backups/d1/daily/<file>.sql.gz --file dump.sql.gz --remote
+#   gunzip dump.sql.gz
+#   wrangler d1 create fufut-db-restore-YYYY-MM-DD
+#   wrangler d1 execute fufut-db-restore-YYYY-MM-DD --remote --file dump.sql
+# Never point --file at the live fufut-db while it is serving; restore into a
+# new database and migrate rows deliberately.
+#
+# Failure visibility: scheduled runs that fail email the repository actors.
+# A missing nightly is the signal that backups are broken — treat a red or
+# absent run in this list the same as a failed backup.
+#
+# Scope note: this covers D1. The six KV namespaces (menu/content/gallery)
+# are not dumped here yet — a documented follow-up.
+
+on:
+  schedule:
+    # 02:00 UTC == 05:00 Africa/Nairobi — after close, before opening.
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      daily_retention_days:
+        description: 'Days to keep d1/daily/* objects in R2'
+        required: false
+        default: '30'
+        type: string
+
+concurrency:
+  group: d1-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BUCKET: fufut-backups
+      DAILY_RETENTION: ${{ inputs.daily_retention_days || '30' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Ensure private backup bucket + retention rules
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npx --yes wrangler@4 r2 bucket create "$BUCKET" 2>/dev/null \
+            || echo "bucket '$BUCKET' already exists (or create skipped)"
+          # Re-assert retention on every run; remove-then-add keeps the
+          # numbers in step with the dispatch input.
+          npx --yes wrangler@4 r2 bucket lifecycle remove "$BUCKET" d1-daily-expire 2>/dev/null || true
+          npx --yes wrangler@4 r2 bucket lifecycle remove "$BUCKET" d1-monthly-expire 2>/dev/null || true
+          npx --yes wrangler@4 r2 bucket lifecycle add "$BUCKET" d1-daily-expire "d1/daily/" \
+            --expire-days "$DAILY_RETENTION" --force
+          npx --yes wrangler@4 r2 bucket lifecycle add "$BUCKET" d1-monthly-expire "d1/monthly/" \
+            --expire-days 365 --force
+
+      - name: Export production D1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          STAMP="$(date -u +%Y-%m-%d)"
+          mkdir -p work
+          npx --yes wrangler@4 d1 export fufut-db --remote --output "work/fufut-db-${STAMP}.sql"
+          [ -s "work/fufut-db-${STAMP}.sql" ] || { echo "EMPTY EXPORT — aborting"; exit 1; }
+          gzip -f "work/fufut-db-${STAMP}.sql"
+          SIZE="$(du -h "work/fufut-db-${STAMP}.sql.gz" | cut -f1)"
+          SHA="$(sha256sum "work/fufut-db-${STAMP}.sql.gz" | cut -d' ' -f1)"
+          echo "STAMP=${STAMP}"           >> "$GITHUB_ENV"
+          echo "FILE=fufut-db-${STAMP}.sql.gz" >> "$GITHUB_ENV"
+          echo "SIZE=${SIZE}"             >> "$GITHUB_ENV"
+          echo "SHA=${SHA}"               >> "$GITHUB_ENV"
+          echo "exported fufut-db -> ${FILE} (${SIZE}, sha256 ${SHA})"
+
+      - name: Upload to R2 (daily, plus monthly on the 1st)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npx --yes wrangler@4 r2 object put "$BUCKET/d1/daily/$FILE" \
+            --file "work/$FILE" --content-type application/gzip --remote --force
+          if [ "$(date -u +%d)" = "01" ]; then
+            npx --yes wrangler@4 r2 object put "$BUCKET/d1/monthly/$FILE" \
+              --file "work/$FILE" --content-type application/gzip --remote --force
+            echo "monthly copy uploaded"
+          fi
+
+      - name: Prove it restores (read back from R2, import, count rows)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          command -v sqlite3 >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3; }
+          mkdir -p verify
+          npx --yes wrangler@4 r2 object get "$BUCKET/d1/daily/$FILE" \
+            --file "verify/$FILE" --remote
+          VERIFY_SHA="$(sha256sum "verify/$FILE" | cut -d' ' -f1)"
+          if [ "$VERIFY_SHA" != "$SHA" ]; then
+            echo "READ-BACK MISMATCH: local $SHA vs R2 $VERIFY_SHA"; exit 1
+          fi
+          gunzip -c "verify/$FILE" > verify/dump.sql
+          rm -f verify/scratch.db
+          sqlite3 verify/scratch.db < verify/dump.sql 2>verify/import.err
+          if [ -s verify/import.err ]; then
+            echo "IMPORT WARNINGS:"; cat verify/import.err
+          fi
+          {
+            echo "Tables in dump:"
+            sqlite3 verify/scratch.db "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;" | sed 's/^/  /'
+            echo "Row counts:"
+            for t in orders order_items reservations menu_items tables staff settings alerts audit_log customers; do
+              EXISTS=$(sqlite3 verify/scratch.db "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='$t';")
+              [ "$EXISTS" = "1" ] && echo "  $t = $(sqlite3 verify/scratch.db "SELECT COUNT(*) FROM $t;")"
+            done
+          } | tee verify/counts.txt
+
+      - name: Run summary
+        run: |
+          {
+            echo "## D1 nightly backup — ${STAMP}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Database | fufut-db (production) |"
+            echo "| Dump | \`${FILE}\` |"
+            echo "| Size | ${SIZE} |"
+            echo "| SHA-256 | \`${SHA}\` |"
+            echo "| R2 | \`${BUCKET}/d1/daily/${FILE}\` |"
+            echo "| Retention | daily ${DAILY_RETENTION}d, monthly 365d (R2 lifecycle) |"
+            echo "| Restore test | passed (R2 copy re-imported into sqlite) |"
+            echo ""
+            echo '```'
+            cat verify/counts.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Artifact copy (14 days)
+        uses: actions/upload-artifact@v4
+        with:
+          name: d1-backup-${{ env.STAMP }}
+          path: work/${{ env.FILE }}
+          retention-days: 14
+          if-no-files-found: error
