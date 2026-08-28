@@ -205,3 +205,86 @@ export function isLapsedNoShow(reservation, nowMs, graceMin = GRACE_MIN) {
   if (!Number.isFinite(start)) return false;
   return nowMs > start + graceMin * 60000;
 }
+
+/**
+ * ── Creation-time validation ─────────────────────────────────────────────
+ *
+ * POST /api/reservations is reachable by the anonymous website visitor, so
+ * everything the two real clients send has to be checked on the server too.
+ * Production carried the residue of not doing this: nameless, timeless rows
+ * from QA tooling sat in the live table, and the website's own form sent the
+ * guest count as the option's label text ("2 People"), which `Number()`
+ * silently turned into 1 for every booking the site ever took.
+ */
+
+/** Largest party the API will accept on one booking. The POS form caps at 50. */
+export const MAX_GUESTS = 50;
+
+/**
+ * A booking whose time has already passed is junk — but a host seating a
+ * walk-in "for right now" from the POS, or a guest submitting at 18:59 for
+ * 19:00, are normal. Accept starts up to this far behind the clock.
+ */
+export const PAST_BOOKING_GRACE_MIN = 30;
+
+/**
+ * Read the guest count out of whatever arrived.
+ *
+ * The website sends the option's label ("2 People", "6+ People"), the POS
+ * sends a number, and older rows hold strings. Take the leading integer and
+ * refuse anything with none — "2" and "2 People" are both a party of two.
+ */
+export function parseGuests(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? Math.trunc(value) : null;
+  const m = String(value).trim().match(/^(\d{1,3})/);
+  return m ? Number(m[1]) : null;
+}
+
+/**
+ * Everything wrong with a reservation a client is trying to create, as human
+ * messages for the response body. Empty array means acceptable.
+ *
+ * `startMs` is the window the handler already computed (date + time in shop
+ * time); `nowMs` is the clock. Date and time themselves are checked by
+ * computeWindow upstream — this covers the fields around them.
+ */
+export function newReservationProblems(data, startMs, nowMs) {
+  const problems = [];
+
+  const name = String(data.name == null ? '' : data.name).trim();
+  if (!name) problems.push('A guest name is required');
+  else if (name.length > 100) problems.push('Guest name is limited to 100 characters');
+
+  const guests = parseGuests(data.guests);
+  if (guests === null) problems.push('A guest count is required');
+  else if (guests < 1 || guests > MAX_GUESTS) {
+    problems.push(`Guests must be between 1 and ${MAX_GUESTS}`);
+  }
+
+  const phone = String(data.phone == null ? '' : data.phone).trim();
+  if (phone.length > 40) problems.push('Phone is limited to 40 characters');
+
+  // The website asks for an email; the POS does not send one. Required at the
+  // form, optional at the API — but a value that cannot be an address is junk.
+  const email = String(data.email == null ? '' : data.email).trim();
+  if (email) {
+    if (email.length > 120) problems.push('Email is limited to 120 characters');
+    else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      problems.push('Email address is not valid');
+    }
+  }
+
+  const notes = String(data.notes == null ? '' : data.notes).trim();
+  if (notes.length > 500) problems.push('Notes are limited to 500 characters');
+
+  if (
+    Number.isFinite(startMs) &&
+    Number.isFinite(nowMs) &&
+    startMs + PAST_BOOKING_GRACE_MIN * 60000 < nowMs
+  ) {
+    problems.push('Reservation time is in the past');
+  }
+
+  return problems;
+}

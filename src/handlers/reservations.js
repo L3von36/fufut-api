@@ -5,6 +5,8 @@ import {
   normaliseDuration,
   holdsTable,
   isLapsedNoShow,
+  parseGuests,
+  newReservationProblems,
   ACTIVE_STATUSES,
   DEFAULT_DURATION_MIN,
   GRACE_MIN,
@@ -116,12 +118,22 @@ async function handleReservations(pathname, method, request, env, auth) {
       );
     }
 
+    // This endpoint answers to the anonymous internet as well as to staff, so
+    // the fields around the date are checked here rather than trusted from any
+    // form. Rejects nameless bookings, unreadable party sizes, malformed
+    // emails and bookings for a time that has already gone by.
+    const problems = newReservationProblems(data, Date.parse(window.startAt), Date.now());
+    if (problems.length) return json({ ok: false, error: problems.join('; ') }, 400);
+
     const resolved = await resolveTableId(env, data);
     if (!resolved.ok) return json({ ok: false, error: resolved.error }, 400);
 
     const id = data.id || 'R' + crypto.randomUUID().slice(0, 7);
     const nowIso = new Date().toISOString();
-    const status = String(data.status || 'new');
+    // A fresh booking starts life as 'new', whatever the caller asked for: the
+    // status field is how the floor tracks a booking's lifecycle, and a
+    // visitor on the public site does not get to set it.
+    const status = 'new';
 
     const params = [
       id,
@@ -130,7 +142,7 @@ async function handleReservations(pathname, method, request, env, auth) {
       String(data.email || ''),
       String(data.date || ''),
       String(data.time || ''),
-      Number(data.guests) || 1,
+      parseGuests(data.guests),
       resolved.tableId,
       status,
       String(data.notes || ''),
