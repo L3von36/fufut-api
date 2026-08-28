@@ -283,3 +283,44 @@ describe('staff PII redaction', () => {
     }
   });
 });
+
+// Self-scoped audit reads — the My Activity screen (per-role performance
+// dashboard). Every signed-in role can read their own audit trail; nobody
+// can read another person's or the system-wide trail without the `audit`
+// read grant.
+describe('self-scoped audit reads (My Activity)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it.each(['cleaner', 'delivery-staff', 'head-chef', 'head-waiter', 'cashier', 'assistant-chef'])(
+    'allows %s to read their own audit entries (actor_id matches staff_id)',
+    async (role) => {
+      const url = new URL('https://api.test/api/audit?actor_id=S10&from=2026-08-01&to=2026-08-31T23:59:59&limit=500');
+      getAuthUser.mockResolvedValue({ staff_id: 'S10', sessionRole: role });
+      const d = await authorize(new Request(url), {}, '/api/audit', 'GET', url);
+      expect(d.ok).toBe(true);
+    }
+  );
+
+  it('refuses a non-manager who tries to read another person audit entries', async () => {
+    const url = new URL('https://api.test/api/audit?actor_id=S5');
+    getAuthUser.mockResolvedValue({ staff_id: 'S10', sessionRole: 'delivery-staff' });
+    const d = await authorize(new Request(url), {}, '/api/audit', 'GET', url);
+    expect(d.ok).toBe(false);
+    expect(d.response.status).toBe(403);
+  });
+
+  it('refuses a non-manager who tries to read the system-wide audit (no actor_id)', async () => {
+    const url = new URL('https://api.test/api/audit');
+    getAuthUser.mockResolvedValue({ staff_id: 'S10', sessionRole: 'delivery-staff' });
+    const d = await authorize(new Request(url), {}, '/api/audit', 'GET', url);
+    expect(d.ok).toBe(false);
+    expect(d.response.status).toBe(403);
+  });
+
+  it('still allows a manager to read the system-wide audit (no actor_id)', async () => {
+    const url = new URL('https://api.test/api/audit');
+    getAuthUser.mockResolvedValue({ staff_id: 'S1', sessionRole: 'manager' });
+    const d = await authorize(new Request(url), {}, '/api/audit', 'GET', url);
+    expect(d.ok).toBe(true);
+  });
+});

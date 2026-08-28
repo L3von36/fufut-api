@@ -476,7 +476,7 @@ function isManager(role) {
  *
  * @returns {{ok: true, auth: object|null} | {ok: false, response: Response}}
  */
-export async function authorize(request, env, pathname, method) {
+export async function authorize(request, env, pathname, method, url) {
   // Checked first, ahead of even the public list: these are the only routes
   // authenticated by a shared secret rather than by a person, and nothing else
   // should ever be able to widen them.
@@ -550,6 +550,33 @@ export async function authorize(request, env, pathname, method) {
   // handler rather than by the role matrix. See SELF_SERVICE.
   if (SELF_SERVICE.has(pathname)) {
     return { ok: true, auth };
+  }
+
+  // Self-scoped audit reads: any signed-in member of staff may read the audit
+  // log filtered to their own actions. The My Activity screen (per-role
+  // performance dashboard) lives on this — a delivery driver has to see "how
+  // many deliveries did I do today" the same way a manager sees "how many
+  // orders did I touch". Without this exception, only `manager` and
+  // `accountant` (who hold the `audit` read in ROLE_ACCESS) could load the
+  // view; every other role would see an empty page despite having actions
+  // recorded against them.
+  //
+  // The scoping is enforced here, not in the handler: the caller MUST pass
+  // `actor_id` equal to their own staff_id. A request with no actor_id, or
+  // with a different id, falls through to the ordinary role matrix and is
+  // refused for any role that does not hold the `audit` read. So this widens
+  // nothing — a non-manager still cannot read another person's actions or the
+  // system-wide trail.
+  if (
+    method.toUpperCase() === 'GET' &&
+    (pathname === '/api/audit' || pathname === '/api/audit-log')
+  ) {
+    const requestedActor = url && url.searchParams
+      ? url.searchParams.get('actor_id') || url.searchParams.get('actorId')
+      : null;
+    if (requestedActor && auth.staff_id && String(requestedActor) === String(auth.staff_id)) {
+      return { ok: true, auth };
+    }
   }
 
   if (!roleMayAccess(role, pathname, method)) {

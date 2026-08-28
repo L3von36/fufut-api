@@ -237,7 +237,7 @@ export default {
     }
 
     // ── Authorization gate ──────────────────────────────────────────────
-    const decision = await authorize(request, env, pathname, method.toUpperCase());
+    const decision = await authorize(request, env, pathname, method.toUpperCase(), url);
     if (!decision.ok) return decision.response;
 
     const response = await route(pathname, method, url, request, env, ctx, decision.auth);
