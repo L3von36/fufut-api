@@ -180,10 +180,11 @@ const ROLE_ACCESS = {
     // Recipes, stock movements and suppliers all belong to the person who owns
     // food cost. Purchases are readable — they need to see what arrived and at
     // what price — but committing spend stays with the manager.
-    read: ['orders', 'inventory', 'waste', 'expenses', 'recipes', 'units', 'suppliers', 'purchases'],
+    read: ['orders', 'inventory', 'waste', 'expenses', 'recipes', 'units', 'suppliers', 'purchases', 'alerts'],
     // menu-availability lets them 86 a dish that has run out. The menu itself
-    // stays manager-only, so pricing is untouched.
-    write: ['orders', 'inventory', 'waste', 'menu-availability', 'recipes'],
+    // stays manager-only, so pricing is untouched. Acknowledging an alert is
+    // a kitchen act — "I have this ticket" — so the board's owner signs it.
+    write: ['orders', 'inventory', 'waste', 'menu-availability', 'recipes', 'alerts'],
   },
   // Reads stock, does not own it. Monitoring levels, ordering supplies and
   // controlling food cost belong to the head chef; an assistant executes
@@ -191,8 +192,9 @@ const ROLE_ACCESS = {
   // stock take stops reconciling.
   'assistant-chef': {
     // Reads recipes because they cook from them; writes none of it, for the
-    // same reason they do not own the stock counts.
-    read: ['orders', 'inventory', 'recipes', 'units'],
+    // same reason they do not own the stock counts. Reads alerts because the
+    // ticket going late is theirs to rescue — they just cannot sign it off.
+    read: ['orders', 'inventory', 'recipes', 'units', 'alerts'],
     write: ['orders'],
   },
   'head-waiter': {
@@ -200,15 +202,15 @@ const ROLE_ACCESS = {
     // writes tips because a tip left on the table is theirs to record. Cannot
     // write payments: taking the money is the cashier's, and a floor tablet
     // that can mark a bill paid is a hole with no compensating control.
-    read: ['orders', 'tables', 'reservations', 'payments', 'tips'],
-    write: ['orders', 'tables', 'reservations', 'tips'],
+    read: ['orders', 'tables', 'reservations', 'payments', 'tips', 'alerts'],
+    write: ['orders', 'tables', 'reservations', 'tips', 'alerts'],
   },
   cashier: {
-    read: ['orders', 'tables', 'reservations', 'expenses', 'staff', 'timeclock', 'cashdrawer', 'payments', 'tips', 'delivery'],
+    read: ['orders', 'tables', 'reservations', 'expenses', 'staff', 'timeclock', 'cashdrawer', 'payments', 'tips', 'delivery', 'alerts'],
     // `upload` is the transfer screenshot that §9 requires against a Telebirr,
     // CBE or bank payment. Without it the evidence has nowhere to go and the
     // verification step has nothing to verify against.
-    write: ['orders', 'tables', 'reservations', 'timeclock', 'cashdrawer', 'payments', 'tips', 'delivery', 'upload'],
+    write: ['orders', 'tables', 'reservations', 'timeclock', 'cashdrawer', 'payments', 'tips', 'delivery', 'upload', 'alerts'],
   },
   // A driver needs the order behind the job — what is in the bag, what it comes
   // to, and whether it is already paid — plus a way to record the cash or the
@@ -217,7 +219,7 @@ const ROLE_ACCESS = {
   // manager, so the money the driver reports is still checked by the till when
   // they get back.
   'delivery-staff': {
-    read: ['delivery', 'orders', 'payments', 'tips'],
+    read: ['delivery', 'orders', 'payments', 'tips', 'alerts'],
     // Uploads for the same reason as the cashier: the screenshot is taken on
     // the doorstep, and a driver who can record a transfer but not photograph
     // it has to write the reference on their hand and type it in later.
@@ -378,7 +380,11 @@ export function resourceForPath(pathname) {
   if (head === 'menu' && parts[3] === 'availability') return 'menu-availability';
   if (head === 'menus') return 'menu';
   if (head === 'save-content') return 'content';
-  if (head === 'events') return parts[2] === 'kitchen' ? 'orders' : 'tables';
+  if (head === 'events') {
+    if (parts[2] === 'kitchen') return 'orders';
+    if (parts[2] === 'alerts') return 'alerts';
+    return 'tables';
+  }
   return head;
 }
 

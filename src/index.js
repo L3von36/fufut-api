@@ -19,6 +19,7 @@ import { authorize, redactStaffForRole } from './auth.js';
 
 import { handleContent, checkScheduledPublish } from './handlers/content.js';
 import { handleOrders, loadStaleHours } from './handlers/orders.js';
+import { handleAlerts, runAlertSweep } from './handlers/alerts.js';
 import { handlePayments } from './handlers/payments.js';
 import { handleAudit } from './handlers/audit.js';
 import { handleDelivery } from './handlers/delivery.js';
@@ -107,8 +108,9 @@ async function route(pathname, method, url, request, env, ctx, auth) {
     return handlePublicStats(env);
   }
 
-  if (pathname === '/api/events/tables' || pathname === '/api/events/kitchen') {
-    return handleSSE(request, env, pathname.endsWith('tables') ? 'tables' : 'kitchen');
+  if (pathname === '/api/events/tables' || pathname === '/api/events/kitchen' || pathname === '/api/events/alerts') {
+    const channel = pathname.endsWith('tables') ? 'tables' : pathname.endsWith('alerts') ? 'alerts' : 'kitchen';
+    return handleSSE(request, env, channel);
   }
 
   // Sync between the box and the cloud. Authorised in auth.js — the three
@@ -162,6 +164,11 @@ async function route(pathname, method, url, request, env, ctx, auth) {
     const r = await handleCustomers(pathname, method, url, request, env, auth);
     if (r !== null) return r;
   }
+
+  // Alerts read their own resource: the rules the sweep writes are what the
+  // floor acts on. Gated per role below, in the matrix.
+  const alerts = await handleAlerts(pathname, method, url, request, env, auth);
+  if (alerts !== null) return alerts;
 
   // Must precede handleResources: it enriches GET /api/tables with the current
   // reservation hold, and gates seating a reserved table. It returns null to
@@ -262,8 +269,9 @@ export default {
     return response;
   },
 
-  // Cron: publish any content scheduled for now, and put back tables that
-  // nobody cleared. Both are things that only happen if something asks.
+  // Cron: publish any content scheduled for now, put back tables that nobody
+  // cleared, and run the SLA rules over live orders. All three only happen if
+  // something asks — this is the something.
   async scheduled(event, env, ctx) {
     await checkScheduledPublish(env);
     try {
@@ -273,6 +281,15 @@ export default {
       // A sweep that fails must not stop the scheduled publish, and there is
       // nobody to tell — the next minute tries again.
       console.error('[SWEEP] tables', e);
+    }
+    try {
+      const r = await runAlertSweep(env);
+      if (!r.skipped && (r.raised || r.changed || r.resolved)) {
+        console.log('[SWEEP] alerts', JSON.stringify(r));
+      }
+    } catch (e) {
+      // Same contract as the tables sweep: fail alone, try again next minute.
+      console.error('[SWEEP] alerts', e);
     }
   },
 };

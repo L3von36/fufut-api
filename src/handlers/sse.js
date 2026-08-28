@@ -30,6 +30,12 @@ async function handleSSE(request, env, channel) {
             const { results } = await d1Query(env, "SELECT * FROM tables ORDER BY created DESC");
             eventName = "table_update";
             payload = { tables: (results || []).map((r) => mapResourceRow("tables", r)) };
+          } else if (channel === "alerts") {
+            // Open alerts only: a resolved or acknowledged alert leaving the
+            // feed is the point — the banner goes away when the floor fixes it.
+            const { results } = await d1Query(env, "SELECT * FROM alerts WHERE status = 'open' ORDER BY created DESC LIMIT 100");
+            eventName = "alerts_update";
+            payload = { alerts: results || [] };
           } else {
             const { results } = await d1Query(env, "SELECT * FROM orders WHERE status NOT IN ('completed','cancelled','fulfilled') ORDER BY created DESC");
             const rows = (results || []).map((o) => Object.assign({}, o, { tableNum: o.table_id || o.table_number || null, table_number: o.table_id || o.table_number || null }));
