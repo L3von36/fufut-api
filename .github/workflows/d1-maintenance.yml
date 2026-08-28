@@ -1,0 +1,35 @@
+name: D1 maintenance
+
+# Manual, one-statement-at-a-time access to the production D1 database for
+# ops work (inspection, targeted data fixes) when a laptop with wrangler is
+# not available. Runs with the same secrets the deploy workflow uses, so the
+# token's own D1 permission scope is the gate.
+#
+# Deliberately dispatch-only: nothing here runs on push, so routine CI can
+# never mutate data. Every execution is attributable through the Actions log
+# (the run records who triggered it and the exact SQL).
+
+on:
+  workflow_dispatch:
+    inputs:
+      sql:
+        description: 'SQL to execute against production fufut-db (use --json output in the run log)'
+        required: true
+        type: string
+
+concurrency:
+  group: d1-maintenance
+  cancel-in-progress: false
+
+jobs:
+  exec:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Execute against production D1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SQL: ${{ inputs.sql }}
+        run: |
+          npx --yes wrangler@4 d1 execute fufut-db --remote --json --command "$SQL"
