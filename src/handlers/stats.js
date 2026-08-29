@@ -16,9 +16,13 @@
  *   non-voided orders. Food is not a cup.
  * - yearsServing — this year minus `venue.founded_year`. Tick-over is
  *   automatic; the setting is the only input.
- * - awards — external recognition is not something the POS can count. It
- *   stays curated in `stats.awards`, but in the settings table rather than
- *   the HTML, so changing it is a setting, not a deploy.
+ * - awards, coffeeOrigins, happyPercent — external/brand facts the till cannot
+ *   count (a roaster list is not an order line; satisfaction is not a column).
+ *   Each stays curated in settings (`stats.awards`, `stats.coffee_origins`,
+ *   `stats.happy_percent`) rather than in HTML, so changing one is a setting,
+ *   not a deploy. The website matches values to slots by these keys — never
+ *   by position — so adding a metric here cannot put an order count under the
+ *   "Happy Percent" label again.
  *
  * The two counts can be topped up with a pre-POS baseline
  * (`stats.baseline_customers`, `stats.baseline_cups`) so the venue's real
@@ -86,5 +90,7 @@ export async function handlePublicStats(env) {
     cupsServed: cupsCount + Math.max(0, Math.round(num(settings['stats.baseline_cups'], 0))),
     yearsServing: Math.max(0, new Date().getFullYear() - foundedYear),
     awards: Math.max(0, Math.round(num(settings['stats.awards'], 14))),
+    coffeeOrigins: Math.max(0, Math.round(num(settings['stats.coffee_origins'], 3))),
+    happyPercent: Math.min(100, Math.max(0, Math.round(num(settings['stats.happy_percent'], 99)))),
   });
 }
