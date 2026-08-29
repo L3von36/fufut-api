@@ -166,19 +166,101 @@ function isManager(auth) {
   return String(role || '').toLowerCase() === 'manager';
 }
 
+/**
+ * Who should see each alert rule.
+ *
+ * Before this map existed, every role with `alerts` read permission saw every
+ * open alert — so the chef's kitchen tablet showed "Table 3 seated 1h 31min"
+ * and "Takeaway served 30 min ago, bill still open", neither of which the
+ * kitchen can act on. The chef ignored the banner, which is the same as not
+ * having one.
+ *
+ * The map is keyed by `rule_id` (stable strings from RULE_IDS) and the value
+ * is the set of roles that should see alerts raised by that rule. A manager
+ * always sees everything — they are the floor's fallback for any problem.
+ *
+ * Order rules split by stage:
+ *   - PREPARING_TOO_LONG, NEW_UNACCEPTED — kitchen's clock, kitchen's job
+ *   - READY_NOT_SERVED — kitchen marked it ready, but the waiter is who
+ *     needs to fetch it. Both need to see it (the kitchen to know the food
+ *     is sitting, the waiter to know it is theirs to pick up).
+ *   - SERVED_UNPAID — money on the floor. Cashier owns it; head-waiter can
+ *     remind the guest. The kitchen has no part in this.
+ *
+ * Filtering by `rule_id` rather than `entity_type` is deliberate: an order
+ * can be the entity behind four different rules with four different
+ * audiences, and `entity_type='order'` alone cannot tell them apart.
+ */
+const RULE_AUDIENCE = {
+  'order-preparing-too-long':     new Set(['manager', 'head-chef', 'assistant-chef']),
+  'order-new-unaccepted':         new Set(['manager', 'head-chef', 'assistant-chef']),
+  'order-ready-not-served':       new Set(['manager', 'head-chef', 'assistant-chef', 'head-waiter']),
+  'order-served-unpaid':          new Set(['manager', 'cashier', 'head-waiter']),
+  'delivery-ready-unassigned':    new Set(['manager', 'delivery-staff']),
+  'delivery-in-transit-too-long': new Set(['manager', 'delivery-staff']),
+  'reservation-no-show':          new Set(['manager', 'head-waiter']),
+  'table-seated-too-long':        new Set(['manager', 'head-waiter']),
+};
+
+/**
+ * The rule_ids a given role should see, as a SQL IN-list placeholder string
+ * (e.g. `'order-preparing-too-long','order-new-unaccepted'`). Returns `null`
+ * for a manager — they see every rule, so no WHERE clause is needed.
+ *
+ * Also returns `null` when `auth` is missing (anonymous caller — the auth
+ * gate should have refused the request already, but defense in depth).
+ */
+function ruleWhitelistForRole(auth) {
+  if (!auth) return null;
+  const role = String(auth.sessionRole || auth.role || '').toLowerCase();
+  if (!role) return null;
+  if (role === 'manager') return null; // manager sees everything
+  const allowed = new Set();
+  for (const [ruleId, roles] of Object.entries(RULE_AUDIENCE)) {
+    if (roles.has(role)) allowed.add(ruleId);
+  }
+  if (!allowed.size) return []; // role has no business seeing any alert
+  return [...allowed];
+}
+
 /** GET /api/alerts — open by default, ?status=… or ?all=1 to widen. */
-async function listAlerts(url, env) {
+async function listAlerts(url, env, auth) {
   const wantsAll = ['1', 'true', 'yes'].includes(String(url.searchParams.get('all') || '').toLowerCase());
   const statusParam = String(url.searchParams.get('status') || 'open').toLowerCase().trim();
   const limitRaw = num(url.searchParams.get('limit'));
   const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 500) : 200;
 
+  // Role-targeted filtering: only managers see every alert. Everyone else
+  // sees only the rules in their audience. Applied on top of the status
+  // filter so a head-chef asking for ?status=acknowledged still only sees
+  // kitchen-relevant acked rows, not the cashier's.
+  const allowedRules = ruleWhitelistForRole(auth);
+  // `wantsAll` is a manager's tool (the SLA Alerts dashboard "show history"
+  // toggle). A non-manager who somehow passes ?all=1 still gets the
+  // role filter applied — they cannot widen their view by adding a param.
+  const managerSeesAll = allowedRules === null;
+
   let rows;
-  if (wantsAll) {
+  if (wantsAll && managerSeesAll) {
     ({ results: rows } = await d1Query(env, 'SELECT * FROM alerts ORDER BY created DESC LIMIT ?', [limit]));
   } else {
     const status = ['open', 'acknowledged', 'resolved'].includes(statusParam) ? statusParam : 'open';
-    ({ results: rows } = await d1Query(env, 'SELECT * FROM alerts WHERE status = ? ORDER BY created DESC LIMIT ?', [status, limit]));
+    if (managerSeesAll) {
+      ({ results: rows } = await d1Query(env, 'SELECT * FROM alerts WHERE status = ? ORDER BY created DESC LIMIT ?', [status, limit]));
+    } else if (allowedRules.length === 0) {
+      // Role is not in any audience — return nothing rather than every row
+      // the gate would otherwise expose. (Defense in depth: the auth matrix
+      // should also refuse them the resource, but if it ever lets them
+      // through, this is the second door.)
+      rows = [];
+    } else {
+      const placeholders = allowedRules.map(() => '?').join(',');
+      ({ results: rows } = await d1Query(
+        env,
+        `SELECT * FROM alerts WHERE status = ? AND rule_id IN (${placeholders}) ORDER BY created DESC LIMIT ?`,
+        [status, ...allowedRules, limit]
+      ));
+    }
   }
   return json({ ok: true, alerts: rows || [] });
 }
@@ -256,7 +338,7 @@ async function handleAlerts(pathname, method, url, request, env, auth) {
   const m = String(method || '').toUpperCase();
   const sub = pathname.replace(/^\/api\/alerts/, '');
 
-  if (m === 'GET' && (sub === '' || sub === '/')) return listAlerts(url, env);
+  if (m === 'GET' && (sub === '' || sub === '/')) return listAlerts(url, env, auth);
   if (m === 'GET' && sub === '/summary') return alertSummary(env);
   if (m === 'POST' && sub === '/acknowledge-all') return acknowledgeAll(env, auth);
   const ack = sub.match(/^\/([^/]+)\/acknowledge$/);
