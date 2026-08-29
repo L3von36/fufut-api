@@ -138,14 +138,14 @@ async function route(pathname, method, url, request, env, ctx, auth) {
   }
 
   if (pathname.startsWith('/api/orders')) {
-    const r = await handleOrders(pathname, method, url, request, env, auth);
+    const r = await handleOrders(pathname, method, url, request, env, ctx, auth);
     if (r !== null) return r;
   }
   // Payments and tips are separate resources from orders on purpose: a waiter
   // may take an order and may not verify a bank transfer, and a tip is not
   // revenue. Gated independently in the role matrix for both reasons.
   if (pathname.startsWith('/api/payments') || pathname.startsWith('/api/tips')) {
-    const r = await handlePayments(pathname, method, url, request, env, auth);
+    const r = await handlePayments(pathname, method, url, request, env, ctx, auth);
     if (r !== null) return r;
   }
   if (pathname.startsWith('/api/audit')) {

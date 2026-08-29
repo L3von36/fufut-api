@@ -37,7 +37,16 @@ async function handleSSE(request, env, channel) {
             eventName = "alerts_update";
             payload = { alerts: results || [] };
           } else {
-            const { results } = await d1Query(env, "SELECT * FROM orders WHERE status NOT IN ('completed','cancelled','fulfilled') ORDER BY created DESC");
+            // Kitchen tick: every active order on the board. Bounded because a
+            // busy week puts thousands of rows in `orders`, and every connected
+            // kitchen/pipeline client runs this query every 10s — without a
+            // LIMIT the SSE tick becomes a full-table scan that grows linearly
+            // with the order history, and the per-tick latency grows with it.
+            // 200 covers a full service day with headroom; older history is
+            // not what the kitchen board needs anyway (terminal states are
+            // filtered out below, and the board is interested in what is open
+            // *right now*).
+            const { results } = await d1Query(env, "SELECT * FROM orders WHERE status NOT IN ('completed','cancelled','fulfilled') ORDER BY created DESC LIMIT 200");
             const rows = (results || []).map((o) => Object.assign({}, o, { tableNum: o.table_id || o.table_number || null, table_number: o.table_id || o.table_number || null }));
             eventName = "new_order";
             payload = { orders: rows };

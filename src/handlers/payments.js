@@ -24,7 +24,7 @@
  *    `orderFinancials()` below is the one place that subtraction is expressed.
  */
 
-import { d1Query, d1Run, json, readBody } from '../lib/db.js';
+import { d1Query, d1Run, json, readBody, fireAndForget } from '../lib/db.js';
 import { writeAudit } from '../lib/audit.js';
 import { actorName, isManager } from '../auth.js';
 import { addToOpenDrawerCash } from '../lib/drawer.js';
@@ -192,16 +192,18 @@ async function recordPayment(request, env, auth) {
   );
 
   const fin = await refreshPaymentStatus(env, orderId);
-  await writeAudit(env, auth, {
+  fireAndForget(ctx, writeAudit(env, auth, {
     action: 'create',
     entity: 'payments',
     entityId: id,
     after: { order_id: orderId, method, amount, reference: data.reference || null, status },
-  });
+  }));
 
   // A cash payment made directly against an order (a driver collecting on the
   // doorstep, a cashier taking a part-payment) lands in the same open till.
-  if (method === 'cash' && amount > 0) await addToOpenDrawerCash(env, amount);
+  // Drawer tally is eventually-consistent — deferred so the cashier's
+  // "Recorded" toast is not blocked on a drawer read+update.
+  if (method === 'cash' && amount > 0) fireAndForget(ctx, addToOpenDrawerCash(env, amount));
 
   return json({
     ok: true,
@@ -249,14 +251,14 @@ async function verifyPayment(request, env, auth, paymentId) {
   );
 
   const fin = await refreshPaymentStatus(env, payment.order_id);
-  await writeAudit(env, auth, {
+  fireAndForget(ctx, writeAudit(env, auth, {
     action: 'verify',
     entity: 'payments',
     entityId: paymentId,
     before: { status: payment.status },
     after: { status },
     reason: data.reason || null,
-  });
+  }));
 
   return json({ ok: true, status, order: fin });
 }
@@ -317,20 +319,22 @@ async function refundPayment(request, env, auth, paymentId) {
 
   // Cash handed back leaves the till it went into, so an open drawer's tally
   // comes down by the same figure. A refund after the drawer closed leaves no
-  // drawer to adjust — the Z-report stands as counted.
+  // drawer to adjust — the Z-report stands as counted. Deferred: the drawer is
+  // eventually-consistent, and a refund confirmation must not wait on a drawer
+  // read+update.
   if (String(original.method || '').toLowerCase() === 'cash') {
-    await addToOpenDrawerCash(env, -requested);
+    fireAndForget(ctx, addToOpenDrawerCash(env, -requested));
   }
 
   const fin = await refreshPaymentStatus(env, original.order_id);
-  await writeAudit(env, auth, {
+  fireAndForget(ctx, writeAudit(env, auth, {
     action: 'refund',
     entity: 'payments',
     entityId: paymentId,
     before: { amount: original.amount, status: original.status },
     after: { refund_id: id, amount: -requested, status: 'refunded' },
     reason: String(data.reason).trim(),
-  });
+  }));
 
   return json({ ok: true, id, refunded: requested, order: fin });
 }
@@ -418,12 +422,12 @@ async function recordTip(request, env, auth) {
     ]
   );
 
-  await writeAudit(env, auth, {
+  fireAndForget(ctx, writeAudit(env, auth, {
     action: 'create',
     entity: 'tips',
     entityId: id,
     after: { order_id: data.orderId || null, staff_id: staffId, amount },
-  });
+  }));
 
   return json({ ok: true, id });
 }
@@ -478,7 +482,13 @@ async function tipSummary(env, url) {
 
 // ── Router ──────────────────────────────────────────────────────────────────
 
-export async function handlePayments(pathname, method, url, request, env, auth) {
+export async function handlePayments(pathname, method, url, request, env, ctx, auth) {
+  // Backwards-compat shim: see handleOrders for the rationale. If the 6th
+  // argument is an auth object rather than a Worker ctx, treat it as auth.
+  if (ctx && typeof ctx === 'object' && !('waitUntil' in ctx) && (auth === undefined)) {
+    auth = ctx;
+    ctx = null;
+  }
   const m = method.toUpperCase();
 
   if (pathname.startsWith('/api/payments')) {

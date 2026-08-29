@@ -278,6 +278,12 @@ describe('Finding 5: POST /api/orders links reservation.order_id', () => {
     const res = await handleOrders(ctx.pathname, ctx.method, ctx.url, ctx.request, env, WAITER);
     expect(res.status).toBe(200);
 
+    // The reservation-link UPDATE is deferred via fireAndForget (it is a
+    // best-effort nightly-reporting link, not on the order's critical path).
+    // Let the microtask queue drain so the deferred promise has run before
+    // we assert against the captured bound params.
+    await new Promise((r) => setTimeout(r, 0));
+
     const linkUpd = boundParams.find(
       (b) => /UPDATE reservations\s+SET order_id = \?/.test(b.sql) && b.sql.includes("status = 'seated'")
     );

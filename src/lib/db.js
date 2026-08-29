@@ -63,4 +63,37 @@ function stripMeta(content) {
   }
   return clean;
 }
-export { D1_BINDING, json, readBody, now, vid, d1Query, d1Run, d1Batch, stripMeta };
+
+/**
+ * Run a non-critical promise without blocking the response.
+ *
+ * Cloudflare Workers extend the lifetime of a request past its response via
+ * `ctx.waitUntil()` — the response is returned immediately and the deferred
+ * work runs on the same isolate until it resolves or the runtime reaps it.
+ *
+ * This is the right home for audit writes, best-effort reservation links,
+ * cash-drawer tallies and anything else whose failure must not fail the action
+ * it describes. Audit's own `writeAudit` already swallows errors, but it
+ * currently `await`s the INSERT on the request path, adding latency to every
+ * mutating handler. Wrapping the call here instead moves it off the hot path
+ * without changing failure semantics.
+ *
+ * If `ctx` is unavailable (e.g. a unit test invoking a handler directly),
+ * the promise is still kicked off and errors are swallowed — so a handler
+ * test does not need to construct a fake `ctx` to use this.
+ */
+function fireAndForget(ctx, promise) {
+  if (!promise || typeof promise.then !== 'function') return;
+  const safe = (typeof promise.catch === 'function')
+    ? promise.catch((e) => console.error('[fireAndForget]', e))
+    : promise;
+  try {
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(safe);
+    }
+  } catch {
+    // ctx.waitUntil is optional in some test runtimes; the promise still runs.
+  }
+}
+
+export { D1_BINDING, json, readBody, now, vid, d1Query, d1Run, d1Batch, stripMeta, fireAndForget };

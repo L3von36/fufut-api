@@ -1,4 +1,4 @@
-import { d1Query, d1Run, d1Batch, json, readBody } from '../lib/db.js';
+import { d1Query, d1Run, d1Batch, json, readBody, fireAndForget } from '../lib/db.js';
 import { writeAudit } from '../lib/audit.js';
 import { actorName, isManager } from '../auth.js';
 import { refreshPaymentStatus } from './payments.js';
@@ -8,7 +8,6 @@ import { consumeForOrder, reverseOrderConsumption } from '../lib/ledger.js';
 import { blocksSeating, ACTIVE_STATUSES } from '../lib/booking.js';
 import { venueStatus } from '../lib/venue.js';
 import { keysMatch } from '../lib/tablekey.js';
-import { getAuthUser } from './session.js';
 import {
   normaliseTableId,
   ticketStale,
@@ -914,7 +913,18 @@ export async function autoCompleteStaleOrders(env, nowMs = Date.now()) {
   return { closed, thresholdMin: minutes };
 }
 
-async function handleOrders(pathname, method, url, request, env, auth) {
+async function handleOrders(pathname, method, url, request, env, ctx, auth) {
+  // Backwards-compat shim: existing tests and any external callers pass the
+  // 6th argument as `auth` (the original signature was
+  //   handleOrders(pathname, method, url, request, env, auth)
+  // before `ctx` was threaded in for ctx.waitUntil). If the 6th argument
+  // looks like an auth object rather than a Worker ctx, treat it as auth.
+  // A Worker ctx has `waitUntil`; an auth object has `staff_id`/`sessionRole`.
+  // This keeps every existing test working without modification.
+  if (ctx && typeof ctx === 'object' && !('waitUntil' in ctx) && (auth === undefined)) {
+    auth = ctx;
+    ctx = null;
+  }
   const m = method.toUpperCase();
   const sub = pathname.replace(/^\/api\/orders/, "");
   if (m === "GET" && sub === "") {
@@ -928,7 +938,14 @@ async function handleOrders(pathname, method, url, request, env, auth) {
       const { results } = await d1Query(env, "SELECT * FROM orders WHERE table_id = ? ORDER BY created DESC", [String(tableFilter)]);
       rows = results || [];
     } else {
-      const { results } = await d1Query(env, "SELECT * FROM orders ORDER BY created DESC");
+      // Default list. The POS KitchenView and PipelineView call this on every
+      // refresh, so an unbounded SELECT * against every order ever taken is
+      // the wrong default — a busy week puts thousands of rows in here, and
+      // each row carries items, notes, customer_phone… the response gets big
+      // enough to dominate the request. LIMIT 200 covers a full service day
+      // with headroom; older history is reachable via the dedicated reports
+      // endpoints which already paginate.
+      const { results } = await d1Query(env, "SELECT * FROM orders ORDER BY created DESC LIMIT 200");
       rows = results || [];
     }
     return json(rows.map(mapOrderRow));
@@ -947,11 +964,14 @@ async function handleOrders(pathname, method, url, request, env, auth) {
      * the fallback when the box is down but the line is up, and closing that
      * would take the till offline at precisely the wrong moment.
      */
-    // `auth` is null here even for a signed-in waiter: this route is in PUBLIC,
-    // so the gate returns before it ever looks for a session. Resolving it
-    // explicitly is the only way to tell a customer from a member of staff,
-    // and getting that wrong would refuse the till instead of the website.
-    const actor = auth || (await getAuthUser(request, env));
+    // `auth` is resolved by authorize() even for this anonymous-write route:
+    // ANONYMOUS_WRITES is checked *after* getAuthUser in auth.js, so a signed-in
+    // waiter reaches here with `auth` already populated. The previous code
+    // called getAuthUser() a second time, which is one D1 round-trip per order
+    // for nothing — `auth` already holds the same value the second call would
+    // return. Anonymous callers (no session cookie) get `auth === null` and
+    // stay anonymous, which is exactly what the gate intended.
+    const actor = auth;
 
     if (!actor) {
       const venue = await venueStatus(env);
@@ -1154,7 +1174,10 @@ async function handleOrders(pathname, method, url, request, env, auth) {
       const delivery = await createDeliveryJob(env, auth, id, data, orderType);
       if (delivery.warning) followUps.push(delivery.warning);
 
-      await writeAudit(env, auth, {
+      // Audit is non-critical: a failed write is swallowed inside writeAudit
+      // and must not delay the order reaching the kitchen. ctx.waitUntil keeps
+      // the promise alive past the response without blocking it.
+      fireAndForget(ctx, writeAudit(env, auth, {
         action: "create",
         entity: "orders",
         entityId: id,
@@ -1169,7 +1192,7 @@ async function handleOrders(pathname, method, url, request, env, auth) {
           // guest) from a probing campaign (repriced every time).
           ...(guestRepriced ? { guest_repriced: true } : {}),
         },
-      });
+      }));
 
       // Finding 5 (B+ sim): a reservation marked "seated" on the same table
       // carries no join key to the order that fulfilled it, so nightly
@@ -1186,39 +1209,45 @@ async function handleOrders(pathname, method, url, request, env, auth) {
       // reservations handler returns the explicit `id`. Look up the row to
       // get both forms and try each — order id, table number as a string, and
       // the raw value the caller sent.
+      // Best-effort reservation link — see comment above. A missed link only
+      // affects nightly reporting, never ordering, so it must not sit on the
+      // request path. Deferred via ctx.waitUntil so the waiter's "Sent" toast
+      // does not wait on a SELECT + UPDATE against the reservations table.
       if (tableId) {
-        try {
-          const tableRow = await resolveTableRow(env, tableId);
-          const tableIdCandidates = new Set();
-          tableIdCandidates.add(String(tableId));
-          if (tableRow) {
-            if (tableRow.id) tableIdCandidates.add(String(tableRow.id));
-            if (tableRow.number !== undefined && tableRow.number !== null) {
-              tableIdCandidates.add(String(tableRow.number));
+        fireAndForget(ctx, (async () => {
+          try {
+            const tableRow = await resolveTableRow(env, tableId);
+            const tableIdCandidates = new Set();
+            tableIdCandidates.add(String(tableId));
+            if (tableRow) {
+              if (tableRow.id) tableIdCandidates.add(String(tableRow.id));
+              if (tableRow.number !== undefined && tableRow.number !== null) {
+                tableIdCandidates.add(String(tableRow.number));
+              }
             }
+            // Build IN (?, ?, ?) with the same number of placeholders as candidates.
+            const candidates = Array.from(tableIdCandidates);
+            const placeholders = candidates.map(() => '?').join(', ');
+            await d1Run(
+              env,
+              `UPDATE reservations
+                  SET order_id = ?, updated_at = ?
+                WHERE id = (
+                  SELECT id FROM reservations
+                   WHERE table_id IN (${placeholders})
+                     AND status = 'seated'
+                     AND order_id IS NULL
+                     AND released_at IS NULL
+                     AND no_show_at IS NULL
+                   ORDER BY updated_at DESC LIMIT 1
+                )`,
+              [id, nowIso, ...candidates]
+            );
+          } catch (e) {
+            // A reservation-link failure must never cost the guest their order.
+            console.error('[ORDERS] reservation link failed:', e);
           }
-          // Build IN (?, ?, ?) with the same number of placeholders as candidates.
-          const candidates = Array.from(tableIdCandidates);
-          const placeholders = candidates.map(() => '?').join(', ');
-          await d1Run(
-            env,
-            `UPDATE reservations
-                SET order_id = ?, updated_at = ?
-              WHERE id = (
-                SELECT id FROM reservations
-                 WHERE table_id IN (${placeholders})
-                   AND status = 'seated'
-                   AND order_id IS NULL
-                   AND released_at IS NULL
-                   AND no_show_at IS NULL
-                 ORDER BY updated_at DESC LIMIT 1
-              )`,
-            [id, nowIso, ...candidates]
-          );
-        } catch (e) {
-          // A reservation-link failure must never cost the guest their order.
-          console.error('[ORDERS] reservation link failed:', e);
-        }
+        })());
       }
 
       const warnings = [tracking.warning, ...followUps].filter(Boolean);
@@ -1414,13 +1443,13 @@ async function handleOrders(pathname, method, url, request, env, auth) {
       );
     }
 
-    await writeAudit(env, auth, {
+    fireAndForget(ctx, writeAudit(env, auth, {
       action: "update",
       entity: "orders",
       entityId: orderId,
       before: { total: order.total, items: order.items },
       after: { total, items: itemsSummary, addedLines: tracking.inserted },
-    });
+    }));
 
     return json({
       ok: true,
@@ -1627,14 +1656,14 @@ async function handleOrders(pathname, method, url, request, env, auth) {
       new Date().toISOString(),
       orderId,
     ]);
-    await writeAudit(env, auth, {
+    fireAndForget(ctx, writeAudit(env, auth, {
       action: "update",
       entity: "orders",
       entityId: orderId,
       before: { status: "new" },
       after: { status: "confirmed" },
       reason: `Table order accepted by ${actorName(auth)}`,
-    });
+    }));
 
     return json({ ok: true, id: orderId, status: "confirmed" });
   }
@@ -1817,8 +1846,13 @@ async function handleOrders(pathname, method, url, request, env, auth) {
     // The chef marking food ready is what should put a delivery in front of a
     // driver. Before this, somebody had to remember to move the job by hand on
     // a second screen, which is the kind of step that gets skipped at 8pm.
-    if (data.status !== void 0) {
-      await syncDeliveryToOrderStatus(env, id, data.status);
+    //
+    // Guarded by the order's type so a non-delivery PUT does not pay for a
+    // DB round-trip that will always be a no-op. The helper itself is also
+    // fail-open: if it throws, the order status change has already happened
+    // and the delivery sync is the only thing that did not.
+    if (data.status !== void 0 && before && String(before.type || '').toLowerCase() === 'delivery') {
+      try { await syncDeliveryToOrderStatus(env, id, data.status); } catch { /* delivery sync is best-effort */ }
     }
 
     // ── Sale → recipe → ingredient consumption ──────────────────────────────
@@ -1865,7 +1899,7 @@ async function handleOrders(pathname, method, url, request, env, auth) {
       if (tipResult.warning) followSettlementWarnings.push(tipResult.warning);
     }
 
-    await writeAudit(env, auth, {
+    fireAndForget(ctx, writeAudit(env, auth, {
       action: "update",
       entity: "orders",
       entityId: id,
@@ -1875,7 +1909,7 @@ async function handleOrders(pathname, method, url, request, env, auth) {
           .map((f, i) => [f.split(" ")[0], values[i]])
           .filter(([c]) => c !== "updated_at")
       ),
-    });
+    }));
 
     const warnings = [consumptionWarning, ...followSettlementWarnings].filter(Boolean);
     return json({ ok: true, updated_at: nowIso, warning: warnings.length ? warnings.join(" ") : undefined });
@@ -2040,14 +2074,14 @@ async function handleOrders(pathname, method, url, request, env, auth) {
       restocked = reversal.posted || 0;
     }
 
-    await writeAudit(env, auth, {
+    fireAndForget(ctx, writeAudit(env, auth, {
       action: "void",
       entity: "orders",
       entityId: id,
       before: { status: order.status, total: order.total },
       after: { status: "cancelled", voided_at: nowIso, void_category: voidCategory, auto_refunded: autoRefunded },
       reason: reason || null,
-    });
+    }));
 
     return json({ ok: true, voided: true, id, restocked, void_category: voidCategory, auto_refunded: autoRefunded, refund_ids: autoRefundIds });
   }
