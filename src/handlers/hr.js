@@ -991,5 +991,240 @@ export async function handleHR(pathname, method, url, request, env, auth) {
     }
   }
 
+  // ── Employee Activity module (Phase 1) ────────────────────────────────
+  //
+  // Two endpoints that give managers the "who worked, what did they do"
+  // visibility the existing separate views (Staff, Time Clock, Attendance,
+  // Audit Log) don't provide on their own. Both reuse the existing timeclock
+  // + audit_log tables — no new migrations needed.
+
+  if (pathname.startsWith('/api/employees')) {
+    const sub = pathname.replace(/^\/api\/employees/, '');
+
+    // GET /api/employees/activity?from=&to=
+    // Manager dashboard: who worked in the range, clock-in/out, late flags,
+    // summary cards (working today, late, absent, total hours).
+    if (m === 'GET' && (sub === '/activity' || sub === '/activity/')) {
+      if (!isManager((auth && (auth.sessionRole || auth.role)) || '')) {
+        return json({ ok: false, error: 'Only a manager can view employee activity' }, 403);
+      }
+      const sp = url.searchParams;
+      const from = sp.get('from') || today();
+      const to = sp.get('to') || today();
+
+      // Active staff (not deleted/inactive)
+      const { results: staffRows } = await d1Query(
+        env,
+        "SELECT id, firstName, lastName, role, status FROM staff WHERE status = 'active' ORDER BY firstName, lastName"
+      );
+
+      // Timeclock entries in range
+      const { results: clockRows } = await d1Query(
+        env,
+        'SELECT * FROM timeclock WHERE date >= ? AND date <= ? ORDER BY clock_in DESC',
+        [from, to]
+      );
+
+      // Build a map of staffId → timeclock entries
+      const clocksByStaff = new Map();
+      for (const c of clockRows || []) {
+        if (!clocksByStaff.has(c.staff_id)) clocksByStaff.set(c.staff_id, []);
+        clocksByStaff.get(c.staff_id).push(c);
+      }
+
+      // Build employee activity list
+      const employees = (staffRows || []).map((s) => {
+        const clocks = clocksByStaff.get(s.id) || [];
+        const latest = clocks[0]; // newest first (already sorted DESC)
+        const totalHours = clocks.reduce((sum, c) => sum + (c.hours || 0), 0);
+        const totalLate = clocks.reduce((sum, c) => sum + (c.late_minutes || 0), 0);
+        const totalOvertime = clocks.reduce((sum, c) => sum + (c.overtime_hours || 0), 0);
+        const isWorking = latest && latest.status === 'open';
+        const isLate = clocks.some((c) => (c.late_minutes || 0) > 0);
+        return {
+          id: s.id,
+          name: `${s.firstName || ''} ${s.lastName || ''}`.trim(),
+          role: s.role,
+          status: s.status,
+          isWorking,
+          clockIn: latest?.clock_in || null,
+          clockOut: latest?.clock_out || null,
+          shifts: clocks.length,
+          totalHours: Math.round(totalHours * 10) / 10,
+          totalLateMinutes: totalLate,
+          totalOvertimeHours: Math.round(totalOvertime * 10) / 10,
+          isLate,
+          attendanceStatus: latest?.attendance_status || (clocks.length ? 'present' : 'absent'),
+        };
+      });
+
+      // Summary cards
+      const workingToday = employees.filter((e) => e.isWorking).length;
+      const presentToday = employees.filter((e) => e.shifts > 0).length;
+      const lateToday = employees.filter((e) => e.isLate).length;
+      const absentToday = employees.filter((e) => e.shifts === 0).length;
+      const totalHours = employees.reduce((s, e) => s + e.totalHours, 0);
+
+      return json({
+        ok: true,
+        from,
+        to,
+        summary: {
+          totalEmployees: employees.length,
+          workingNow: workingToday,
+          presentToday,
+          lateToday,
+          absentToday,
+          totalHours: Math.round(totalHours * 10) / 10,
+        },
+        employees,
+      });
+    }
+
+    // GET /api/employees/:id/history?from=&to=
+    // Per-employee detail: profile + timeline (audit_log + timeclock merged
+    // chronologically) + role-specific KPI counts.
+    const histMatch = sub.match(/^\/([^/]+)\/history$/);
+    if (m === 'GET' && histMatch) {
+      const staffId = histMatch[1];
+      const role = String((auth && (auth.sessionRole || auth.role)) || '').toLowerCase();
+      const isMe = auth && auth.staff_id === staffId;
+      // Self can read own; manager can read anyone. Others get 403.
+      if (!isManager(role) && !isMe) {
+        return json({ ok: false, error: 'You can only view your own history' }, 403);
+      }
+
+      const sp = url.searchParams;
+      const from = sp.get('from') || today();
+      const to = sp.get('to') || today();
+
+      // Profile
+      const { results: staffRows } = await d1Query(
+        env,
+        'SELECT * FROM staff WHERE id = ?',
+        [String(staffId)]
+      );
+      const staff = (staffRows || [])[0];
+      if (!staff) return json({ ok: false, error: 'Employee not found' }, 404);
+
+      // Timeclock entries in range
+      const { results: clockRows } = await d1Query(
+        env,
+        'SELECT * FROM timeclock WHERE staff_id = ? AND date >= ? AND date <= ? ORDER BY clock_in DESC',
+        [String(staffId), from, to]
+      );
+
+      // Audit log entries in range
+      const { results: auditRows } = await d1Query(
+        env,
+        'SELECT * FROM audit_log WHERE actor_id = ? AND at >= ? AND at <= ? ORDER BY at DESC LIMIT 500',
+        [String(staffId), from, to + 'T23:59:59']
+      );
+
+      // Build a merged timeline: timeclock events + audit events, sorted by time
+      const timeline = [];
+      for (const c of clockRows || []) {
+        if (c.clock_in) timeline.push({ type: 'clock_in', at: c.clock_in, label: 'Clocked in', entry_id: c.id });
+        if (c.clock_out) timeline.push({ type: 'clock_out', at: c.clock_out, label: 'Clocked out', entry_id: c.id });
+      }
+      for (const a of auditRows || []) {
+        timeline.push({
+          type: 'audit',
+          at: a.at,
+          label: a.action,
+          entity: a.entity,
+          entity_id: a.entity_id,
+          before: a.before,
+          after: a.after,
+          reason: a.reason,
+        });
+      }
+      timeline.sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')));
+
+      // Role-specific KPIs (counts from the audit slice)
+      const countBy = (pred) => (auditRows || []).filter(pred).length;
+      const roleKey = String(staff.role || '').toLowerCase();
+      const kpis = [];
+      if (roleKey === 'manager') {
+        kpis.push(
+          { label: 'Orders Touched', value: countBy((e) => e.entity === 'orders') },
+          { label: 'Payments', value: countBy((e) => e.entity === 'payments') },
+          { label: 'Staff Edits', value: countBy((e) => e.entity === 'staff') },
+          { label: 'Attendance Corrections', value: countBy((e) => e.entity === 'timeclock') },
+        );
+      } else if (roleKey === 'head-chef' || roleKey === 'assistant-chef') {
+        kpis.push(
+          { label: 'Dishes Sent', value: countBy((e) => e.entity === 'orders' && e.after && (e.after.status === 'ready' || e.after.status === 'served')) },
+          { label: 'Tickets Started', value: countBy((e) => e.entity === 'orders' && e.after && e.after.status === 'preparing') },
+          { label: 'Inventory Adjustments', value: countBy((e) => e.entity === 'inventory') },
+          { label: 'Waste Logged', value: countBy((e) => e.entity === 'waste') },
+        );
+      } else if (roleKey === 'head-waiter') {
+        kpis.push(
+          { label: 'Orders Taken', value: countBy((e) => e.entity === 'orders' && e.action === 'create') },
+          { label: 'Tables Seated', value: countBy((e) => e.entity === 'tables' && e.after && e.after.status === 'occupied') },
+          { label: 'Tips Recorded', value: countBy((e) => e.entity === 'tips') },
+          { label: 'Reservations', value: countBy((e) => e.entity === 'reservations') },
+        );
+      } else if (roleKey === 'cashier') {
+        kpis.push(
+          { label: 'Payments Verified', value: countBy((e) => e.entity === 'payments' && (e.action === 'verify' || e.action === 'create')) },
+          { label: 'Refunds Issued', value: countBy((e) => e.entity === 'payments' && e.action === 'refund') },
+          { label: 'Cash Drawer Ops', value: countBy((e) => e.entity === 'cashdrawer') },
+          { label: 'Orders Settled', value: countBy((e) => e.entity === 'orders' && e.after && /paid|settled|completed/.test(e.after.status || '')) },
+        );
+      } else if (roleKey === 'delivery-staff') {
+        kpis.push(
+          { label: 'Jobs Taken', value: countBy((e) => e.entity === 'delivery' && e.after && e.after.status === 'assigned') },
+          { label: 'Delivered', value: countBy((e) => e.entity === 'delivery' && e.after && e.after.status === 'delivered') },
+          { label: 'Payments Recorded', value: countBy((e) => e.entity === 'payments' && e.action === 'create') },
+          { label: 'Tips', value: countBy((e) => e.entity === 'tips') },
+        );
+      } else if (roleKey === 'cleaner') {
+        kpis.push(
+          { label: 'Waste Logged', value: countBy((e) => e.entity === 'waste') },
+          { label: 'Tables Cleared', value: countBy((e) => e.entity === 'tables' && e.after && e.after.status === 'available') },
+        );
+      }
+
+      // Attendance summary
+      const totalHours = (clockRows || []).reduce((s, c) => s + (c.hours || 0), 0);
+      const totalLate = (clockRows || []).reduce((s, c) => s + (c.late_minutes || 0), 0);
+
+      return json({
+        ok: true,
+        staff: {
+          id: staff.id,
+          firstName: staff.firstName,
+          lastName: staff.lastName,
+          role: staff.role,
+          status: staff.status,
+          email: staff.email,
+          phone: staff.phone,
+        },
+        from,
+        to,
+        attendance: {
+          shifts: (clockRows || []).length,
+          totalHours: Math.round(totalHours * 10) / 10,
+          totalLateMinutes: totalLate,
+          entries: (clockRows || []).map((c) => ({
+            id: c.id,
+            date: c.date,
+            clockIn: c.clock_in,
+            clockOut: c.clock_out,
+            hours: c.hours,
+            status: c.status,
+            lateMinutes: c.late_minutes || 0,
+            overtimeHours: c.overtime_hours || 0,
+            attendanceStatus: c.attendance_status,
+          })),
+        },
+        kpis,
+        timeline: timeline.slice(0, 200), // cap for perf
+      });
+    }
+  }
+
   return null;
 }
