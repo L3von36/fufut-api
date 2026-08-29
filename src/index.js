@@ -110,7 +110,7 @@ async function route(pathname, method, url, request, env, ctx, auth) {
 
   if (pathname === '/api/events/tables' || pathname === '/api/events/kitchen' || pathname === '/api/events/alerts') {
     const channel = pathname.endsWith('tables') ? 'tables' : pathname.endsWith('alerts') ? 'alerts' : 'kitchen';
-    return handleSSE(request, env, channel);
+    return handleSSE(request, env, channel, auth);
   }
 
   // Sync between the box and the cloud. Authorised in auth.js — the three

@@ -1,12 +1,20 @@
 import { mapResourceRow } from './resources.js';
 import { d1Query } from '../lib/db.js';
+import { ruleWhitelistForRole } from './alerts.js';
 
 function sseEvent(event, data) {
   const enc = new TextEncoder();
   return enc.encode("event: " + event + "\ndata: " + JSON.stringify(data) + "\n\n");
 }
 
-async function handleSSE(request, env, channel) {
+async function handleSSE(request, env, channel, auth) {
+  // The alerts channel must apply the same role-targeted filter as
+  // GET /api/alerts — otherwise a chef's tablet would see every open alert
+  // pushed via SSE even though listAlerts correctly returns 0 to them. The
+  // filter (ruleWhitelistForRole from handlers/alerts.js) returns null for a
+  // manager (sees everything) or an array of allowed rule_ids.
+  const alertsAllowedRules = (channel === 'alerts') ? ruleWhitelistForRole(auth) : null;
+  const alertsManagerSeesAll = alertsAllowedRules === null;
   const encoder = new TextEncoder();
   let timer = null;
   // The last payload sent, so a tick that found nothing new stays quiet.
@@ -33,9 +41,26 @@ async function handleSSE(request, env, channel) {
           } else if (channel === "alerts") {
             // Open alerts only: a resolved or acknowledged alert leaving the
             // feed is the point — the banner goes away when the floor fixes it.
-            const { results } = await d1Query(env, "SELECT * FROM alerts WHERE status = 'open' ORDER BY created DESC LIMIT 100");
+            // Filtered by the caller's role so a chef's banner only sees
+            // kitchen-relevant rules (preparing-too-long, new-unaccepted,
+            // ready-not-served) — same filter as GET /api/alerts. Without
+            // this the SSE push would leak every open alert to every
+            // connected tablet.
+            let rows;
+            if (alertsManagerSeesAll) {
+              ({ results: rows } = await d1Query(env, "SELECT * FROM alerts WHERE status = 'open' ORDER BY created DESC LIMIT 100"));
+            } else if (alertsAllowedRules && alertsAllowedRules.length === 0) {
+              rows = [];
+            } else {
+              const placeholders = alertsAllowedRules.map(() => '?').join(',');
+              ({ results: rows } = await d1Query(
+                env,
+                `SELECT * FROM alerts WHERE status = 'open' AND rule_id IN (${placeholders}) ORDER BY created DESC LIMIT 100`,
+                alertsAllowedRules
+              ));
+            }
             eventName = "alerts_update";
-            payload = { alerts: results || [] };
+            payload = { alerts: rows || [] };
           } else {
             // Kitchen tick: every active order on the board. Bounded because a
             // busy week puts thousands of rows in `orders`, and every connected

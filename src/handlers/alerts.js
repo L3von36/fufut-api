@@ -296,6 +296,15 @@ async function acknowledgeOne(id, request, env, auth) {
   if (!row) return json({ ok: false, error: 'Alert not found' }, 404);
   if (row.status === 'resolved') return json({ ok: false, error: 'Alert already resolved' }, 409);
 
+  // Defense-in-depth on top of the role-targeted filter: even if a non-manager
+  // somehow obtains the id of an alert outside their audience, they cannot ack
+  // it. The same RULE_AUDIENCE map that gates listAlerts gates this — a chef
+  // cannot ack a table-seated or served-unpaid alert.
+  const allowedRules = ruleWhitelistForRole(auth);
+  if (allowedRules !== null && !allowedRules.includes(row.rule_id)) {
+    return json({ ok: false, error: 'Not permitted: this alert is for a different role' }, 403);
+  }
+
   const stamp = now();
   await d1Run(
     env,
@@ -347,4 +356,4 @@ async function handleAlerts(pathname, method, url, request, env, auth) {
   return null;
 }
 
-export { handleAlerts, RULE_IDS, SEVERITY };
+export { handleAlerts, listAlerts, ruleWhitelistForRole, RULE_AUDIENCE, RULE_IDS, SEVERITY };
