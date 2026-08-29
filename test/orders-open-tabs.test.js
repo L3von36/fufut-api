@@ -223,7 +223,10 @@ describe('settlement payment idempotency (open tab)', () => {
       payment: 'cash',
     };
     const req1 = makeRequest('/api/orders/Oopen01', 'PUT', payload);
-    await handleOrders(req1.pathname, req1.method, req1.url, req1.request, first.env, { staff_id: 'S1' });
+    // cashier role — settlement is the cashier's job (see fufut-api/src/auth.js).
+    // The head-waiter is no longer permitted to attach paymentBreakdown/tip to
+    // a PUT, so the role here must be one the server accepts.
+    await handleOrders(req1.pathname, req1.method, req1.url, req1.request, first.env, { staff_id: 'S1', sessionRole: 'cashier' });
     const insertsFirst = first.prepare.mock.calls.filter((c) => /INSERT INTO payments/.test(c[0]));
     expect(insertsFirst.length).toBeGreaterThan(0);
 
@@ -234,7 +237,7 @@ describe('settlement payment idempotency (open tab)', () => {
       overrides: { 'SELECT id FROM payments': { results: [{ id: 'PM123' }] } },
     });
     const req2 = makeRequest('/api/orders/Oopen01', 'PUT', payload);
-    const res2 = await handleOrders(req2.pathname, req2.method, req2.url, req2.request, second.env, { staff_id: 'S1' });
+    const res2 = await handleOrders(req2.pathname, req2.method, req2.url, req2.request, second.env, { staff_id: 'S1', sessionRole: 'cashier' });
     expect(res2.status).toBe(200);
     const insertsSecond = second.prepare.mock.calls.filter((c) => /INSERT INTO payments/.test(c[0]));
     expect(insertsSecond.length).toBe(0);

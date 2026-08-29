@@ -1889,6 +1889,26 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
     // idempotent (recordSubmittedPayments refuses to double-post, and
     // recordSubmittedTip skips an order that already has a tip row), so a
     // retried PUT cannot take the same cash twice.
+    //
+    // Defense-in-depth on top of the role matrix: the head-waiter has `orders`
+    // write (so they can take orders and fire rounds) but is NOT meant to take
+    // money — that's the cashier's. The route gate through `orders` write alone
+    // is not enough to express that distinction, because settlement is
+    // implemented as a PUT /api/orders/:id with paymentBreakdown/tip in the
+    // body. So we look at what the body is asking the order to do, not just
+    // whether the role can write `orders` at all: only cashier and manager are
+    // allowed to attach settlement data. The earlier client-side guards (the
+    // Checkout button is hidden for head-waiter, and 'checkout' is no longer
+    // in ROLE_PERMISSIONS for them) close the front door; this closes the
+    // back door.
+    const role = String((auth && (auth.sessionRole || auth.role)) || '').toLowerCase();
+    const canSettle = isManager(role) || role === 'cashier';
+    if (!canSettle && (Array.isArray(data.paymentBreakdown) && data.paymentBreakdown.length || round2(data.tip) > 0)) {
+      return json(
+        { ok: false, error: 'Only a cashier or manager can settle a bill. Hand the table to the cashier.' },
+        403
+      );
+    }
     if (Array.isArray(data.paymentBreakdown) && data.paymentBreakdown.length) {
       const settlement = await recordSubmittedPayments(env, auth, id, data);
       if (settlement.warning) followSettlementWarnings.push(settlement.warning);

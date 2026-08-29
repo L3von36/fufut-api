@@ -49,7 +49,7 @@ function makeRequest(pathname, method = 'GET', body = null) {
   return { pathname, method, url, request: req };
 }
 
-const WAITER = { staff_id: 'S6', sessionRole: 'head-waiter', firstName: 'Yonas' };
+const WAITER = { staff_id: 'S6', sessionRole: 'cashier', firstName: 'Yonas' };
 
 const OPEN_ORDER = {
   id: 'Otab0001', items: '2xMacchiato', total: 260, payment: 'unpaid',
