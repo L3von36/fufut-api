@@ -231,7 +231,37 @@ async function handleTables(pathname, method, url, request, env, auth) {
   if (parts[0] !== 'api' || parts[1] !== 'tables') return null;
 
   if (m === 'GET' && parts.length === 2) {
-    return json(await listTablesWithHolds(env));
+    const all = await listTablesWithHolds(env);
+    // A waiter works their section, not the whole room: the floor plan a
+    // head-waiter fetches shows only the tables a manager has assigned to
+    // them by name. The manager keeps the full map - they are the one making
+    // the assignments - and so does the cashier, who clears bills across
+    // every section. The match is the staff member's own display name
+    // (first + last), compared the way the assignment dropdown writes it.
+    const role = String((auth && (auth.sessionRole || auth.role)) || '').toLowerCase();
+    if (role === 'head-waiter') {
+      const me = actorName(auth).trim().toLowerCase();
+      if (!me) return json([]);
+      return json(all.filter((t) => String(t.server || '').trim().toLowerCase() === me));
+    }
+    return json(all);
+  }
+
+  // Creating a table is a floor edit any `tables` writer may do, but creating
+  // one that already names a server is an assignment - and assignments are a
+  // manager's decision. The POS adds tables with no server, so this only ever
+  // bites a direct API caller trying to sneak an assignment in through CREATE.
+  if (m === 'POST' && parts.length === 2 && !isManager(auth)) {
+    let body;
+    try {
+      body = await readBody(request.clone());
+    } catch {
+      body = null;
+    }
+    if (body && String(body.server || '').trim()) {
+      return json({ ok: false, error: 'Only a manager can assign a server to a table.' }, 403);
+    }
+    return null;
   }
 
   /**
@@ -313,6 +343,37 @@ async function handleTables(pathname, method, url, request, env, auth) {
       return null; // let the generic handler produce the usual error
     }
     if (!data) return null;
+
+    // ── Assignment gate ──────────────────────────────────────────────────────
+    // Only a manager decides who owns a table. Status, guests and notes stay
+    // with the floor staff who run service; the name on the table does not.
+    // Two shapes of write are still allowed through for everyone, or normal
+    // service would break:
+    //   - an empty server, because the two "free the table" flows (Orders,
+    //     Checkout) reset the whole party - status, guests, server, timer -
+    //     and clearing a name is housekeeping, not assignment;
+    //   - the stored name echoed back unchanged, because the seat/checkout
+    //     flows PUT the row they fetched (a spread) and would otherwise 403
+    //     on their own shadow.
+    {
+      const { results: curRows } = await d1Query(
+        env,
+        'SELECT id, number, server FROM tables WHERE id = ?',
+        [tableId]
+      );
+      const current = (curRows || [])[0];
+      if (!current) return null; // let the generic handler answer 404
+      if (!isManager(auth) && data.server !== undefined) {
+        const nextServer = String(data.server || '').trim().toLowerCase();
+        const storedServer = String(current.server || '').trim().toLowerCase();
+        if (nextServer && nextServer !== storedServer) {
+          return json(
+            { ok: false, error: 'Only a manager can assign a server to a table.' },
+            403
+          );
+        }
+      }
+    }
 
     const nextStatus = String(data.status || '').toLowerCase();
     if (!SEATING_STATUSES.includes(nextStatus)) return null; // not a seating change
