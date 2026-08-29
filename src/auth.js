@@ -158,6 +158,10 @@ const SELF_SERVICE = new Set([
   '/api/timeclock/me/history',
   '/api/timeclock/clock-in',
   '/api/timeclock/clock-out',
+  '/api/timeclock/break-start',
+  '/api/timeclock/break-end',
+  '/api/handovers',
+  '/api/handovers/latest',
 ]);
 
 /**
@@ -180,11 +184,11 @@ const ROLE_ACCESS = {
     // Recipes, stock movements and suppliers all belong to the person who owns
     // food cost. Purchases are readable — they need to see what arrived and at
     // what price — but committing spend stays with the manager.
-    read: ['orders', 'inventory', 'waste', 'expenses', 'recipes', 'units', 'suppliers', 'purchases', 'alerts'],
+    read: ['orders', 'inventory', 'waste', 'expenses', 'recipes', 'units', 'suppliers', 'purchases', 'alerts', 'tasks'],
     // menu-availability lets them 86 a dish that has run out. The menu itself
     // stays manager-only, so pricing is untouched. Acknowledging an alert is
     // a kitchen act — "I have this ticket" — so the board's owner signs it.
-    write: ['orders', 'inventory', 'waste', 'menu-availability', 'recipes', 'alerts'],
+    write: ['orders', 'inventory', 'waste', 'menu-availability', 'recipes', 'alerts', 'tasks'],
   },
   // Reads stock, does not own it. Monitoring levels, ordering supplies and
   // controlling food cost belong to the head chef; an assistant executes
@@ -194,7 +198,7 @@ const ROLE_ACCESS = {
     // Reads recipes because they cook from them; writes none of it, for the
     // same reason they do not own the stock counts. Reads alerts because the
     // ticket going late is theirs to rescue — they just cannot sign it off.
-    read: ['orders', 'inventory', 'recipes', 'units', 'alerts'],
+    read: ['orders', 'inventory', 'recipes', 'units', 'alerts', 'tasks'],
     write: ['orders'],
   },
   'head-waiter': {
@@ -202,15 +206,15 @@ const ROLE_ACCESS = {
     // writes tips because a tip left on the table is theirs to record. Cannot
     // write payments: taking the money is the cashier's, and a floor tablet
     // that can mark a bill paid is a hole with no compensating control.
-    read: ['orders', 'tables', 'reservations', 'payments', 'tips', 'alerts'],
-    write: ['orders', 'tables', 'reservations', 'tips', 'alerts'],
+    read: ['orders', 'tables', 'reservations', 'payments', 'tips', 'alerts', 'tasks'],
+    write: ['orders', 'tables', 'reservations', 'tips', 'alerts', 'tasks'],
   },
   cashier: {
-    read: ['orders', 'tables', 'reservations', 'expenses', 'staff', 'timeclock', 'cashdrawer', 'payments', 'tips', 'delivery', 'alerts'],
+    read: ['orders', 'tables', 'reservations', 'expenses', 'staff', 'timeclock', 'cashdrawer', 'payments', 'tips', 'delivery', 'alerts', 'tasks'],
     // `upload` is the transfer screenshot that §9 requires against a Telebirr,
     // CBE or bank payment. Without it the evidence has nowhere to go and the
     // verification step has nothing to verify against.
-    write: ['orders', 'tables', 'reservations', 'timeclock', 'cashdrawer', 'payments', 'tips', 'delivery', 'upload', 'alerts'],
+    write: ['orders', 'tables', 'reservations', 'timeclock', 'cashdrawer', 'payments', 'tips', 'delivery', 'upload', 'alerts', 'tasks'],
   },
   // A driver needs the order behind the job — what is in the bag, what it comes
   // to, and whether it is already paid — plus a way to record the cash or the
@@ -219,7 +223,7 @@ const ROLE_ACCESS = {
   // manager, so the money the driver reports is still checked by the till when
   // they get back.
   'delivery-staff': {
-    read: ['delivery', 'orders', 'payments', 'tips', 'alerts'],
+    read: ['delivery', 'orders', 'payments', 'tips', 'alerts', 'tasks'],
     // Uploads for the same reason as the cashier: the screenshot is taken on
     // the doorstep, and a driver who can record a transfer but not photograph
     // it has to write the reference on their hand and type it in later.

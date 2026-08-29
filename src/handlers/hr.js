@@ -1226,5 +1226,341 @@ export async function handleHR(pathname, method, url, request, env, auth) {
     }
   }
 
+  // ── Breaks ────────────────────────────────────────────────────────────
+  if (pathname === '/api/timeclock/break-start' && m === 'POST') return breakStart(request, env, auth);
+  if (pathname === '/api/timeclock/break-end' && m === 'POST') return breakEnd(request, env, auth);
+
+  // ── Tasks ────────────────────────────────────────────────────────────
+  if (pathname.startsWith('/api/tasks')) {
+    const sub = pathname.replace(/^\/api\/tasks/, '');
+    if (m === 'GET' && (sub === '' || sub === '/')) return listTasks(env, url, auth);
+    if (m === 'POST' && (sub === '' || sub === '/')) return createTask(request, env, auth);
+    const taskMatch = sub.match(/^\/([^/]+)$/);
+    if (m === 'PUT' && taskMatch) return updateTask(request, env, auth, taskMatch[1]);
+    if (m === 'DELETE' && taskMatch) return deleteTask(env, auth, taskMatch[1]);
+    const completeMatch = sub.match(/^\/([^/]+)\/complete$/);
+    if (m === 'POST' && completeMatch) return completeTask(request, env, auth, completeMatch[1]);
+  }
+
+  // ── Shift handovers ──────────────────────────────────────────────────
+  if (pathname.startsWith('/api/handovers')) {
+    const sub = pathname.replace(/^\/api\/handovers/, '');
+    if (m === 'GET' && (sub === '' || sub === '/')) return listHandovers(env, url, auth);
+    if (m === 'POST' && (sub === '' || sub === '/')) return createHandover(request, env, auth);
+    const latestMatch = sub.match(/^\/latest$/);
+    if (m === 'GET' && latestMatch) return latestHandover(env, auth);
+  }
+
   return null;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// BREAKS
+// ════════════════════════════════════════════════════════════════════════
+
+/** POST /api/timeclock/break-start — start a break during the current shift. */
+async function breakStart(request, env, auth) {
+  const staffId = subjectStaffId({}, auth);
+  if (!staffId) return json({ ok: false, error: 'No staff record on this session' }, 400);
+
+  const entry = await openEntryFor(env, staffId);
+  if (!entry) return json({ ok: false, error: 'Not clocked in.' }, 409);
+
+  // Refuse if a break is already in progress
+  const { results: openBreaks } = await d1Query(
+    env,
+    'SELECT id FROM break_records WHERE timeclock_id = ? AND end_at IS NULL',
+    [entry.id]
+  );
+  if (openBreaks && openBreaks.length) {
+    return json({ ok: false, error: 'Already on break.' }, 409);
+  }
+
+  const id = 'BR' + crypto.randomUUID().replace(/-/g, '').slice(0, 8);
+  const now = new Date().toISOString();
+  await d1Run(
+    env,
+    'INSERT INTO break_records (id, timeclock_id, staff_id, start_at, created) VALUES (?, ?, ?, ?, ?)',
+    [id, entry.id, staffId, now, now]
+  );
+
+  await writeAudit(env, auth, {
+    action: 'create', entity: 'break', entityId: id,
+    after: { timeclock_id: entry.id, start_at: now },
+  });
+
+  return json({ ok: true, id, staffId, timeclockId: entry.id, startAt: now });
+}
+
+/** POST /api/timeclock/break-end — end the current break. */
+async function breakEnd(request, env, auth) {
+  const staffId = subjectStaffId({}, auth);
+  if (!staffId) return json({ ok: false, error: 'No staff record on this session' }, 400);
+
+  const entry = await openEntryFor(env, staffId);
+  if (!entry) return json({ ok: false, error: 'Not clocked in.' }, 409);
+
+  const { results } = await d1Query(
+    env,
+    'SELECT * FROM break_records WHERE timeclock_id = ? AND end_at IS NULL ORDER BY start_at DESC LIMIT 1',
+    [entry.id]
+  );
+  const br = (results || [])[0];
+  if (!br) return json({ ok: false, error: 'No break in progress.' }, 409);
+
+  const now = new Date().toISOString();
+  const durationMin = Math.round((Date.parse(now) - Date.parse(br.start_at)) / 60000);
+  await d1Run(
+    env,
+    'UPDATE break_records SET end_at = ?, duration_min = ? WHERE id = ?',
+    [now, durationMin, br.id]
+  );
+
+  await writeAudit(env, auth, {
+    action: 'update', entity: 'break', entityId: br.id,
+    before: { end_at: null },
+    after: { end_at: now, duration_min: durationMin },
+  });
+
+  return json({ ok: true, id: br.id, endAt: now, durationMin });
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// TASKS
+// ════════════════════════════════════════════════════════════════════════
+
+/** GET /api/tasks?status=&staff_id= */
+async function listTasks(env, url, auth) {
+  const sp = url.searchParams;
+  const status = sp.get('status');
+  const staffId = sp.get('staff_id') || sp.get('staffId');
+  const role = String((auth && (auth.sessionRole || auth.role)) || '').toLowerCase();
+  const isMgr = isManager(role);
+
+  const clauses = [];
+  const params = [];
+  // Non-managers only see their own tasks
+  if (!isMgr) {
+    clauses.push('staff_id = ?');
+    params.push(String(auth.staff_id));
+  } else if (staffId) {
+    clauses.push('staff_id = ?');
+    params.push(String(staffId));
+  }
+  if (status) { clauses.push('status = ?'); params.push(status); }
+
+  const where = clauses.length ? ' WHERE ' + clauses.join(' AND ') : '';
+  const { results } = await d1Query(
+    env,
+    `SELECT t.*, s.firstName, s.lastName
+       FROM employee_tasks t LEFT JOIN staff s ON s.id = t.staff_id${where}
+      ORDER BY t.created DESC LIMIT 200`,
+    params
+  );
+  const rows = (results || []).map((r) => ({
+    ...r,
+    staffName: [r.firstName, r.lastName].filter(Boolean).join(' ') || null,
+  }));
+  return json(rows);
+}
+
+/** POST /api/tasks — manager creates a task. */
+async function createTask(request, env, auth) {
+  if (!isManager((auth && (auth.sessionRole || auth.role)) || '')) {
+    return json({ ok: false, error: 'Only a manager can create tasks' }, 403);
+  }
+  const data = await readBody(request);
+  if (!data) return json({ ok: false, error: 'Invalid JSON body' }, 400);
+  if (!data.staffId || !data.title) {
+    return json({ ok: false, error: 'staffId and title are required' }, 400);
+  }
+
+  const id = 'TASK' + crypto.randomUUID().replace(/-/g, '').slice(0, 8);
+  const now = new Date().toISOString();
+  await d1Run(
+    env,
+    `INSERT INTO employee_tasks (id, staff_id, created_by, title, description, priority, due_at, area, status, created, updated)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+    [id, String(data.staffId), auth.staff_id, String(data.title), data.description || null,
+     data.priority || 'normal', data.dueAt || null, data.area || null, now, now]
+  );
+
+  await writeAudit(env, auth, {
+    action: 'create', entity: 'task', entityId: id,
+    after: { staff_id: data.staffId, title: data.title, priority: data.priority || 'normal' },
+  });
+
+  return json({ ok: true, id });
+}
+
+/** PUT /api/tasks/:id — update a task (manager or assigned employee). */
+async function updateTask(request, env, auth, taskId) {
+  const data = await readBody(request);
+  if (!data) return json({ ok: false, error: 'Invalid JSON body' }, 400);
+
+  const { results } = await d1Query(env, 'SELECT * FROM employee_tasks WHERE id = ?', [String(taskId)]);
+  const task = (results || [])[0];
+  if (!task) return json({ ok: false, error: 'Task not found' }, 404);
+
+  const role = String((auth && (auth.sessionRole || auth.role)) || '').toLowerCase();
+  const isMgr = isManager(role);
+  const isAssigned = auth.staff_id === task.staff_id;
+  if (!isMgr && !isAssigned) {
+    return json({ ok: false, error: 'Not permitted' }, 403);
+  }
+
+  const fields = [];
+  const values = [];
+  if (data.status !== undefined && ['pending', 'in_progress', 'completed', 'failed', 'cancelled'].includes(data.status)) {
+    fields.push('status = ?');
+    values.push(data.status);
+    if (data.status === 'completed') {
+      fields.push('completed_at = ?');
+      values.push(new Date().toISOString());
+    }
+  }
+  if (data.note !== undefined) { fields.push('note = ?'); values.push(data.note); }
+  if (isMgr && data.priority !== undefined) { fields.push('priority = ?'); values.push(data.priority); }
+  if (isMgr && data.dueAt !== undefined) { fields.push('due_at = ?'); values.push(data.dueAt); }
+  if (isMgr && data.title !== undefined) { fields.push('title = ?'); values.push(data.title); }
+  if (isMgr && data.description !== undefined) { fields.push('description = ?'); values.push(data.description); }
+
+  if (!fields.length) return json({ ok: false, error: 'No fields to update' }, 400);
+  fields.push('updated = ?');
+  values.push(new Date().toISOString());
+  values.push(String(taskId));
+
+  await d1Run(env, `UPDATE employee_tasks SET ${fields.join(', ')} WHERE id = ?`, values);
+
+  await writeAudit(env, auth, {
+    action: 'update', entity: 'task', entityId: taskId,
+    before: { status: task.status },
+    after: data,
+  });
+
+  return json({ ok: true });
+}
+
+/** POST /api/tasks/:id/complete — employee marks a task complete. */
+async function completeTask(request, env, auth, taskId) {
+  const data = await readBody(request) || {};
+  const { results } = await d1Query(env, 'SELECT * FROM employee_tasks WHERE id = ?', [String(taskId)]);
+  const task = (results || [])[0];
+  if (!task) return json({ ok: false, error: 'Task not found' }, 404);
+
+  const role = String((auth && (auth.sessionRole || auth.role)) || '').toLowerCase();
+  const isMgr = isManager(role);
+  const isAssigned = auth.staff_id === task.staff_id;
+  if (!isMgr && !isAssigned) {
+    return json({ ok: false, error: 'Not permitted' }, 403);
+  }
+  if (task.status === 'completed') return json({ ok: false, error: 'Already completed' }, 409);
+
+  const now = new Date().toISOString();
+  await d1Run(
+    env,
+    'UPDATE employee_tasks SET status = ?, completed_at = ?, note = ?, updated = ? WHERE id = ?',
+    ['completed', now, data.note || null, now, String(taskId)]
+  );
+
+  await writeAudit(env, auth, {
+    action: 'update', entity: 'task', entityId: taskId,
+    before: { status: task.status },
+    after: { status: 'completed', completed_at: now },
+  });
+
+  return json({ ok: true, completedAt: now });
+}
+
+/** DELETE /api/tasks/:id — manager only. */
+async function deleteTask(env, auth, taskId) {
+  if (!isManager((auth && (auth.sessionRole || auth.role)) || '')) {
+    return json({ ok: false, error: 'Only a manager can delete tasks' }, 403);
+  }
+  await d1Run(env, 'DELETE FROM employee_tasks WHERE id = ?', [String(taskId)]);
+  await writeAudit(env, auth, { action: 'delete', entity: 'task', entityId: taskId });
+  return json({ ok: true });
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// SHIFT HANDOVERS
+// ════════════════════════════════════════════════════════════════════════
+
+/** GET /api/handovers?staff_id= — list handovers (manager sees all, others see own). */
+async function listHandovers(env, url, auth) {
+  const sp = url.searchParams;
+  const staffId = sp.get('staff_id') || sp.get('staffId');
+  const role = String((auth && (auth.sessionRole || auth.role)) || '').toLowerCase();
+  const isMgr = isManager(role);
+
+  const clauses = [];
+  const params = [];
+  if (!isMgr) { clauses.push('staff_id = ?'); params.push(String(auth.staff_id)); }
+  else if (staffId) { clauses.push('staff_id = ?'); params.push(String(staffId)); }
+
+  const where = clauses.length ? ' WHERE ' + clauses.join(' AND ') : '';
+  const { results } = await d1Query(
+    env,
+    `SELECT h.*, s.firstName, s.lastName
+       FROM shift_handovers h LEFT JOIN staff s ON s.id = h.staff_id${where}
+      ORDER BY h.created DESC LIMIT 50`,
+    params
+  );
+  const rows = (results || []).map((r) => ({
+    ...r,
+    staffName: [r.firstName, r.lastName].filter(Boolean).join(' ') || null,
+  }));
+  return json(rows);
+}
+
+/** GET /api/handovers/latest — the most recent handover (for the next shift to read). */
+async function latestHandover(env, auth) {
+  const { results } = await d1Query(
+    env,
+    `SELECT h.*, s.firstName, s.lastName
+       FROM shift_handovers h LEFT JOIN staff s ON s.id = h.staff_id
+      ORDER BY h.created DESC LIMIT 1`
+  );
+  const row = (results || [])[0];
+  if (!row) return json({ ok: true, handover: null });
+  return json({
+    ok: true,
+    handover: {
+      ...row,
+      staffName: [row.firstName, row.lastName].filter(Boolean).join(' ') || null,
+    },
+  });
+}
+
+/** POST /api/handovers — create a handover (any signed-in employee). */
+async function createHandover(request, env, auth) {
+  const data = await readBody(request);
+  if (!data) return json({ ok: false, error: 'Invalid JSON body' }, 400);
+
+  const staffId = subjectStaffId({}, auth);
+  if (!staffId) return json({ ok: false, error: 'No staff record on this session' }, 400);
+
+  const id = 'HO' + crypto.randomUUID().replace(/-/g, '').slice(0, 8);
+  const now = new Date().toISOString();
+
+  // Link to the current open timeclock entry if one exists
+  const entry = await openEntryFor(env, staffId);
+  const timeclockId = entry ? entry.id : null;
+
+  await d1Run(
+    env,
+    `INSERT INTO shift_handovers (id, staff_id, timeclock_id, pending_orders, pending_tasks, cash_info, problems, customer_issues, inventory_notes, important_notes, created)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, staffId, timeclockId,
+     data.pendingOrders || null, data.pendingTasks || null, data.cashInfo || null,
+     data.problems || null, data.customerIssues || null, data.inventoryNotes || null,
+     data.importantNotes || null, now]
+  );
+
+  await writeAudit(env, auth, {
+    action: 'create', entity: 'handover', entityId: id,
+    after: { staff_id: staffId, timeclock_id: timeclockId },
+  });
+
+  return json({ ok: true, id });
 }
