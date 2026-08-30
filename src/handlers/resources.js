@@ -58,6 +58,7 @@ async function handleResources(pathname, method, url, request, env, auth) {
   if (!cfg) return null;
   const table = cfg.table;
   const idPart = parts[2] || "";
+  const idPartFull = parts.slice(2).join("/"); // e.g. "CD3a1d1ab/z-report"
 
   // ── Cashier Cashdrawer Sub-Routes ─────────────────────────────────────────
   if (res === "cashdrawer") {
@@ -273,7 +274,7 @@ async function handleResources(pathname, method, url, request, env, auth) {
     // - Refunds summary (count, total, by method)
     // - Cash reconciliation (opening + cash sales − cash refunds − paid-out)
     // - Service charge + tips totals
-    const zrMatch = idPart && idPart.match(/^([^/]+)\/z-report$/);
+    const zrMatch = idPartFull && idPartFull.match(/^([^/]+)\/z-report$/);
     if (zrMatch && m === "GET") {
       const drawerId = zrMatch[1];
       const { results: drawerRows } = await d1Query(
