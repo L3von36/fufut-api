@@ -1237,7 +1237,7 @@ export async function handleHR(pathname, method, url, request, env, auth) {
         return json({ ok: false, error: 'You can only view your own report' }, 403);
       }
 
-      const date = sp.get('date') || today();
+      const date = url.searchParams.get('date') || today();
 
       // Profile
       const { results: staffRows } = await d1Query(env, 'SELECT * FROM staff WHERE id = ?', [String(staffId)]);
