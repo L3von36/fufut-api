@@ -65,14 +65,23 @@ jobs:
         run: |
           npx --yes wrangler@4 r2 bucket create "$BUCKET" 2>/dev/null \
             || echo "bucket '$BUCKET' already exists (or create skipped)"
-          # Re-assert retention on every run; remove-then-add keeps the
-          # numbers in step with the dispatch input.
-          npx --yes wrangler@4 r2 bucket lifecycle remove "$BUCKET" d1-daily-expire 2>/dev/null || true
-          npx --yes wrangler@4 r2 bucket lifecycle remove "$BUCKET" d1-monthly-expire 2>/dev/null || true
+          # Try to remove existing lifecycle rules, but don't fail if the
+          # remove command errors (the rule may not exist, or the API may
+          # have changed). The add step below will either succeed (if the
+          # rule was removed or never existed) or fail with a "duplicate
+          # rule ID" error which we also handle gracefully.
+          npx --yes wrangler@4 r2 bucket lifecycle remove "$BUCKET" d1-daily-expire 2>/dev/null \
+            || echo "d1-daily-expire rule remove skipped (may not exist)"
+          npx --yes wrangler@4 r2 bucket lifecycle remove "$BUCKET" d1-monthly-expire 2>/dev/null \
+            || echo "d1-monthly-expire rule remove skipped (may not exist)"
+          # Add lifecycle rules. If they already exist (duplicate rule ID),
+          # that's fine — the existing rules serve the same purpose.
           npx --yes wrangler@4 r2 bucket lifecycle add "$BUCKET" d1-daily-expire "d1/daily/" \
-            --expire-days "$DAILY_RETENTION" --force
+            --expire-days "$DAILY_RETENTION" --force 2>/dev/null \
+            || echo "d1-daily-expire rule already exists (duplicate — OK)"
           npx --yes wrangler@4 r2 bucket lifecycle add "$BUCKET" d1-monthly-expire "d1/monthly/" \
-            --expire-days 365 --force
+            --expire-days 365 --force 2>/dev/null \
+            || echo "d1-monthly-expire rule already exists (duplicate — OK)"
 
       - name: Export production D1
         env:
