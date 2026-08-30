@@ -61,7 +61,7 @@ function num(v) {
 
 /** Rows the stage rules judge: anything not finished and not cancelled. */
 async function loadSweepRows(env) {
-  const [ordersStage, ordersUnpaid, deliveryJobs, reservations, tables] = await Promise.all([
+  const [ordersStage, ordersUnpaid, deliveryJobs, reservations, tables, timeclockOpen] = await Promise.all([
     d1Query(
       env,
       "SELECT * FROM orders WHERE status IN ('new','confirmed','preparing','ready') ORDER BY created"
@@ -82,12 +82,18 @@ async function loadSweepRows(env) {
       "AND COALESCE(released_at, '') = '' AND COALESCE(no_show_at, '') = '' ORDER BY start_at"
     ),
     d1Query(env, "SELECT * FROM tables WHERE status = 'occupied' ORDER BY seated_at"),
+    d1Query(
+      env,
+      "SELECT t.*, s.firstName, s.lastName FROM timeclock t LEFT JOIN staff s ON s.id = t.staff_id " +
+      "WHERE t.clock_out IS NULL OR t.clock_out = '' ORDER BY t.clock_in"
+    ),
   ]);
   return {
     orders: [...(ordersStage.results || []), ...(ordersUnpaid.results || [])],
     deliveryJobs: deliveryJobs.results || [],
     reservations: reservations.results || [],
     tables: tables.results || [],
+    timeclockEntries: timeclockOpen.results || [],
   };
 }
 
@@ -200,6 +206,8 @@ const RULE_AUDIENCE = {
   'delivery-in-transit-too-long': new Set(['manager', 'delivery-staff']),
   'reservation-no-show':          new Set(['manager', 'head-waiter']),
   'table-seated-too-long':        new Set(['manager', 'head-waiter']),
+  'employee-forgot-clock-out':    new Set(['manager']),
+  'employee-late-arrival':        new Set(['manager']),
 };
 
 /**

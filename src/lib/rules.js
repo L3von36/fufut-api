@@ -39,6 +39,8 @@ export const RULE_IDS = {
   SERVED_UNPAID: 'order-served-unpaid',
   RESERVATION_NO_SHOW: 'reservation-no-show',
   TABLE_SEATED_TOO_LONG: 'table-seated-too-long',
+  FORGOT_CLOCK_OUT: 'employee-forgot-clock-out',
+  EMPLOYEE_LATE: 'employee-late-arrival',
 };
 
 /**
@@ -62,6 +64,7 @@ export const RULE_DEFAULTS = {
   servedUnpaidMin: 30,
   reservationNoShowMin: 15,
   tableSeatedMaxMin: 90,
+  forgotClockOutMin: 600, // 10 hours — a shift that is still open this long was forgotten
 };
 
 /** Minutes since an ISO-ish stamp, or null when the stamp cannot be read. */
@@ -321,9 +324,52 @@ export function evaluateTables(tables, nowMs, th = RULE_DEFAULTS) {
 }
 
 /**
+ * Did this employee forget to clock out?
+ *
+ * A timeclock entry that is still 'active' (clock_out is empty) more than
+ * `forgotClockOutMin` minutes after clock_in was almost certainly left open
+ * when the person went home. The shift gate (clockOut handler) refuses
+ * clock-out when checks are open, so this is also a signal that money may
+ * be owed on tables nobody is watching.
+ */
+export function evaluateTimeclock(entry, nowMs, th = RULE_DEFAULTS) {
+  if (!entry || !entry.id) return null;
+  // Only open entries (no clock_out)
+  if (entry.clock_out && String(entry.clock_out).trim() !== '') return null;
+  if (String(entry.status || '').toLowerCase() === 'completed') return null;
+
+  // clock_in is stored as "HH:MM" (shop local time), not an ISO timestamp.
+  // Reconstruct a comparable instant by combining the entry's date + clock_in.
+  const dateStr = String(entry.date || '').slice(0, 10);
+  const timeStr = String(entry.clock_in || '').trim();
+  if (!dateStr || !timeStr) return null;
+  const inMs = Date.parse(`${dateStr}T${timeStr.length === 5 ? timeStr + ':00' : timeStr}Z`);
+  if (!Number.isFinite(inMs)) return null;
+  const age = (nowMs - inMs) / 60000;
+  if (age <= th.forgotClockOutMin) return null;
+
+  const name = [entry.firstName, entry.lastName].filter(Boolean).join(' ') || entry.staff_id;
+  return violation(
+    RULE_IDS.FORGOT_CLOCK_OUT, SEVERITY.WARNING, 'timeclock', entry.id,
+    `${name} — shift still open`,
+    `${name} clocked in ${fmtMin(age)} ago and has not clocked out (limit ${fmtMin(th.forgotClockOutMin)}). Check if they forgot, or if open checks are blocking clock-out.`
+  );
+}
+
+/** Every forgotten-clock-out violation in one pass. */
+export function evaluateTimeclockEntries(entries, nowMs, th = RULE_DEFAULTS) {
+  const out = [];
+  for (const e of entries || []) {
+    const v = evaluateTimeclock(e, nowMs, th);
+    if (v) out.push(v);
+  }
+  return out;
+}
+
+/**
  * One sweep over everything.
  *
- * Takes the four collections already loaded by the caller and returns every
+ * Takes the collections already loaded by the caller and returns every
  * live violation. The dedupe key — rule, entity type, entity id — is what the
  * sweep compares against `alerts` rows: one row per condition, raised once,
  * escalated in place, resolved when the condition clears.
@@ -332,11 +378,12 @@ export function dedupeKey(v) {
   return `${v.rule_id}|${v.entity_type}|${v.entity_id}`;
 }
 
-export function evaluateAll({ orders, deliveryJobs, reservations, tables }, nowMs, th = RULE_DEFAULTS) {
+export function evaluateAll({ orders, deliveryJobs, reservations, tables, timeclockEntries }, nowMs, th = RULE_DEFAULTS) {
   return [
     ...evaluateOrders(orders, nowMs, th),
     ...evaluateDeliveryJobs(deliveryJobs, nowMs, th),
     ...evaluateReservations(reservations, nowMs, th),
     ...evaluateTables(tables, nowMs, th),
+    ...evaluateTimeclockEntries(timeclockEntries, nowMs, th),
   ];
 }

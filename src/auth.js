@@ -387,6 +387,7 @@ export function resourceForPath(pathname) {
   if (head === 'events') {
     if (parts[2] === 'kitchen') return 'orders';
     if (parts[2] === 'alerts') return 'alerts';
+    if (parts[2] === 'activity') return 'audit'; // manager+accountant only
     return 'tables';
   }
   return head;

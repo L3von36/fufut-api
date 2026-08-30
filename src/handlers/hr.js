@@ -1224,6 +1224,147 @@ export async function handleHR(pathname, method, url, request, env, auth) {
         timeline: timeline.slice(0, 200), // cap for perf
       });
     }
+
+    // GET /api/employees/:id/daily-report?date=YYYY-MM-DD
+    // Printable daily report: profile + attendance + role-specific KPIs with
+    // money values + full timeline. Manager or self.
+    const reportMatch = sub.match(/^\/([^/]+)\/daily-report$/);
+    if (m === 'GET' && reportMatch) {
+      const staffId = reportMatch[1];
+      const role = String((auth && (auth.sessionRole || auth.role)) || '').toLowerCase();
+      const isMe = auth && auth.staff_id === staffId;
+      if (!isManager(role) && !isMe) {
+        return json({ ok: false, error: 'You can only view your own report' }, 403);
+      }
+
+      const date = sp.get('date') || today();
+
+      // Profile
+      const { results: staffRows } = await d1Query(env, 'SELECT * FROM staff WHERE id = ?', [String(staffId)]);
+      const staffRow = (staffRows || [])[0];
+      if (!staffRow) return json({ ok: false, error: 'Employee not found' }, 404);
+
+      // Timeclock for that date
+      const { results: clockRows } = await d1Query(
+        env,
+        'SELECT * FROM timeclock WHERE staff_id = ? AND date = ? ORDER BY clock_in',
+        [String(staffId), date]
+      );
+
+      // Audit entries for that date
+      const { results: auditRows } = await d1Query(
+        env,
+        'SELECT * FROM audit_log WHERE actor_id = ? AND at >= ? AND at <= ? ORDER BY at DESC LIMIT 500',
+        [String(staffId), date, date + 'T23:59:59']
+      );
+
+      // Breaks for that date's timeclock entries
+      const tcIds = (clockRows || []).map(c => c.id);
+      let breakRows = [];
+      if (tcIds.length) {
+        const placeholders = tcIds.map(() => '?').join(',');
+        const { results } = await d1Query(
+          env,
+          `SELECT * FROM break_records WHERE timeclock_id IN (${placeholders}) ORDER BY start_at`,
+          tcIds
+        );
+        breakRows = results || [];
+      }
+
+      // Role-specific KPIs with money values
+      const countBy = (pred) => (auditRows || []).filter(pred).length;
+      const sumBy = (pred, field) => {
+        let total = 0;
+        for (const e of auditRows || []) {
+          if (!pred(e)) continue;
+          const v = e.after && (e.after[field] || e.after.total || e.after.amount);
+          if (typeof v === 'number' && Number.isFinite(v)) total += v;
+        }
+        return total;
+      };
+      const roleKey = String(staffRow.role || '').toLowerCase();
+      const reportKpis = [];
+      const totalBreakMin = breakRows.reduce((s, b) => s + (b.duration_min || 0), 0);
+      const totalHours = (clockRows || []).reduce((s, c) => s + (c.hours || 0), 0);
+
+      if (roleKey === 'cashier' || roleKey === 'manager') {
+        const cashTotal = sumBy(e => e.entity === 'payments' && e.after && e.after.method === 'cash', 'amount');
+        const bankTotal = sumBy(e => e.entity === 'payments' && e.after && ['telebirr','cbe','bank'].includes(e.after.method), 'amount');
+        reportKpis.push(
+          { label: 'Payments Processed', value: countBy(e => e.entity === 'payments' && (e.action === 'verify' || e.action === 'create')) },
+          { label: 'Refunds', value: countBy(e => e.entity === 'payments' && e.action === 'refund') },
+          { label: 'Voids', value: countBy(e => e.entity === 'orders' && e.action === 'void') },
+          { label: 'Cash', value: `ETB ${cashTotal.toFixed(0)}`, isMoney: true },
+          { label: 'Bank/Digital', value: `ETB ${bankTotal.toFixed(0)}`, isMoney: true },
+        );
+      } else if (roleKey === 'head-chef' || roleKey === 'assistant-chef') {
+        reportKpis.push(
+          { label: 'Dishes Sent', value: countBy(e => e.entity === 'orders' && e.after && (e.after.status === 'ready' || e.after.status === 'served')) },
+          { label: 'Tickets Started', value: countBy(e => e.entity === 'orders' && e.after && e.after.status === 'preparing') },
+          { label: 'Waste Logged', value: countBy(e => e.entity === 'waste') },
+        );
+      } else if (roleKey === 'head-waiter') {
+        const tipsTotal = sumBy(e => e.entity === 'tips', 'amount');
+        reportKpis.push(
+          { label: 'Orders Taken', value: countBy(e => e.entity === 'orders' && e.action === 'create') },
+          { label: 'Tables Seated', value: countBy(e => e.entity === 'tables' && e.after && e.after.status === 'occupied') },
+          { label: 'Tips', value: `ETB ${tipsTotal.toFixed(0)}`, isMoney: true },
+        );
+      } else if (roleKey === 'delivery-staff') {
+        const tipsTotal = sumBy(e => e.entity === 'tips', 'amount');
+        reportKpis.push(
+          { label: 'Delivered', value: countBy(e => e.entity === 'delivery' && e.after && e.after.status === 'delivered') },
+          { label: 'Payments Collected', value: countBy(e => e.entity === 'payments' && e.action === 'create') },
+          { label: 'Tips', value: `ETB ${tipsTotal.toFixed(0)}`, isMoney: true },
+        );
+      } else if (roleKey === 'cleaner') {
+        reportKpis.push(
+          { label: 'Waste Logged', value: countBy(e => e.entity === 'waste') },
+          { label: 'Tables Cleared', value: countBy(e => e.entity === 'tables' && e.after && e.after.status === 'available') },
+        );
+      }
+
+      return json({
+        ok: true,
+        date,
+        staff: {
+          id: staffRow.id,
+          firstName: staffRow.firstName,
+          lastName: staffRow.lastName,
+          role: staffRow.role,
+          email: staffRow.email,
+          phone: staffRow.phone,
+        },
+        attendance: {
+          shifts: (clockRows || []).length,
+          totalHours: Math.round(totalHours * 100) / 100,
+          totalBreakMinutes: Math.round(totalBreakMin),
+          entries: (clockRows || []).map(c => ({
+            id: c.id,
+            clockIn: c.clock_in,
+            clockOut: c.clock_out,
+            hours: c.hours,
+            status: c.status,
+            lateMinutes: c.late_minutes || 0,
+          })),
+          breaks: breakRows.map(b => ({
+            startAt: b.start_at,
+            endAt: b.end_at,
+            durationMin: b.duration_min || 0,
+          })),
+        },
+        kpis: reportKpis,
+        timeline: (auditRows || []).slice(0, 200).map(a => ({
+          at: a.at,
+          action: a.action,
+          entity: a.entity,
+          entityId: a.entity_id,
+          before: a.before,
+          after: a.after,
+          reason: a.reason,
+        })),
+      });
+    }
   }
 
   // ── Breaks ────────────────────────────────────────────────────────────

@@ -16,6 +16,18 @@ async function handleSSE(request, env, channel, auth) {
   const alertsAllowedRules = (channel === 'alerts') ? ruleWhitelistForRole(auth) : null;
   const alertsManagerSeesAll = alertsAllowedRules === null;
   const encoder = new TextEncoder();
+
+  // The activity channel pushes recent audit_log entries (the live activity
+  // feed for managers). Manager-only — non-managers get a 403.
+  const isActivityChannel = channel === 'activity';
+  if (isActivityChannel) {
+    const role = String((auth && (auth.sessionRole || auth.role)) || '').toLowerCase();
+    if (role !== 'manager') {
+      return new Response(JSON.stringify({ ok: false, error: 'Manager only' }), {
+        status: 403, headers: { 'Content-Type': 'application/json' },
+      });
+    }
+  }
   let timer = null;
   // The last payload sent, so a tick that found nothing new stays quiet.
   // Previously every tick emitted, which made the stream a 10-second poll in
@@ -61,6 +73,17 @@ async function handleSSE(request, env, channel, auth) {
             }
             eventName = "alerts_update";
             payload = { alerts: rows || [] };
+          } else if (isActivityChannel) {
+            // Live activity feed: pushes the 50 most recent audit_log entries
+            // to managers every 10s. Manager-only — checked at the top of
+            // handleSSE (returns 403 for non-managers). The signature dedup
+            // means no event is emitted when nothing has changed.
+            const { results } = await d1Query(env,
+              "SELECT a.id, a.at, a.actor_id, a.actor_name, a.actor_role, a.action, a.entity, a.entity_id, a.reason, a.before, a.after" +
+              " FROM audit_log a ORDER BY a.at DESC LIMIT 50"
+            );
+            eventName = "activity_update";
+            payload = { entries: results || [] };
           } else {
             // Kitchen tick: every active order on the board. Bounded because a
             // busy week puts thousands of rows in `orders`, and every connected

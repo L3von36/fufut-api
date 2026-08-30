@@ -108,8 +108,8 @@ async function route(pathname, method, url, request, env, ctx, auth) {
     return handlePublicStats(env);
   }
 
-  if (pathname === '/api/events/tables' || pathname === '/api/events/kitchen' || pathname === '/api/events/alerts') {
-    const channel = pathname.endsWith('tables') ? 'tables' : pathname.endsWith('alerts') ? 'alerts' : 'kitchen';
+  if (pathname === '/api/events/tables' || pathname === '/api/events/kitchen' || pathname === '/api/events/alerts' || pathname === '/api/events/activity') {
+    const channel = pathname.endsWith('tables') ? 'tables' : pathname.endsWith('alerts') ? 'alerts' : pathname.endsWith('activity') ? 'activity' : 'kitchen';
     return handleSSE(request, env, channel, auth);
   }
 
