@@ -149,7 +149,7 @@ async function route(pathname, method, url, request, env, ctx, auth) {
     if (r !== null) return r;
   }
   if (pathname.startsWith('/api/audit')) {
-    const r = await handleAudit(pathname, method, url, env);
+    const r = await handleAudit(pathname, method, url, env, auth);
     if (r !== null) return r;
   }
   if (pathname.startsWith('/api/reservations')) {

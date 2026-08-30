@@ -14,7 +14,56 @@ import { d1Query, json } from '../lib/db.js';
 
 const MAX_LIMIT = 500;
 
-export async function handleAudit(pathname, method, url, env) {
+/**
+ * Entity types each role is allowed to see in their own audit log.
+ *
+ * The self-scoped carve-out in auth.js lets any signed-in user read their
+ * own audit entries. Without this map, a cleaner who triggered an audit
+ * event for `staff` (unlikely but possible via a task assignment) would
+ * see staff salary data in the `after` JSON payload. This map ensures a
+ * non-manager only sees audit entries for entity types their role is
+ * allowed to read — same principle as the alerts RULE_AUDIENCE filter.
+ *
+ * Manager and accountant see everything (they hold the `audit` resource
+ * read grant in the role matrix, so they don't go through the self-scoped
+ * path at all — they see the full trail).
+ *
+ * The entity types map to the ROLE_ACCESS read lists in auth.js:
+ * a role that cannot read `staff` should not see `staff` audit entries
+ * even if they somehow triggered one.
+ */
+const ENTITY_AUDIENCE = {
+  manager: null, // sees everything
+  accountant: null, // sees everything (has audit read grant)
+
+  'head-chef': new Set([
+    'orders', 'inventory', 'waste', 'recipes', 'menu', 'menu-availability',
+    'alerts', 'timeclock', 'break', 'task', 'handover',
+  ]),
+  'assistant-chef': new Set([
+    'orders', 'inventory', 'recipes', 'menu',
+    'alerts', 'timeclock', 'break', 'task', 'handover',
+  ]),
+  'head-waiter': new Set([
+    'orders', 'tables', 'reservations', 'tips',
+    'alerts', 'timeclock', 'break', 'task', 'handover',
+  ]),
+  cashier: new Set([
+    'orders', 'tables', 'payments', 'tips', 'cashdrawer',
+    'reservations', 'timeclock',
+    'alerts', 'break', 'task', 'handover',
+  ]),
+  'delivery-staff': new Set([
+    'delivery', 'orders', 'payments', 'tips',
+    'timeclock', 'break', 'task', 'handover',
+  ]),
+  cleaner: new Set([
+    'waste', 'tables',
+    'timeclock', 'break', 'task', 'handover',
+  ]),
+};
+
+export async function handleAudit(pathname, method, url, env, auth) {
   if (method.toUpperCase() !== 'GET') {
     if (pathname.startsWith('/api/audit')) {
       return json({ ok: false, error: 'The audit log is written by the system and is read-only' }, 405);
@@ -40,6 +89,17 @@ export async function handleAudit(pathname, method, url, env) {
   if (action) { clauses.push('action = ?'); params.push(action); }
   if (from) { clauses.push('at >= ?'); params.push(from); }
   if (to) { clauses.push('at <= ?'); params.push(to); }
+
+  // Entity-type filter for non-managers reading their own audit log.
+  // A role that cannot read `staff` should not see `staff` entries even
+  // if they somehow triggered one. Manager and accountant see everything.
+  const role = String((auth && (auth.sessionRole || auth.role)) || '').toLowerCase();
+  const allowedEntities = ENTITY_AUDIENCE[role];
+  if (allowedEntities !== null && allowedEntities !== undefined) {
+    const placeholders = [...allowedEntities].map(() => '?').join(',');
+    clauses.push(`entity IN (${placeholders})`);
+    params.push(...allowedEntities);
+  }
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const limit = Math.min(MAX_LIMIT, Math.max(1, parseInt(url.searchParams.get('limit'), 10) || 100));
