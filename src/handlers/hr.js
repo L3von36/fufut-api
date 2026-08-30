@@ -1365,6 +1365,224 @@ export async function handleHR(pathname, method, url, request, env, auth) {
         })),
       });
     }
+
+    // GET /api/employees/:id/performance?from=&to=
+    // Rich performance report calculated from actual POS transactions:
+    // orders, order_items, payments, delivery, waste, timeclock.
+    // Per-role: waiter gets items-by-category + top items + service time;
+    // chef gets prep time + items prepared; cashier gets payment method
+    // breakdown + cash reconciliation; driver gets deliveries + avg time;
+    // cleaner gets waste + tables cleared.
+    const perfMatch = sub.match(/^\/([^/]+)\/performance$/);
+    if (m === 'GET' && perfMatch) {
+      const staffId = perfMatch[1];
+      const role = String((auth && (auth.sessionRole || auth.role)) || '').toLowerCase();
+      const isMe = auth && auth.staff_id === staffId;
+      if (!isManager(role) && !isMe) {
+        return json({ ok: false, error: 'You can only view your own performance' }, 403);
+      }
+
+      const from = url.searchParams.get('from') || today();
+      const to = url.searchParams.get('to') || today();
+      const toEnd = to + 'T23:59:59';
+
+      // Profile
+      const { results: staffRows } = await d1Query(env, 'SELECT * FROM staff WHERE id = ?', [String(staffId)]);
+      const staffRow = (staffRows || [])[0];
+      if (!staffRow) return json({ ok: false, error: 'Employee not found' }, 404);
+      const roleKey = String(staffRow.role || '').toLowerCase();
+
+      // ── Orders created by this employee ──────────────────────────
+      const { results: orderRows } = await d1Query(
+        env,
+        "SELECT * FROM orders WHERE created_by = ? AND created >= ? AND created <= ? AND COALESCE(voided_at,'') = '' ORDER BY created DESC",
+        [String(staffId), from, toEnd]
+      );
+      const orders = orderRows || [];
+      const orderIds = orders.map(o => o.id);
+
+      // ── Order items for those orders ────────────────────────────
+      let itemRows = [];
+      if (orderIds.length) {
+        const ph = orderIds.map(() => '?').join(',');
+        const { results } = await d1Query(
+          env,
+          `SELECT oi.*, o.created_by FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.created_by = ? AND oi.status <> 'cancelled'`,
+          [String(staffId)]
+        );
+        itemRows = results || [];
+      }
+
+      // ── Payments collected/verified by this employee ────────────
+      const { results: payRows } = await d1Query(
+        env,
+        "SELECT * FROM payments WHERE (collected_by = ? OR verified_by = ?) AND created_at >= ? AND created_at <= ? ORDER BY created_at DESC",
+        [String(staffId), String(staffId), from, toEnd]
+      );
+      const payments = payRows || [];
+
+      // ── Delivery jobs for this driver ───────────────────────────
+      let deliveryRows = [];
+      if (roleKey === 'delivery-staff') {
+        const { results } = await d1Query(
+          env,
+          "SELECT * FROM delivery WHERE driver_id = ? AND created >= ? AND created <= ? ORDER BY created DESC",
+          [String(staffId), from, toEnd]
+        );
+        deliveryRows = results || [];
+      }
+
+      // ── Waste logged by this employee ───────────────────────────
+      const { results: wasteRows } = await d1Query(
+        env,
+        "SELECT * FROM waste WHERE logged_by = ? AND date >= ? AND date <= ? ORDER BY created DESC",
+        [String(staffId), from, to]
+      );
+      const waste = wasteRows || [];
+
+      // ── Timeclock for the range ─────────────────────────────────
+      const { results: clockRows } = await d1Query(
+        env,
+        'SELECT * FROM timeclock WHERE staff_id = ? AND date >= ? AND date <= ? ORDER BY clock_in DESC',
+        [String(staffId), from, to]
+      );
+      const clocks = clockRows || [];
+
+      // ── Compute role-specific metrics ──────────────────────────
+      const totalSales = orders.reduce((s, o) => s + (Number(o.total) || 0), 0);
+      const totalTips = orders.reduce((s, o) => s + (Number(o.tip) || 0), 0);
+      const cancelledOrders = orders.filter(o => o.status === 'cancelled' || o.voided_at).length;
+      const dineInOrders = orders.filter(o => (o.type || '') === 'dine-in').length;
+      const takeawayOrders = orders.filter(o => (o.type || '') === 'takeaway').length;
+
+      // Items by category (waiter/chef)
+      const categoryMap = {};
+      const itemMap = {};
+      for (const it of itemRows) {
+        const cat = it.category || 'Other';
+        const qty = Number(it.qty) || 1;
+        categoryMap[cat] = (categoryMap[cat] || 0) + qty;
+        const name = it.name || 'Unknown';
+        itemMap[name] = (itemMap[name] || 0) + qty;
+      }
+      const categoryBreakdown = Object.entries(categoryMap)
+        .sort((a, b) => b[1] - a[1])
+        .map(([category, count]) => ({ category, count }));
+      const topItems = Object.entries(itemMap)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10)
+        .map(([name, count]) => ({ name, count }));
+
+      // Payment method breakdown (cashier)
+      const methodMap = {};
+      for (const p of payments) {
+        if (p.status === 'rejected') continue;
+        const method = p.method || 'other';
+        const amount = Number(p.amount) || 0;
+        if (!methodMap[method]) methodMap[method] = { count: 0, total: 0 };
+        methodMap[method].count++;
+        methodMap[method].total += amount;
+      }
+      const paymentBreakdown = Object.entries(methodMap).map(([method, v]) => ({
+        method, count: v.count, total: Math.round(v.total),
+      }));
+
+      // Service time: order.created → order.served_at (waiter)
+      let serviceTimes = [];
+      for (const o of orders) {
+        if (o.served_at && o.created) {
+          const ms = Date.parse(o.served_at) - Date.parse(o.created);
+          if (ms > 0 && ms < 86400000) serviceTimes.push(ms / 60000);
+        }
+      }
+      const avgServiceMin = serviceTimes.length ? Math.round(serviceTimes.reduce((a, b) => a + b, 0) / serviceTimes.length) : null;
+
+      // Prep time: order_items.preparing_at → ready_at (chef)
+      let prepTimes = [];
+      for (const it of itemRows) {
+        if (it.ready_at && it.preparing_at) {
+          const ms = Date.parse(it.ready_at) - Date.parse(it.preparing_at);
+          if (ms > 0 && ms < 86400000) prepTimes.push(ms / 60000);
+        }
+      }
+      const avgPrepMin = prepTimes.length ? Math.round(prepTimes.reduce((a, b) => a + b, 0) / prepTimes.length) : null;
+
+      // Delivery stats
+      let deliveryStats = null;
+      if (deliveryRows.length) {
+        const completed = deliveryRows.filter(d => d.status === 'delivered');
+        let deliveryTimes = [];
+        for (const d of completed) {
+          if (d.delivered_at && d.assigned_at) {
+            const ms = Date.parse(d.delivered_at) - Date.parse(d.assigned_at);
+            if (ms > 0 && ms < 86400000) deliveryTimes.push(ms / 60000);
+          }
+        }
+        const cashCollected = payments
+          .filter(p => p.method === 'cash' && p.status !== 'rejected')
+          .reduce((s, p) => s + (Number(p.amount) || 0), 0);
+        deliveryStats = {
+          assigned: deliveryRows.length,
+          completed: completed.length,
+          failed: deliveryRows.filter(d => d.status === 'cancelled' || d.status === 'failed').length,
+          avgDeliveryMin: deliveryTimes.length ? Math.round(deliveryTimes.reduce((a, b) => a + b, 0) / deliveryTimes.length) : null,
+          cashCollected: Math.round(cashCollected),
+          feesCollected: Math.round(deliveryRows.reduce((s, d) => s + (Number(d.fee) || 0), 0)),
+        };
+      }
+
+      // Attendance
+      const totalHours = clocks.reduce((s, c) => s + (c.hours || 0), 0);
+
+      // Refunds
+      const refunds = payments.filter(p => p.status === 'refunded' || (Number(p.amount) || 0) < 0);
+
+      return json({
+        ok: true,
+        from,
+        to,
+        staff: {
+          id: staffRow.id,
+          firstName: staffRow.firstName,
+          lastName: staffRow.lastName,
+          role: staffRow.role,
+          email: staffRow.email,
+          phone: staffRow.phone,
+        },
+        attendance: {
+          shifts: clocks.length,
+          totalHours: Math.round(totalHours * 10) / 10,
+          entries: clocks.map(c => ({
+            date: c.date,
+            clockIn: c.clock_in,
+            clockOut: c.clock_out,
+            hours: c.hours,
+            lateMinutes: c.late_minutes || 0,
+          })),
+        },
+        summary: {
+          ordersTaken: orders.length,
+          totalSales: Math.round(totalSales),
+          totalTips: Math.round(totalTips),
+          cancelledOrders,
+          dineInOrders,
+          takeawayOrders,
+          itemsServed: itemRows.reduce((s, it) => s + (Number(it.qty) || 1), 0),
+          paymentsProcessed: payments.filter(p => p.status !== 'rejected').length,
+          refunds: refunds.length,
+          avgServiceMin,
+          avgPrepMin,
+        },
+        categoryBreakdown,
+        topItems,
+        paymentBreakdown,
+        deliveryStats,
+        waste: {
+          count: waste.length,
+          totalCost: Math.round(waste.reduce((s, w) => s + (Number(w.est_cost) || 0), 0)),
+        },
+      });
+    }
   }
 
   // ── Breaks ────────────────────────────────────────────────────────────
