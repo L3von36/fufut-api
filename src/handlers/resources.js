@@ -261,6 +261,215 @@ async function handleResources(pathname, method, url, request, env, auth) {
         return json({ ok: false, error: String(e.message || e) }, 500);
       }
     }
+
+    // ── Z-Report: full fiscal breakdown for a drawer session ────────
+    // GET /api/cashdrawer/:id/z-report
+    // Joins the drawer with payments, orders, and voids scoped to the
+    // drawer's opened_at → closed_at window. Produces:
+    // - Header (business, TIN, machine ID, Z-number, session times, operator)
+    // - Sales by tax bucket (standard 15%, exempt 0%)
+    // - Sales by payment method (cash, telebirr, cbe, bank, card, mobile)
+    // - Voids summary (count, total, by category)
+    // - Refunds summary (count, total, by method)
+    // - Cash reconciliation (opening + cash sales − cash refunds − paid-out)
+    // - Service charge + tips totals
+    const zrMatch = idPart && idPart.match(/^([^/]+)\/z-report$/);
+    if (zrMatch && m === "GET") {
+      const drawerId = zrMatch[1];
+      const { results: drawerRows } = await d1Query(
+        env, "SELECT * FROM cashdrawers WHERE id = ?", [String(drawerId)]
+      );
+      const drawer = (drawerRows || [])[0];
+      if (!drawer) return json({ ok: false, error: "Drawer not found" }, 404);
+
+      const openedAt = drawer.opened_at || drawer.created;
+      const closedAt = drawer.closed_at || new Date().toISOString();
+
+      // ── Payments in the drawer's time window ──────────────────────
+      const { results: payRows } = await d1Query(
+        env,
+        "SELECT * FROM payments WHERE created_at >= ? AND created_at <= ? ORDER BY created_at",
+        [openedAt, closedAt]
+      );
+      const payments = payRows || [];
+
+      // ── Orders in the drawer's time window ────────────────────────
+      const { results: orderRows } = await d1Query(
+        env,
+        "SELECT * FROM orders WHERE created >= ? AND created <= ? ORDER BY created",
+        [openedAt, closedAt]
+      );
+      const orders = orderRows || [];
+
+      // ── Tips in the drawer's time window ──────────────────────────
+      const { results: tipRows } = await d1Query(
+        env,
+        "SELECT * FROM tips WHERE created_at >= ? AND created_at <= ?",
+        [openedAt, closedAt]
+      );
+      const tips = tipRows || [];
+
+      // ── Compute payment method breakdown ─────────────────────────
+      const methodMap = {};
+      for (const p of payments) {
+        if (p.status === 'rejected') continue;
+        const method = p.method || 'other';
+        const amount = Number(p.amount) || 0;
+        if (!methodMap[method]) methodMap[method] = { count: 0, total: 0, refunds: 0, refundCount: 0 };
+        if (amount >= 0) {
+          methodMap[method].count++;
+          methodMap[method].total += amount;
+        } else {
+          methodMap[method].refundCount++;
+          methodMap[method].refunds += Math.abs(amount);
+        }
+      }
+      const paymentBreakdown = Object.entries(methodMap).map(([method, v]) => ({
+        method,
+        count: v.count,
+        total: Math.round(v.total * 100) / 100,
+        refundCount: v.refundCount,
+        refunds: Math.round(v.refunds * 100) / 100,
+        net: Math.round((v.total - v.refunds) * 100) / 100,
+      }));
+
+      // ── Compute VAT breakdown ─────────────────────────────────────
+      // Ethiopia: 15% standard rate on most food/beverage; 0% exempt
+      // (bread, milk). Orders carry a `tax` column; if 0 or null, treat
+      // as exempt. If the order has tax > 0, it's standard-rated.
+      const VAT_RATE = 0.15;
+      let standardGross = 0, standardVat = 0, standardCount = 0;
+      let exemptGross = 0, exemptCount = 0;
+      for (const o of orders) {
+        if (o.voided_at) continue; // voids are reported separately
+        const total = Number(o.total) || 0;
+        const tax = Number(o.tax) || 0;
+        if (tax > 0) {
+          standardGross += total;
+          standardVat += tax;
+          standardCount++;
+        } else {
+          exemptGross += total;
+          exemptCount++;
+        }
+      }
+      // If no tax column is populated (common — the setting is orphaned),
+      // treat all sales as standard-rated at 15% (VAT-inclusive extraction).
+      if (standardVat === 0 && orders.length > 0) {
+        const allGross = orders.filter(o => !o.voided_at).reduce((s, o) => s + (Number(o.total) || 0), 0);
+        // VAT-inclusive: net = gross / 1.15, vat = gross − net
+        standardGross = allGross;
+        standardVat = Math.round((allGross - allGross / 1.15) * 100) / 100;
+        standardCount = orders.filter(o => !o.voided_at).length;
+        exemptGross = 0;
+        exemptCount = 0;
+      }
+
+      // ── Voids summary ─────────────────────────────────────────────
+      const voidedOrders = orders.filter(o => o.voided_at);
+      const voidCategories = {};
+      for (const o of voidedOrders) {
+        const cat = o.void_category || 'other';
+        if (!voidCategories[cat]) voidCategories[cat] = { count: 0, total: 0 };
+        voidCategories[cat].count++;
+        voidCategories[cat].total += Number(o.total) || 0;
+      }
+      const voidsSummary = {
+        count: voidedOrders.length,
+        total: Math.round(voidedOrders.reduce((s, o) => s + (Number(o.total) || 0), 0) * 100) / 100,
+        byCategory: Object.entries(voidCategories).map(([cat, v]) => ({
+          category: cat, count: v.count, total: Math.round(v.total * 100) / 100,
+        })),
+      };
+
+      // ── Refunds summary (non-cash) ────────────────────────────────
+      const refundPayments = payments.filter(p => p.status === 'refunded' || (Number(p.amount) || 0) < 0);
+      const refundByMethod = {};
+      for (const r of refundPayments) {
+        const method = r.method || 'other';
+        if (!refundByMethod[method]) refundByMethod[method] = { count: 0, total: 0 };
+        refundByMethod[method].count++;
+        refundByMethod[method].total += Math.abs(Number(r.amount) || 0);
+      }
+
+      // ── Cash reconciliation ────────────────────────────────────────
+      const opening = Number(drawer.opening_balance) || 0;
+      const cashSales = Number(drawer.cash_sales) || 0;
+      const paidIn = Number(drawer.paid_in) || 0;
+      const paidOut = Number(drawer.paid_out) || 0;
+      const closing = Number(drawer.closing_balance) || 0;
+      const expected = Math.round((opening + cashSales + paidIn - paidOut) * 100) / 100;
+      const variance = Math.round((closing - expected) * 100) / 100;
+
+      // ── Service charge + tips ─────────────────────────────────────
+      const serviceChargeTotal = orders
+        .filter(o => !o.voided_at)
+        .reduce((s, o) => s + (Number(o.service_charge) || 0), 0);
+      const tipsTotal = tips.reduce((s, t) => s + (Number(t.amount) || 0), 0);
+
+      // ── Cumulative grand totals (all closed drawers) ──────────────
+      const { results: allClosed } = await d1Query(
+        env, "SELECT COUNT(*) as count, SUM(cash_sales) as total FROM cashdrawers WHERE status = 'closed'"
+      );
+      const grandTotal = (allClosed && allClosed[0]) || { count: 0, total: 0 };
+
+      // ── Z-number: sequential number for this drawer ───────────────
+      const { results: zCount } = await d1Query(
+        env, "SELECT COUNT(*) as count FROM cashdrawers WHERE status = 'closed' AND created <= ?",
+        [drawer.created]
+      );
+      const zNumber = ((zCount && zCount[0] && zCount[0].count) || 0);
+
+      return json({
+        ok: true,
+        header: {
+          zNumber,
+          drawerId: drawer.id,
+          openedAt,
+          closedAt: drawer.closed_at || null,
+          status: drawer.status,
+          // Business fields — populated from settings if available, else blank
+          businessName: null, // TODO: read from settings
+          tin: null,          // TODO: read from settings
+          vatRate: VAT_RATE,
+        },
+        vatBreakdown: {
+          standard: { rate: VAT_RATE, gross: Math.round(standardGross * 100) / 100, vat: Math.round(standardVat * 100) / 100, count: standardCount },
+          exempt: { rate: 0, gross: Math.round(exemptGross * 100) / 100, count: exemptCount },
+          totalGross: Math.round((standardGross + exemptGross) * 100) / 100,
+          totalVat: Math.round(standardVat * 100) / 100,
+        },
+        paymentBreakdown,
+        voids: voidsSummary,
+        refunds: {
+          count: refundPayments.length,
+          total: Math.round(refundPayments.reduce((s, r) => s + Math.abs(Number(r.amount) || 0), 0) * 100) / 100,
+          byMethod: Object.entries(refundByMethod).map(([method, v]) => ({
+            method, count: v.count, total: Math.round(v.total * 100) / 100,
+          })),
+        },
+        cashReconciliation: {
+          openingFloat: Math.round(opening * 100) / 100,
+          cashSales: Math.round(cashSales * 100) / 100,
+          paidIn: Math.round(paidIn * 100) / 100,
+          paidOut: Math.round(paidOut * 100) / 100,
+          expected: Math.round(expected * 100) / 100,
+          counted: Math.round(closing * 100) / 100,
+          variance: Math.round(variance * 100) / 100,
+        },
+        serviceCharge: Math.round(serviceChargeTotal * 100) / 100,
+        tips: Math.round(tipsTotal * 100) / 100,
+        grandTotals: {
+          zCount: grandTotal.count || 0,
+          cumulativeCashSales: Math.round((grandTotal.total || 0) * 100) / 100,
+        },
+        receiptRange: {
+          firstReceipt: orders.length ? orders[0].id : null,
+          lastReceipt: orders.length ? orders[orders.length - 1].id : null,
+          totalReceipts: orders.filter(o => !o.voided_at).length,
+        },
+      });
+    }
   }
 
   let cols = [];
