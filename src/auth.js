@@ -201,6 +201,20 @@ const ROLE_ACCESS = {
     read: ['orders', 'inventory', 'recipes', 'units', 'alerts', 'tasks'],
     write: ['orders'],
   },
+  // The drinks station. Since order lines route by category — food to the
+  // kitchen board, drinks to the barista board — the barista's entire job
+  // against the API is reading the active lines and advancing them, so
+  // `orders` read/write is the whole grant. Everything else the board needs
+  // arrives through the standing carve-outs: menu, settings and units are
+  // readable by any signed-in staff (ANY_STAFF_READ), clocking in and out is
+  // self-service (SELF_SERVICE), and My Activity rides the self-scoped audit
+  // read. No inventory, recipes, menu-availability or alerts: stock counts and
+  // 86ing drinks stay with the chefs and the manager, and the SLA banner's
+  // silent-fail on a refused /api/alerts is the same treatment a cleaner gets.
+  barista: {
+    read: ['orders'],
+    write: ['orders'],
+  },
   'head-waiter': {
     // Reads payments to see whether a table has settled before clearing it, and
     // writes tips because a tip left on the table is theirs to record. Cannot
@@ -293,6 +307,7 @@ export const ROLES = [
   'manager',
   'head-chef',
   'assistant-chef',
+  'barista',
   'head-waiter',
   'cashier',
   'delivery-staff',

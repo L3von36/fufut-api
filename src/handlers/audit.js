@@ -44,6 +44,12 @@ const ENTITY_AUDIENCE = {
     'orders', 'inventory', 'recipes', 'menu',
     'alerts', 'timeclock', 'break', 'task', 'handover',
   ]),
+  // The barista touches only order lines and their own clock: no stock
+  // movements, no recipes, no menu edits. Their self-scoped audit view should
+  // not imply otherwise, so the list is narrower than the chefs' on purpose.
+  barista: new Set([
+    'orders', 'timeclock', 'break', 'handover',
+  ]),
   'head-waiter': new Set([
     'orders', 'tables', 'reservations', 'tips',
     'alerts', 'timeclock', 'break', 'task', 'handover',
