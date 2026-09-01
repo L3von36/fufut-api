@@ -10,6 +10,7 @@ const ROLES = [
   'manager',
   'head-chef',
   'assistant-chef',
+  'barista',
   'head-waiter',
   'cashier',
   'delivery-staff',
@@ -101,6 +102,54 @@ describe('head chef', () => {
   });
 });
 
+// The drinks station. The board rides on plain orders read/write; the
+// supporting screens (orders list, alerts, waste, recipes) landed when the
+// role was widened, each read-shaped — the write set is still just the board
+// plus the waste log.
+describe('barista', () => {
+  it('keeps the board and reads the whole ticket list', () => {
+    expect(roleMayAccess('barista', '/api/orders', GET)).toBe(true);
+    expect(roleMayAccess('barista', '/api/orders', PUT)).toBe(true);
+    // `tables` feeds the Orders screen's table filter — the same
+    // load-bearing read the cleaner's dashboard needs.
+    expect(roleMayAccess('barista', '/api/tables', GET)).toBe(true);
+    expect(roleMayAccess('barista', '/api/tables', PUT)).toBe(false);
+  });
+
+  it('reads the SLA warnings but does not sign them off', () => {
+    expect(roleMayAccess('barista', '/api/alerts', GET)).toBe(true);
+    // Same treatment as the assistant-chef: the ticket going late is theirs
+    // to rescue; acknowledging it stays with the chefs, the floor leads and
+    // the manager.
+    expect(roleMayAccess('barista', '/api/alerts/AL1/acknowledge', POST)).toBe(false);
+  });
+
+  it('logs waste against the stock list without adjusting stock', () => {
+    expect(roleMayAccess('barista', '/api/waste', GET)).toBe(true);
+    expect(roleMayAccess('barista', '/api/waste', POST)).toBe(true);
+    // The stock list is what lets a wasted carton of milk name the item —
+    // the cleaner's exact treatment. Reading stock is not adjusting it.
+    expect(roleMayAccess('barista', '/api/inventory', GET)).toBe(true);
+    expect(roleMayAccess('barista', '/api/inventory', PUT)).toBe(false);
+    expect(roleMayAccess('barista', '/api/inventory', POST)).toBe(false);
+  });
+
+  it('brews from recipes it cannot write', () => {
+    expect(roleMayAccess('barista', '/api/recipes', GET)).toBe(true);
+    expect(roleMayAccess('barista', '/api/recipes', POST)).toBe(false);
+  });
+
+  it('cannot 86 a drink — that stays with the chefs and the manager', () => {
+    expect(roleMayAccess('barista', '/api/menu/MI123/availability', PUT)).toBe(false);
+  });
+
+  it('is still refused money and colleague data', () => {
+    for (const p of ['/api/payments', '/api/tips', '/api/cashdrawer', '/api/expenses', '/api/staff', '/api/audit', '/api/payroll', '/api/leave']) {
+      expect(roleMayAccess('barista', p, GET)).toBe(false);
+    }
+  });
+});
+
 describe('assistant chef', () => {
   it('is narrower than the head chef', () => {
     expect(roleMayAccess('assistant-chef', '/api/orders', GET)).toBe(true);
@@ -175,7 +224,7 @@ describe('86ing a dish', () => {
   });
 
   it('is refused to every other role', () => {
-    for (const r of ['assistant-chef', 'head-waiter', 'cashier', 'cleaner', 'delivery-staff']) {
+    for (const r of ['assistant-chef', 'barista', 'head-waiter', 'cashier', 'cleaner', 'delivery-staff']) {
       expect(roleMayAccess(r, AVAIL, PUT)).toBe(false);
     }
   });
@@ -189,7 +238,7 @@ describe('stock control follows the head chef', () => {
   });
 
   it('grants stock writes to nobody else outside the manager', () => {
-    for (const r of ['head-waiter', 'cashier', 'cleaner', 'delivery-staff', 'assistant-chef']) {
+    for (const r of ['head-waiter', 'cashier', 'cleaner', 'delivery-staff', 'assistant-chef', 'barista']) {
       expect(roleMayAccess(r, '/api/inventory', PUT)).toBe(false);
     }
     expect(roleMayAccess('manager', '/api/inventory', PUT)).toBe(true);
@@ -534,6 +583,7 @@ describe('every role can still do its own job', () => {
     manager: ['/api/staff', GET],
     'head-chef': ['/api/orders', PUT],
     'assistant-chef': ['/api/orders', PUT],
+    barista: ['/api/orders', PUT],
     'head-waiter': ['/api/orders', POST],
     cashier: ['/api/cashdrawer', POST],
     'delivery-staff': ['/api/delivery', PUT],

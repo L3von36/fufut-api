@@ -33,6 +33,12 @@ const SCREEN_NEEDS = {
   reservations: ['reservations', 'tables'],
   delivery: ['delivery'],
   kitchen: ['orders'],
+  // The barista board: the same screen as the kitchen, pinned to the bar
+  // filter. It reads orders and nothing else.
+  barista: ['orders'],
+  // The SLA rules screen. Reads its own resource alone; who may WRITE it
+  // (acknowledge) is pinned in role-access.test.js, not here.
+  alerts: ['alerts'],
   expenses: ['expenses'],
   pnl: ['expenses', 'orders'],
   cashdrawer: ['cashdrawer'],
@@ -59,6 +65,12 @@ const POS_PERMISSIONS = {
   manager: ['dashboard', 'orders', 'open-checks', 'tables', 'menu-mgmt', 'menu-view', 'expenses', 'pnl', 'cashdrawer', 'inventory', 'waste', 'shifts', 'timeclock', 'kitchen', 'reports', 'reservations', 'delivery', 'analytics', 'checkout', 'recipes', 'suppliers', 'purchases', 'stock-control'],
   'head-chef': ['kitchen', 'orders', 'dashboard', 'inventory', 'waste', 'reports', 'pipeline', 'menu-mgmt', 'recipes', 'stock-control', 'suppliers', 'purchases', 'timeclock'],
   'assistant-chef': ['kitchen', 'orders', 'dashboard', 'inventory', 'recipes', 'timeclock'],
+  // The drinks station. The board is home; around it the role reads the full
+  // Orders list, the SLA warnings, the waste log (with the inventory read
+  // that names the item thrown away) and the drink recipes. No dashboard:
+  // the board IS the overview, and when the role was widened the owner chose
+  // the recipe book over one. Mirrors pos/src/api/index.js.
+  barista: ['barista', 'orders', 'alerts', 'waste', 'recipes', 'timeclock'],
   'head-waiter': ['tables', 'orders', 'open-checks', 'dashboard', 'menu-view', 'reservations', 'checkout', 'timeclock'],
   cashier: ['cashdrawer', 'orders', 'open-checks', 'dashboard', 'tables', 'reports', 'timeclock', 'reservations', 'revenue', 'menu-view', 'analytics', 'checkout'],
   'delivery-staff': ['delivery', 'dashboard', 'timeclock'],
@@ -106,8 +118,11 @@ describe('every granted screen is backed by readable data', () => {
 });
 
 describe('the dashboard is the awkward one', () => {
-  it('is granted to every role', () => {
-    for (const role of ROLES) {
+  it('is granted to every role except the barista', () => {
+    // The barista's board IS their screen — ROLE_DEFAULT_VIEW puts them on it
+    // at sign-in, and when the role was widened the owner chose the drink
+    // recipe book over an overview dashboard. Every other role keeps it.
+    for (const role of ROLES.filter((r) => r !== 'barista')) {
       expect(POS_PERMISSIONS[role]).toContain('dashboard');
     }
   });

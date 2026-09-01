@@ -201,19 +201,33 @@ const ROLE_ACCESS = {
     read: ['orders', 'inventory', 'recipes', 'units', 'alerts', 'tasks'],
     write: ['orders'],
   },
-  // The drinks station. Since order lines route by category — food to the
-  // kitchen board, drinks to the barista board — the barista's entire job
-  // against the API is reading the active lines and advancing them, so
-  // `orders` read/write is the whole grant. Everything else the board needs
-  // arrives through the standing carve-outs: menu, settings and units are
-  // readable by any signed-in staff (ANY_STAFF_READ), clocking in and out is
-  // self-service (SELF_SERVICE), and My Activity rides the self-scoped audit
-  // read. No inventory, recipes, menu-availability or alerts: stock counts and
-  // 86ing drinks stay with the chefs and the manager, and the SLA banner's
-  // silent-fail on a refused /api/alerts is the same treatment a cleaner gets.
+  // The drinks station. The barista board still rides on plain `orders`
+  // read/write — lines route by category, drinks to this screen, food to the
+  // kitchen — and the board remains ROLE_DEFAULT_VIEW at sign-in. Around it,
+  // the role carries the station's supporting screens, each deliberately
+  // read-shaped:
+  //
+  //   orders + tables — the full Orders list, whole tickets rather than the
+  //     board's routed lines, so the barista sees the context a drink travels
+  //     with; `tables` feeds that screen's table filter, the same
+  //     load-bearing read the cleaner's dashboard needs.
+  //   alerts — the SLA warnings, screen and board banner. Read-only like the
+  //     assistant-chef: the ticket going late is theirs to rescue, but
+  //     signing an alert off stays with the chefs, the floor leads and the
+  //     manager.
+  //   waste + inventory — logging spilled milk, stale beans and crushed cups
+  //     against real stock items. This is the cleaner's exact treatment:
+  //     `inventory` READ names the item being thrown away (waste that cannot
+  //     name a stock item never reduces stock), while the counts themselves
+  //     stay with the chefs.
+  //   recipes — they brew from them. The Recipes screen is read-only for this
+  //     role and filters itself to drink recipes.
+  //
+  // Still absent: menu-availability (86ing a drink stays with the chefs and
+  // the manager), inventory write, money, colleague data.
   barista: {
-    read: ['orders'],
-    write: ['orders'],
+    read: ['orders', 'tables', 'alerts', 'waste', 'inventory', 'recipes'],
+    write: ['orders', 'waste'],
   },
   'head-waiter': {
     // Reads payments to see whether a table has settled before clearing it, and
