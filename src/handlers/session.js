@@ -6,6 +6,7 @@ import {
   passwordProblem,
 } from '../lib/crypto.js';
 import { d1Query, d1Run, json, now, readBody } from '../lib/db.js';
+import { screenGrantsForRole } from '../lib/role-scopes.js';
 
 function getSessionToken(request) {
   const cookie = request.headers.get("Cookie") || "";
@@ -72,6 +73,11 @@ async function handleStaffLogin(request, env) {
   var expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1e3).toISOString();
   await d1Run(env, "INSERT INTO sessions (token, staff_id, role, expires_at) VALUES (?,?,?,?)", [token, staff.id, staff.role, expiresAt]);
   var user = stripPwd(staff);
+  // Extra views granted through the backoffice Role Access page (e.g. a
+  // category-scoped Inventory for the barista). Fails soft: a settings read
+  // problem must not break sign-in, only omit the extra tab.
+  var screenGrants = [];
+  try { screenGrants = await screenGrantsForRole(env, staff.role); } catch (e) { console.error("[SCREEN GRANTS]", e); }
   return new Response(
     JSON.stringify({
       ok: true,
@@ -82,6 +88,7 @@ async function handleStaffLogin(request, env) {
       // until the password is changed - but without it the UI would drop them
       // onto a dashboard that then refuses every request.
       mustChangePassword: staff.must_change_password === 1,
+      screenGrants,
     }),
     {
       status: 200,
@@ -210,7 +217,9 @@ async function handleSessionCheck(request, env) {
     return json({ ok: false, error: "Staff inactive" }, 401);
   }
   var user = stripPwd({ id: session.staff_id, firstName: session.firstName, lastName: session.lastName, email: session.email, phone: session.phone, role: session.staffRole, status: session.status, created: session.created });
-  return json({ ok: true, user, role: session.staffRole });
+  var screenGrants = [];
+  try { screenGrants = await screenGrantsForRole(env, session.staffRole); } catch (e) { console.error("[SCREEN GRANTS]", e); }
+  return json({ ok: true, user, role: session.staffRole, screenGrants });
 }
 
 async function handleLogout(request, env) {

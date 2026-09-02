@@ -19,6 +19,11 @@ import { writeAudit } from '../lib/audit.js';
 import { actorName } from '../auth.js';
 import { postMovement } from '../lib/ledger.js';
 import {
+  getRoleScope,
+  isInventoryScoped,
+  filterInventoryRows,
+} from '../lib/role-scopes.js';
+import {
   consumptionVariance,
   stockReconciliation,
   forecastRunout,
@@ -653,6 +658,48 @@ export async function handleInventory(pathname, method, url, request, env, auth)
   if (!pathname.startsWith('/api/inventory')) return null;
   const m = method.toUpperCase();
   const sub = pathname.replace(/^\/api\/inventory/, '');
+
+  // ── Role-scope narrowing (Role Access page) ──
+  // A scoped role (the barista is the first) sees only its categories in the
+  // LIST read, cannot resolve individual items outside it, and gets no stock
+  // ANALYSIS: variance, reorder and capacity aggregate the whole catalogue and
+  // quote supplier costs — exactly what the scope exists to keep away. An
+  // unscoped caller falls through unchanged; this can never widen anything.
+  const scope = await getRoleScope(env, auth ? auth.sessionRole || auth.role : null);
+  if (isInventoryScoped(auth ? auth.sessionRole || auth.role : null, scope)) {
+    if (m === 'GET' && (sub === '' || sub === '/')) {
+      const { results } = await d1Query(env, 'SELECT * FROM inventory ORDER BY created DESC');
+      return json(filterInventoryRows(results, scope));
+    }
+    // Analysis/report sub-routes BEFORE the single-item match, so "/variance"
+    // is never mistaken for an item id.
+    if (
+      m === 'GET' &&
+      ['/variance', '/forecast', '/reorder', '/capacity', '/expiring'].includes(sub)
+    ) {
+      return json(
+        { ok: false, error: 'Stock reports are limited to roles with full stock access' },
+        403
+      );
+    }
+    const STOCK_REPORT = 'Stock reports are limited to roles with full stock access';
+    if (m === 'GET' && /^\/usage\/([^/]+)$/.test(sub)) {
+      return json({ ok: false, error: STOCK_REPORT }, 403);
+    }
+    if (m === 'GET' && /^\/([^/]+)\/movements$/.test(sub)) {
+      return json({ ok: false, error: STOCK_REPORT }, 403);
+    }
+    if (m === 'GET' && /^\/([^/]+)\/reconciliation$/.test(sub)) {
+      return json({ ok: false, error: STOCK_REPORT }, 403);
+    }
+    const single = sub.match(/^\/([^/]+)$/);
+    if (m === 'GET' && single) {
+      const { results } = await d1Query(env, 'SELECT * FROM inventory WHERE id = ?', [single[1]]);
+      const visible = filterInventoryRows(results, scope);
+      if (!visible.length) return json({ ok: false, error: 'Inventory item not found' }, 404);
+      return json(visible[0]);
+    }
+  }
 
   // Collection routes first, so "variance" and "forecast" are never read as an
   // item id — the same ordering trap the kitchen's /items/active route has.

@@ -35,6 +35,7 @@ import { handleGallery } from './handlers/gallery.js';
 import { handleUpload } from './handlers/upload.js';
 import { handleMigration } from './handlers/migration.js';
 import { handleResources } from './handlers/resources.js';
+import { handleRoleScopes } from './handlers/role-scopes.js';
 import { handleTables, releaseOverstayedTables } from './handlers/tables.js';
 import { handleStaff } from './handlers/staff.js';
 import { handlePublicStats } from './handlers/stats.js';
@@ -220,6 +221,12 @@ async function route(pathname, method, url, request, env, ctx, auth) {
   // editing of staff are handled here; GET and DELETE fall through.
   const staff = await handleStaff(pathname, method, request, env);
   if (staff !== null) return staff;
+
+  // The manager's permission-granter (Role Access page). Manager-only via
+  // MANAGER_ONLY in auth.js; must precede handleResources, which would 404 the
+  // path as an unknown resource table.
+  const roleScopes = await handleRoleScopes(pathname, method, url, request, env, auth);
+  if (roleScopes !== null) return roleScopes;
 
   const resources = await handleResources(pathname, method, url, request, env);
   if (resources !== null) return resources;

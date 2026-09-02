@@ -108,6 +108,11 @@ const MANAGER_ONLY = [
   { method: 'PUT', prefix: '/api/settings' },
   // Running payroll commits the business to paying people.
   { method: 'POST', exact: '/api/payroll/run' },
+  // The Role Access page's endpoints: reading the saved scopes and granting or
+  // narrowing what another role sees. Deciding who sees what is the owner's
+  // job, not a shared one — the same reasoning as POST /api/staff above.
+  { method: 'GET', exact: '/api/role-scopes' },
+  { method: 'PUT', prefix: '/api/role-scopes/' },
 ];
 
 /**
