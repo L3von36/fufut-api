@@ -10,8 +10,10 @@
  * Storage is the existing `settings` key/value table (values are JSON), keyed
  * `roleScope.<role>` — one row per role, upserted by the manager. No migration,
  * because the table was built for exactly this shape of configuration. The
- * value is `{ <screenKey>: { enabled: bool, categories?: [..] } }` — the
- * categories list is inventory's alone.
+ * value is `{ <screenKey>: { enabled: bool, categories?: [..], itemIds?: [..] } }`
+ * — both lists belong to inventory alone, and itemIds is only stored when
+ * hand-picked items exist (older rows without it keep parsing: a missing list
+ * is an empty one).
  *
  * What a grant does and does not do:
  *   - enabled screen  → the POS shows that tab (login/auth-me carry
@@ -22,10 +24,14 @@
  *   - implied reads   → a screen's own data needs: the Waste form names items
  *     from inventory, the Orders screen filters by tables. Implies are GET-only
  *     and never become nav tabs.
- *   - inventory scope → when the Inventory screen itself is enabled with
- *     categories, every inventory LIST read narrows to them (also for implied
- *     callers, so the waste picker narrows with it). Analysis reports —
- *     variance, reorder, capacity — stay behind the scope.
+ *   - inventory scope → when the Inventory screen itself is enabled, every
+ *     inventory LIST read narrows to the chosen categories PLUS any
+ *     hand-picked individual items (an item is visible when its category is
+ *     picked OR its id is — so "mostly drinks, but also lemons" is one save).
+ *     Implied callers narrow with it, so the waste picker narrows too.
+ *     Analysis reports — variance, reorder, capacity — stay away from roles
+ *     whose stock access came from a grant; roles that already had inventory
+ *     in the static matrix (head-chef) keep the reports they always had.
  *   - The manager role is never scoped or granted — the owner sees everything,
  *     and the Role Access page refuses to create a manager row.
  */
@@ -45,10 +51,10 @@ export const SCOPABLE_SCREENS = [
   {
     key: 'inventory',
     label: 'Inventory',
-    blurb: 'Stock levels and the item list. Scope it to the categories this role actually touches.',
+    blurb: 'Stock levels and the item list. Scope it to whole categories, single items, or both.',
     methods: ['GET'],
     impliesRead: [],
-    scoping: 'categories',
+    scoping: 'categories+items',
   },
   {
     key: 'waste',
@@ -132,12 +138,24 @@ export function isInventoryScoped(role, scope) {
   return !!(scope && scope.inventory && scope.inventory.enabled);
 }
 
-/** Narrow a list of inventory rows to the scoped categories. */
+/**
+ * Narrow a list of inventory rows to the scoped slice: a row survives when
+ * its category is picked OR its id was hand-picked. Neither list present
+ * (absent, corrupt, or nothing picked) means "see nothing" — the same
+ * fail-closed direction as before, because setRoleScope refuses to save an
+ * enabled scope with both lists empty anyway.
+ */
 export function filterInventoryRows(rows, scope) {
-  const cats = scope && scope.inventory && scope.inventory.categories;
-  if (!Array.isArray(cats)) return [];
-  const allow = new Set(cats);
-  return (rows || []).filter((r) => allow.has(r && r.category));
+  const inv = scope && scope.inventory;
+  const cats = inv && inv.categories;
+  const items = inv && inv.itemIds;
+  const allowCat = Array.isArray(cats) ? new Set(cats) : null;
+  const allowItem = Array.isArray(items) ? new Set(items) : null;
+  if (!allowCat && !allowItem) return [];
+  return (rows || []).filter((r) => {
+    if (!r) return false;
+    return (allowCat && allowCat.has(r.category)) || (allowItem && allowItem.has(r.id));
+  });
 }
 
 /** Every scope row saved so far, for the Role Access page's overview. */
@@ -197,20 +215,32 @@ export async function setRoleScope(env, role, screens, auth) {
       let categories = Array.isArray(cfg.categories)
         ? [...new Set(cfg.categories.map((c) => String(c || '').trim()).filter(Boolean))]
         : [];
+      // Hand-picked items sit beside whole categories: an item is visible when
+      // EITHER list admits it. Ids are validated against the live catalogue so
+      // a stale or typo'd id can never quietly widen or empty the slice.
+      let itemIds = Array.isArray(cfg.itemIds)
+        ? [...new Set(cfg.itemIds.map((id) => String(id || '').trim()).filter(Boolean))]
+        : [];
       if (enabled) {
-        const { results } = await d1Query(env, 'SELECT DISTINCT category FROM inventory WHERE category IS NOT NULL');
-        const live = new Set((results || []).map((r) => r.category));
-        const unknown = categories.filter((c) => !live.has(c));
+        const { results } = await d1Query(env, 'SELECT id, category FROM inventory');
+        const liveCats = new Set((results || []).map((r) => r.category).filter(Boolean));
+        const liveIds = new Set((results || []).map((r) => r.id));
+        const unknown = categories.filter((c) => !liveCats.has(c));
         if (unknown.length) {
           return { ok: false, error: `Unknown inventory categories: ${unknown.join(', ')}` };
         }
-        if (!categories.length) {
-          return { ok: false, error: 'Pick at least one category, or turn inventory access off.' };
+        const unknownIds = itemIds.filter((id) => !liveIds.has(id));
+        if (unknownIds.length) {
+          return { ok: false, error: `Unknown inventory items: ${unknownIds.join(', ')}` };
+        }
+        if (!categories.length && !itemIds.length) {
+          return { ok: false, error: 'Pick at least one category or item, or turn inventory access off.' };
         }
       } else {
         categories = [];
+        itemIds = [];
       }
-      value.inventory = { enabled, categories };
+      value.inventory = itemIds.length ? { enabled, categories, itemIds } : { enabled, categories };
     } else {
       value[screenKey] = { enabled };
     }

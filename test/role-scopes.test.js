@@ -54,6 +54,10 @@ function makeEnv({ scopeRows = {}, inventoryRows = [] } = {}) {
             const live = [...new Set(inventoryRows.map((r) => r.category).filter(Boolean))];
             return { results: live.map((category) => ({ category })) };
           }
+          if (/SELECT id, category FROM inventory/.test(sql)) {
+            // setRoleScope validates both lists against the live catalogue.
+            return { results: inventoryRows.map((r) => ({ id: r.id, category: r.category })) };
+          }
           if (/SELECT \* FROM inventory WHERE id = \?/.test(sql)) {
             return { results: inventoryRows.filter((r) => r.id === String(params[0])) };
           }
@@ -127,9 +131,25 @@ describe('filterInventoryRows', () => {
     expect(out.map((r) => r.id)).toEqual(['I-beans', 'I-milk', 'I-cup']);
   });
 
+  it('admits hand-picked items even when their category is not scoped', () => {
+    const out = filterInventoryRows(CATALOGUE, { inventory: { enabled: true, itemIds: ['I-beef'] } });
+    expect(out.map((r) => r.id)).toEqual(['I-beef']);
+  });
+
+  it('unions categories and hand-picked items', () => {
+    const out = filterInventoryRows(CATALOGUE, {
+      inventory: { enabled: true, categories: ['Coffee & Tea'], itemIds: ['I-beef'] },
+    });
+    expect(out.map((r) => r.id)).toEqual(['I-beans', 'I-beef']);
+  });
+
   it('returns nothing when the scope has no category list', () => {
     expect(filterInventoryRows(CATALOGUE, { inventory: { enabled: true } })).toEqual([]);
     expect(filterInventoryRows(CATALOGUE, { inventory: { enabled: true, categories: [] } })).toEqual([]);
+  });
+
+  it('returns nothing when both lists are empty', () => {
+    expect(filterInventoryRows(CATALOGUE, { inventory: { enabled: true, categories: [], itemIds: [] } })).toEqual([]);
   });
 });
 
@@ -181,6 +201,47 @@ describe('setRoleScope', () => {
     const { env } = makeEnv({ inventoryRows: CATALOGUE });
     const res = await setRoleScope(env, 'barista', { inventory: { enabled: true, categories: [] } }, null);
     expect(res.ok).toBe(false);
+  });
+
+  it('saves a scope of hand-picked items without any category, deduped', async () => {
+    const { env } = makeEnv({ inventoryRows: CATALOGUE });
+    const res = await setRoleScope(
+      env,
+      'cleaner',
+      { inventory: { enabled: true, categories: [], itemIds: ['I-cup', 'I-cup', ' I-milk '] } },
+      null
+    );
+    expect(res.ok).toBe(true);
+    await expect(getRoleScope(env, 'cleaner')).resolves.toEqual({
+      inventory: { enabled: true, categories: [], itemIds: ['I-cup', 'I-milk'] },
+    });
+  });
+
+  it('refuses an unknown item id the same way as an unknown category', async () => {
+    const { env } = makeEnv({ inventoryRows: CATALOGUE });
+    const res = await setRoleScope(
+      env,
+      'barista',
+      { inventory: { enabled: true, categories: [], itemIds: ['I-ghost'] } },
+      null
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/I-ghost/);
+  });
+
+  it('drops hand-picked items when the screen is switched off', async () => {
+    const { env } = makeEnv({ inventoryRows: CATALOGUE });
+    const res = await setRoleScope(
+      env,
+      'head-waiter',
+      { inventory: { enabled: false, categories: ['Packaging'], itemIds: ['I-beef'] }, waste: { enabled: true } },
+      null
+    );
+    expect(res.ok).toBe(true);
+    await expect(getRoleScope(env, 'head-waiter')).resolves.toEqual({
+      inventory: { enabled: false, categories: [] },
+      waste: { enabled: true },
+    });
   });
 
   it('saves a valid scope and reports it back', async () => {
@@ -258,7 +319,7 @@ describe('handleRoleScopes', () => {
     const body = await res.json();
     expect(body.ok).toBe(true);
     expect(body.screens.map((s) => s.key)).toEqual(SCOPABLE_SCREENS.map((s) => s.key));
-    expect(body.screens.find((s) => s.key === 'inventory').scoping).toBe('categories');
+    expect(body.screens.find((s) => s.key === 'inventory').scoping).toBe('categories+items');
     expect(body.roles).toContain('barista');
     expect(body.roles).not.toContain('manager');
     expect(body.categories).toContain('Proteins');
@@ -328,6 +389,59 @@ describe('scoped inventory reads in handleInventory', () => {
     const inScope = req('GET', '/api/inventory/I-beans');
     const resIn = await handleInventory(inScope.url.pathname, inScope.method, inScope.url, inScope.request, env, { sessionRole: 'barista' });
     expect((await resIn.json()).id).toBe('I-beans');
+  });
+
+  it('narrows the list to hand-picked items when no category is scoped', async () => {
+    const { env } = makeEnv({
+      scopeRows: {
+        'roleScope.cleaner': JSON.stringify({ inventory: { enabled: true, categories: [], itemIds: ['I-cup'] } }),
+      },
+      inventoryRows: CATALOGUE,
+    });
+    const { method, url, request } = req('GET', '/api/inventory');
+    const res = await handleInventory(url.pathname, method, url, request, env, { sessionRole: 'cleaner' });
+    const body = await res.json();
+    expect(body.map((r) => r.id)).toEqual(['I-cup']);
+  });
+
+  it('admits a hand-picked item on a direct read even outside the scoped categories', async () => {
+    const { env } = makeEnv({
+      scopeRows: {
+        'roleScope.cleaner': JSON.stringify({
+          inventory: { enabled: true, categories: ['Packaging'], itemIds: ['I-beef'] },
+        }),
+      },
+      inventoryRows: CATALOGUE,
+    });
+    const beef = req('GET', '/api/inventory/I-beef');
+    const resBeef = await handleInventory(beef.url.pathname, beef.method, beef.url, beef.request, env, { sessionRole: 'cleaner' });
+    expect(resBeef.status).toBe(200);
+
+    const milk = req('GET', '/api/inventory/I-milk');
+    const resMilk = await handleInventory(milk.url.pathname, milk.method, milk.url, milk.request, env, { sessionRole: 'cleaner' });
+    expect(resMilk.status).toBe(404);
+  });
+
+  it('keeps the stock reports a role already owned statically (head-chef) while narrowing its list', async () => {
+    const { env } = makeEnv({
+      scopeRows: {
+        'roleScope.head-chef': JSON.stringify({ inventory: { enabled: true, categories: ['Proteins'] } }),
+      },
+      inventoryRows: CATALOGUE,
+    });
+    const list = req('GET', '/api/inventory');
+    const resList = await handleInventory(list.url.pathname, list.method, list.url, list.request, env, { sessionRole: 'head-chef' });
+    expect((await resList.json()).map((r) => r.id)).toEqual(['I-beef']);
+
+    // The chef's Stock Control screen lives on these routes — a scope must
+    // never turn them into a 404 ("reorder" is not an item id) or a 403.
+    // (Exemption rule: static inventory WRITE — see the scope block.)
+    for (const path of ['/api/inventory/reorder', '/api/inventory/variance', '/api/inventory/capacity']) {
+      const { method, url, request } = req('GET', path);
+      const res = await handleInventory(url.pathname, method, url, request, env, { sessionRole: 'head-chef' });
+      expect(res.status).toBe(200);
+      expect((await res.json()).ok).toBe(true);
+    }
   });
 
   it('leaves everything alone for an unscoped role and for the manager', async () => {
