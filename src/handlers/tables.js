@@ -195,9 +195,13 @@ async function releaseOverstayedTables(env, maxHours = DEFAULT_TABLE_MAX_HOURS, 
     const owes = owedTables.has(normaliseTableId(table.number) || String(table.number));
     const nextStatus = owes ? 'cleaning' : 'available';
 
+    // The party resets but the SECTION does not: `server` is what the
+    // head-waiter scoping matches on, so the sweep must not scrub the name —
+    // an abandoned table goes back to the same waiter's section, not to
+    // nobody. Only a manager reassignment moves a table between sections.
     await d1Run(
       env,
-      "UPDATE tables SET status = ?, seated_at = '', guests = 0, server = '' WHERE id = ?",
+      "UPDATE tables SET status = ?, seated_at = '', guests = 0 WHERE id = ?",
       [nextStatus, table.id]
     );
     (owes ? releasedOwing : released).push(table.number);

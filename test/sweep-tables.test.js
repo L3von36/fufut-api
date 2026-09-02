@@ -141,14 +141,17 @@ describe('releaseOverstayedTables', () => {
     expect(updates[0].params[1]).toBe('T07'); // SET seated_at = now WHERE id = ?
   });
 
-  it('clears the sitting when it releases, so the timer stops', async () => {
+  it('clears the sitting when it releases, so the timer stops — but keeps the section owner', async () => {
     const { env, updates } = makeEnv({
       tables: [occupiedTable(9, 8)],
     });
 
     await releaseOverstayedTables(env, 4, now);
 
-    // status, seated_at, guests, server — all reset in one statement.
-    expect(updates[0].sql).toMatch(/seated_at = '', guests = 0, server = ''/);
+    // status, seated_at, guests reset in one statement; `server` deliberately
+    // survives: it is the table's section (head-waiter scoping matches on it),
+    // not the departing party's runner.
+    expect(updates[0].sql).toMatch(/seated_at = '', guests = 0 WHERE id = \?/);
+    expect(updates[0].sql).not.toMatch(/server/);
   });
 });

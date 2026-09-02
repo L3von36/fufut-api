@@ -755,14 +755,16 @@ async function transferCheck(orderId, request, env, auth) {
   );
 
   // Free the table they left, but only once nothing is owed on it. Another
-  // party's tab may still be sitting there.
+  // party's tab may still be sitting there. The section owner (`server`)
+  // stays: the party moved, the table did not — its next party is still the
+  // section waiter's until a manager reassigns.
   let sourceFreed = false;
   if (src) {
     const remaining = await openChecksForTable(env, from, orderId);
     if (!remaining.length) {
       await d1Run(
         env,
-        "UPDATE tables SET status = 'available', seated_at = '', guests = 0, server = '' WHERE id = ?",
+        "UPDATE tables SET status = 'available', seated_at = '', guests = 0 WHERE id = ?",
         [src.id]
       );
       sourceFreed = true;
