@@ -34,7 +34,7 @@ export async function handleRoleScopes(pathname, method, url, request, env, auth
     ]);
     return json({
       ok: true,
-      screens: SCOPABLE_SCREENS,
+      screens: SCOPABLE_SCREENS.map(({ key, label, blurb, scoping }) => ({ key, label, blurb, scoping })),
       roles: SCOPABLE_ROLES,
       categories: (invRows || []).map((r) => r.category),
       scopes,
@@ -45,10 +45,13 @@ export async function handleRoleScopes(pathname, method, url, request, env, auth
   if (m === 'PUT' && put) {
     const data = await readBody(request);
     if (data === undefined || data === null || typeof data !== 'object') {
-      return json({ ok: false, error: 'JSON body required ({inventory:{enabled,categories}} or {inventory:null} to clear)' }, 400);
+      return json({ ok: false, error: 'JSON body required ({screens:{...}} or {clear:true})' }, 400);
     }
-    // {inventory: null} or {} clears the role back to its static defaults.
-    const res = await setRoleScope(env, decodeURIComponent(put[1]), data.inventory ? data : null, auth);
+    // {clear:true} revokes everything; otherwise the body carries the COMPLETE
+    // desired screen set for the role.
+    const res = data.clear
+      ? await setRoleScope(env, decodeURIComponent(put[1]), null, auth)
+      : await setRoleScope(env, decodeURIComponent(put[1]), data.screens, auth);
     if (!res.ok) return json(res, 400);
     return json(res);
   }

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   SCOPABLE_SCREENS,
   SCOPABLE_ROLES,
@@ -8,6 +8,8 @@ import {
   screenGrantsForRole,
   isInventoryScoped,
   filterInventoryRows,
+  roleMayAccessWithGrants,
+  resetGrantCache,
 } from '../src/lib/role-scopes.js';
 import { handleRoleScopes } from '../src/handlers/role-scopes.js';
 import { handleInventory } from '../src/handlers/inventory.js';
@@ -161,6 +163,13 @@ describe('setRoleScope', () => {
     expect(res.ok).toBe(false);
   });
 
+  it('refuses an unknown screen', async () => {
+    const { env } = makeEnv({ inventoryRows: CATALOGUE });
+    const res = await setRoleScope(env, 'barista', { payroll: { enabled: true } }, null);
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/payroll/);
+  });
+
   it('refuses an unknown category so a typo cannot silently hide everything', async () => {
     const { env } = makeEnv({ inventoryRows: CATALOGUE });
     const res = await setRoleScope(env, 'barista', { inventory: { enabled: true, categories: ['Cofee & Tea'] } }, null);
@@ -186,6 +195,37 @@ describe('setRoleScope', () => {
     await expect(getRoleScope(env, 'barista')).resolves.toEqual({
       inventory: { enabled: true, categories: ['Coffee & Tea', 'Packaging'] },
     });
+  });
+
+  it('saves a multi-screen grant (waste + recipes) beside inventory', async () => {
+    const { env } = makeEnv({ inventoryRows: CATALOGUE });
+    const res = await setRoleScope(
+      env,
+      'head-waiter',
+      {
+        inventory: { enabled: false, categories: [] },
+        waste: { enabled: true },
+        recipes: { enabled: true },
+        orders: { enabled: false },
+      },
+      null
+    );
+    expect(res.ok).toBe(true);
+    await expect(getRoleScope(env, 'head-waiter')).resolves.toEqual({
+      inventory: { enabled: false, categories: [] },
+      waste: { enabled: true },
+      recipes: { enabled: true },
+      orders: { enabled: false },
+    });
+    await expect(screenGrantsForRole(env, 'head-waiter')).resolves.toEqual(['waste', 'recipes']);
+  });
+
+  it('deletes the row when nothing is enabled instead of storing a zombie grant', async () => {
+    const { env } = makeEnv({ scopeRows: { 'roleScope.barista': BARISTA_SCOPE }, inventoryRows: CATALOGUE });
+    const res = await setRoleScope(env, 'barista', { inventory: { enabled: false, categories: [] } }, null);
+    expect(res.ok).toBe(true);
+    expect(res.cleared).toBe(true);
+    await expect(getRoleScope(env, 'barista')).resolves.toBeNull();
   });
 
   it('clears a scope back to the role’s static defaults', async () => {
@@ -217,7 +257,8 @@ describe('handleRoleScopes', () => {
     const res = await handleRoleScopes(url.pathname, method, url, request, env, null);
     const body = await res.json();
     expect(body.ok).toBe(true);
-    expect(body.screens).toEqual(SCOPABLE_SCREENS);
+    expect(body.screens.map((s) => s.key)).toEqual(SCOPABLE_SCREENS.map((s) => s.key));
+    expect(body.screens.find((s) => s.key === 'inventory').scoping).toBe('categories');
     expect(body.roles).toContain('barista');
     expect(body.roles).not.toContain('manager');
     expect(body.categories).toContain('Proteins');
@@ -227,7 +268,7 @@ describe('handleRoleScopes', () => {
   it('persists a PUT and answers the saved scope', async () => {
     const { env } = makeEnv({ inventoryRows: CATALOGUE });
     const { method, url, request } = req('PUT', '/api/role-scopes/head-chef', {
-      inventory: { enabled: true, categories: ['Proteins'] },
+      screens: { inventory: { enabled: true, categories: ['Proteins'] } },
     });
     const res = await handleRoleScopes(url.pathname, method, url, request, env, { firstName: 'A', lastName: 'F', staff_id: 'S1' });
     expect((await res.json()).ok).toBe(true);
@@ -236,12 +277,22 @@ describe('handleRoleScopes', () => {
     });
   });
 
-  it('clears a scope on PUT with a null inventory', async () => {
+  it('clears a scope on PUT with clear:true', async () => {
     const { env } = makeEnv({ scopeRows: { 'roleScope.barista': BARISTA_SCOPE }, inventoryRows: CATALOGUE });
-    const { method, url, request } = req('PUT', '/api/role-scopes/barista', { inventory: null });
+    const { method, url, request } = req('PUT', '/api/role-scopes/barista', { clear: true });
     const res = await handleRoleScopes(url.pathname, method, url, request, env, null);
     expect((await res.json()).cleared).toBe(true);
     await expect(getRoleScope(env, 'barista')).resolves.toBeNull();
+  });
+
+  it('saves a multi-screen grant through the endpoint', async () => {
+    const { env } = makeEnv({ inventoryRows: CATALOGUE });
+    const { method, url, request } = req('PUT', '/api/role-scopes/cashier', {
+      screens: { inventory: { enabled: false, categories: [] }, waste: { enabled: true } },
+    });
+    const res = await handleRoleScopes(url.pathname, method, url, request, env, null);
+    expect((await res.json()).ok).toBe(true);
+    await expect(screenGrantsForRole(env, 'cashier')).resolves.toEqual(['waste']);
   });
 });
 
@@ -292,5 +343,79 @@ describe('scoped inventory reads in handleInventory', () => {
     // The manager keeps the report: scoping narrows other roles, never the owner.
     expect(resB.status).toBe(200);
     expect((await resB.json()).ok).toBe(true);
+  });
+});
+
+describe('roleMayAccessWithGrants — widened by manager grants', () => {
+  beforeEach(() => {
+    // The grant cache is module-level (it survives between requests in a real
+    // isolate); these cases each stand up a fresh D1 fake, so wipe it.
+    resetGrantCache();
+  });
+
+  it('lets a role granted Waste read and log waste', async () => {
+    const { env } = makeEnv({ scopeRows: { 'roleScope.head-waiter': JSON.stringify({ waste: { enabled: true } }) } });
+    await expect(roleMayAccessWithGrants(env, 'head-waiter', '/api/waste', 'GET')).resolves.toBe(true);
+    await expect(roleMayAccessWithGrants(env, 'head-waiter', '/api/waste', 'POST')).resolves.toBe(true);
+  });
+
+  it('keeps waste deletion manager-only even for a granted role', async () => {
+    const { env } = makeEnv({ scopeRows: { 'roleScope.head-waiter': JSON.stringify({ waste: { enabled: true } }) } });
+    await expect(roleMayAccessWithGrants(env, 'head-waiter', '/api/waste/W1', 'DELETE')).resolves.toBe(false);
+  });
+
+  it('implies the reads a screen needs: waste names items from inventory, orders filters by tables', async () => {
+    const { env } = makeEnv({
+      scopeRows: {
+        'roleScope.head-waiter': JSON.stringify({ waste: { enabled: true }, orders: { enabled: true } }),
+      },
+    });
+    await expect(roleMayAccessWithGrants(env, 'head-waiter', '/api/inventory', 'GET')).resolves.toBe(true);
+    await expect(roleMayAccessWithGrants(env, 'head-waiter', '/api/tables', 'GET')).resolves.toBe(true);
+    // …but implied reads are GET-only and grant no tab of their own rights.
+    await expect(roleMayAccessWithGrants(env, 'head-waiter', '/api/inventory/I-milk', 'PUT')).resolves.toBe(false);
+  });
+
+  it('grants recipes read-only', async () => {
+    const { env } = makeEnv({ scopeRows: { 'roleScope.cashier': JSON.stringify({ recipes: { enabled: true } }) } });
+    await expect(roleMayAccessWithGrants(env, 'cashier', '/api/recipes', 'GET')).resolves.toBe(true);
+    await expect(roleMayAccessWithGrants(env, 'cashier', '/api/recipes/R1', 'PUT')).resolves.toBe(false);
+    await expect(roleMayAccessWithGrants(env, 'cashier', '/api/recipes', 'POST')).resolves.toBe(false);
+  });
+
+  it('grants orders read-only — the ticket list, not the write path', async () => {
+    const { env } = makeEnv({ scopeRows: { 'roleScope.cleaner': JSON.stringify({ orders: { enabled: true } }) } });
+    await expect(roleMayAccessWithGrants(env, 'cleaner', '/api/orders', 'GET')).resolves.toBe(true);
+    await expect(roleMayAccessWithGrants(env, 'cleaner', '/api/orders', 'POST')).resolves.toBe(false);
+    await expect(roleMayAccessWithGrants(env, 'cleaner', '/api/orders/O1', 'PUT')).resolves.toBe(false);
+  });
+
+  it('never widens anything for a role with no grant row', async () => {
+    const { env } = makeEnv();
+    await expect(roleMayAccessWithGrants(env, 'head-waiter', '/api/waste', 'GET')).resolves.toBe(false);
+    await expect(roleMayAccessWithGrants(env, 'cleaner', '/api/recipes', 'GET')).resolves.toBe(false);
+  });
+
+  it('never reaches a manager-only resource, whatever was granted', async () => {
+    const { env } = makeEnv({
+      scopeRows: {
+        'roleScope.cleaner': JSON.stringify({
+          inventory: { enabled: true, categories: ['Cleaning'] },
+          waste: { enabled: true },
+          recipes: { enabled: true },
+          orders: { enabled: true },
+        }),
+      },
+    });
+    await expect(roleMayAccessWithGrants(env, 'cleaner', '/api/staff', 'GET')).resolves.toBe(false);
+    await expect(roleMayAccessWithGrants(env, 'cleaner', '/api/role-scopes', 'GET')).resolves.toBe(false);
+    await expect(roleMayAccessWithGrants(env, 'cleaner', '/api/settings', 'PUT')).resolves.toBe(false);
+  });
+
+  it('refreshes within the same env as soon as the scope is saved (cache invalidated)', async () => {
+    const { env } = makeEnv({ inventoryRows: CATALOGUE });
+    await expect(roleMayAccessWithGrants(env, 'cashier', '/api/waste', 'GET')).resolves.toBe(false);
+    await setRoleScope(env, 'cashier', { waste: { enabled: true } }, null);
+    await expect(roleMayAccessWithGrants(env, 'cashier', '/api/waste', 'GET')).resolves.toBe(true);
   });
 });

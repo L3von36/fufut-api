@@ -34,6 +34,7 @@
 
 import { json } from './lib/db.js';
 import { getAuthUser } from './handlers/session.js';
+import { roleMayAccessWithGrants } from './lib/role-scopes.js';
 
 /** Routes reachable with no session at all. */
 const PUBLIC = [
@@ -624,7 +625,11 @@ export async function authorize(request, env, pathname, method, url) {
     }
   }
 
-  if (!roleMayAccess(role, pathname, method)) {
+  // The static role matrix decides first. The manager's Role Access grants
+  // can then widen a role for exactly the resources of the screens they were
+  // granted (see lib/role-scopes.js) — read-shaped, never reaching a
+  // manager-only route, which the MANAGER_ONLY gate above already refused.
+  if (!(await roleMayAccessWithGrants(env, role, pathname, method))) {
     return {
       ok: false,
       response: json(
