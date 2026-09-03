@@ -177,6 +177,112 @@ async function variance(env, url) {
   });
 }
 
+/**
+ * GET /api/inventory/snapshot?date=YYYY-MM-DD — the shelf as it stood at the
+ * end of that day. The ledger makes this a lookup rather than a guess: every
+ * movement carries the running balance after it, so the last row inside the
+ * day IS the closing figure. Items with no ledger history that far back
+ * (stock seeded before the ledger, or items created later) fall back to
+ * arithmetic backwards from today's stock, and say so via `basis`.
+ *
+ * The day columns answer the manager's actual questions — what arrived, what
+ * the sales consumed, what was thrown out, what a count corrected.
+ */
+async function snapshot(env, url) {
+  const date = String(url.searchParams.get('date') || new Date().toISOString().slice(0, 10)).slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return json({ ok: false, error: 'date must be YYYY-MM-DD' }, 400);
+  }
+  // Ledger timestamps come in two shapes — Addis-local "YYYY-MM-DD HH:MM:SS"
+  // and ISO-UTC "...Z" — so the day is bracketed by date *prefixes*, which
+  // compare correctly against both shapes. The same convention the
+  // reconciliation window already uses.
+  const dayStart = date;
+  const nextDay = new Date(new Date(date + 'T00:00:00Z').getTime() + 86400000)
+    .toISOString().slice(0, 10);
+
+  const mats = await d1Query(
+    env,
+    'SELECT inventory_id, MAX(at) AS mat FROM stock_movements WHERE at < ? GROUP BY inventory_id',
+    [nextDay]
+  );
+  const matMap = new Map((mats.results || []).map((r) => [String(r.inventory_id), r.mat]));
+
+  // Resolve each item's closing balance from its last movement inside the
+  // window. Ties on the same timestamp resolve to the last row inserted —
+  // rowid order — which is the balance the ledger actually ended on.
+  const lastByItem = new Map();
+  if (matMap.size) {
+    const minMat = [...matMap.values()].reduce((m, v) => (v < m ? v : m));
+    const rows = (await d1Query(
+      env,
+      'SELECT inventory_id, at, balance_after FROM stock_movements WHERE at >= ? AND at < ? ORDER BY rowid ASC',
+      [minMat, nextDay]
+    )).results || [];
+    for (const r of rows) {
+      const want = matMap.get(String(r.inventory_id));
+      if (want !== undefined && r.at <= want && r.balance_after != null) {
+        lastByItem.set(String(r.inventory_id), r.balance_after);
+      }
+    }
+  }
+
+  const after = await d1Query(
+    env,
+    'SELECT inventory_id, SUM(qty) AS net FROM stock_movements WHERE at >= ? GROUP BY inventory_id',
+    [nextDay]
+  );
+  const afterMap = new Map((after.results || []).map((r) => [String(r.inventory_id), num(r.net)]));
+
+  const day = await d1Query(
+    env,
+    `SELECT inventory_id,
+            SUM(CASE WHEN type = 'purchase' THEN qty ELSE 0 END) AS purchased,
+            SUM(CASE WHEN type = 'sale'     THEN qty ELSE 0 END) AS sold,
+            SUM(CASE WHEN type = 'waste'    THEN qty ELSE 0 END) AS wasted,
+            SUM(CASE WHEN type IN ('adjustment','count','void_reversal') THEN qty ELSE 0 END) AS adjusted
+       FROM stock_movements WHERE at >= ? AND at < ? GROUP BY inventory_id`,
+    [dayStart, nextDay]
+  );
+  const dayMap = new Map((day.results || []).map((r) => [String(r.inventory_id), r]));
+
+  const inv = await d1Query(env, 'SELECT id, name, unit, category, stock FROM inventory');
+  const rows = (inv.results || [])
+    .map((i) => {
+      const id = String(i.id);
+      const last = lastByItem.get(id);
+      const basis = last != null ? 'ledger' : 'estimate';
+      const stockAtDate = last != null ? num(last) : num(i.stock) - num(afterMap.get(id));
+      const d = dayMap.get(id) || {};
+      return {
+        inventoryId: i.id,
+        name: i.name,
+        unit: i.unit,
+        category: i.category || '',
+        stockAtDate: roundQty(stockAtDate, i.unit),
+        basis,
+        stockNow: roundQty(num(i.stock), i.unit),
+        day: {
+          // Sale and waste rows are stored negative; report what left as a
+          // positive quantity — "the day consumed 4 kg", not "-4".
+          purchased: roundQty(num(d.purchased), i.unit),
+          sold: roundQty(-num(d.sold), i.unit),
+          wasted: roundQty(-num(d.wasted), i.unit),
+          adjusted: roundQty(num(d.adjusted), i.unit),
+        },
+      };
+    })
+    .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+
+  return json({
+    ok: true,
+    date,
+    items: rows,
+    note:
+      'Stock at end of day comes from the ledger\u2019s own running balance; items without ledger history that far back are estimated backwards from today\u2019s stock and marked estimated. Day boundaries follow the timestamps recorded in the ledger.',
+  });
+}
+
 /** GET /api/inventory/:id/reconciliation — the §27 statement for one item. */
 async function reconciliation(env, url, id) {
   const { from, to } = windowFrom(url);
@@ -690,7 +796,7 @@ export async function handleInventory(pathname, method, url, request, env, auth)
     const STOCK_REPORT = 'Stock reports are limited to roles with full stock access';
     const isAnalysis =
       m === 'GET' &&
-      (['/variance', '/forecast', '/reorder', '/capacity', '/expiring'].includes(sub) ||
+      (['/variance', '/snapshot', '/forecast', '/reorder', '/capacity', '/expiring'].includes(sub) ||
         /^\/usage\/([^/]+)$/.test(sub) ||
         /^\/([^/]+)\/movements$/.test(sub) ||
         /^\/([^/]+)\/reconciliation$/.test(sub));
@@ -712,6 +818,7 @@ export async function handleInventory(pathname, method, url, request, env, auth)
   // Collection routes first, so "variance" and "forecast" are never read as an
   // item id — the same ordering trap the kitchen's /items/active route has.
   if (m === 'GET' && sub === '/variance') return variance(env, url);
+  if (m === 'GET' && sub === '/snapshot') return snapshot(env, url);
   if (m === 'GET' && sub === '/forecast') return forecast(env, url);
   if (m === 'GET' && sub === '/reorder') return reorder(env);
   if (m === 'GET' && sub === '/capacity') return menuCapacity(env, url);
