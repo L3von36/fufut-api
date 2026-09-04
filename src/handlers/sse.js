@@ -1,6 +1,6 @@
 import { mapResourceRow } from './resources.js';
 import { d1Query } from '../lib/db.js';
-import { ruleWhitelistForRole } from './alerts.js';
+import { alertVisibleTo, allowedRuleIdsForRole } from './alerts.js';
 
 function sseEvent(event, data) {
   const enc = new TextEncoder();
@@ -11,9 +11,11 @@ async function handleSSE(request, env, channel, auth) {
   // The alerts channel must apply the same role-targeted filter as
   // GET /api/alerts — otherwise a chef's tablet would see every open alert
   // pushed via SSE even though listAlerts correctly returns 0 to them. The
-  // filter (ruleWhitelistForRole from handlers/alerts.js) returns null for a
-  // manager (sees everything) or an array of allowed rule_ids.
-  const alertsAllowedRules = (channel === 'alerts') ? ruleWhitelistForRole(auth) : null;
+  // pre-filter (allowedRuleIdsForRole) returns null for a manager (sees
+  // everything) or an array of allowed rule_ids; the per-row refinement
+  // (station, targeted pings) is the same alertVisibleTo the list endpoint
+  // uses, so the two surfaces can never disagree about who saw what.
+  const alertsAllowedRules = (channel === 'alerts') ? allowedRuleIdsForRole(auth) : [];
   const alertsManagerSeesAll = alertsAllowedRules === null;
   const encoder = new TextEncoder();
 
@@ -55,9 +57,9 @@ async function handleSSE(request, env, channel, auth) {
             // feed is the point — the banner goes away when the floor fixes it.
             // Filtered by the caller's role so a chef's banner only sees
             // kitchen-relevant rules (preparing-too-long, new-unaccepted,
-            // ready-not-served) — same filter as GET /api/alerts. Without
-            // this the SSE push would leak every open alert to every
-            // connected tablet.
+            // ready-not-served) — same filter as GET /api/alerts. Station and
+            // per-person targeting are applied per row below; without all of
+            // this the SSE push would leak every open alert to every tablet.
             let rows;
             if (alertsManagerSeesAll) {
               ({ results: rows } = await d1Query(env, "SELECT * FROM alerts WHERE status = 'open' ORDER BY created DESC LIMIT 100"));
@@ -71,8 +73,9 @@ async function handleSSE(request, env, channel, auth) {
                 alertsAllowedRules
               ));
             }
+            const visible = (rows || []).filter((r) => alertVisibleTo(r, auth));
             eventName = "alerts_update";
-            payload = { alerts: rows || [] };
+            payload = { alerts: visible };
           } else if (isActivityChannel) {
             // Live activity feed: pushes the 50 most recent audit_log entries
             // to managers every 10s. Manager-only — checked at the top of

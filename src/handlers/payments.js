@@ -28,6 +28,7 @@ import { d1Query, d1Run, json, readBody, fireAndForget } from '../lib/db.js';
 import { writeAudit } from '../lib/audit.js';
 import { actorName, isManager } from '../auth.js';
 import { addToOpenDrawerCash } from '../lib/drawer.js';
+import { normaliseTableId } from '../lib/staleness.js';
 
 /** Methods the business accepts. Anything else is refused rather than stored. */
 const METHODS = new Set(['cash', 'telebirr', 'cbe', 'bank', 'card', 'mobile', 'other']);
@@ -102,6 +103,44 @@ export async function refreshPaymentStatus(env, orderId) {
     paidAt || null,
     orderId,
   ]);
+
+  // The bill request that summoned the cashier has done its job the moment
+  // the table's last open check settles: a request still standing after the
+  // money is taken is a lie on the cashier's screen. Cleared here — the one
+  // place every settle path flows through — when nothing else on the table
+  // is still owed. table_id may spell the table "T-01" or "1"; the same
+  // normalisation the sweep uses folds them together. Best-effort: a failed
+  // clear never fails the payment.
+  if (status === 'paid' && order.table_id) {
+    try {
+      const wanted = normaliseTableId(order.table_id);
+      if (wanted) {
+        const { results: stillOpen } = await d1Query(
+          env,
+          "SELECT id FROM orders WHERE COALESCE(voided_at, '') = '' " +
+            "AND status NOT IN ('cancelled','completed') AND table_id IS NOT NULL AND id <> ?",
+          [orderId]
+        );
+        const others = (stillOpen || []).filter(
+          (o) => normaliseTableId(o.table_id) === wanted &&
+                 !['paid', 'overpaid'].includes(String(o.payment_status || '').toLowerCase())
+        );
+        if (!others.length) {
+          // Match the table row by normalised number (the tables.id is a
+          // surrogate key the order never stores).
+          const { results: tbl } = await d1Query(env, 'SELECT id, number FROM tables');
+          const match = (tbl || []).find((t) => normaliseTableId(t.number) === wanted);
+          if (match) {
+            await d1Run(
+              env,
+              "UPDATE tables SET bill_requested_at = '', bill_requested_by = '' WHERE id = ? AND COALESCE(bill_requested_at, '') <> ''",
+              [match.id]
+            );
+          }
+        }
+      }
+    } catch { /* best-effort clear */ }
+  }
 
   return { ...fin, status };
 }

@@ -342,11 +342,31 @@ async function activeReservations(env) {
  * deriving that on the client would mean shipping the grace-period rule to
  * every screen and keeping the copies in step. The server owns the rule; the
  * client renders what it is told.
+ *
+ * Enriched with two service facts the floor plan and the cashier's screen
+ * both read:
+ *   payment — the money state of the party's open checks, derived from the
+ *     orders on the table: 'paid' when every open check is settled, 'partial'
+ *     when some money is down but a bill is still open, 'unpaid' when nothing
+ *     has been taken, null when the table has no open checks. This is the
+ *     "is the table paid?" answer — previously a question the floor asked a
+ *     human, because no screen carried it.
+ *   bill_requested_at / bill_requested_by — the pending "bring the bill"
+ *     request a waiter raises from the floor plan and the cashier clears by
+ *     settling. Columns ride the SELECT *, cleared by the request endpoints
+ *     below, by a payment that settles the table's last open check, and by
+ *     any status change that ends the party.
  */
 async function listTablesWithHolds(env) {
-  const [{ results: tables }, reservations] = await Promise.all([
+  const [{ results: tables }, reservations, { results: openOrders }] = await Promise.all([
     d1Query(env, 'SELECT * FROM tables ORDER BY number'),
     activeReservations(env),
+    d1Query(
+      env,
+      "SELECT table_id, payment_status FROM orders " +
+      "WHERE table_id IS NOT NULL AND COALESCE(voided_at, '') = '' " +
+      "AND status IN ('new','confirmed','preparing','ready','served','fulfilled')"
+    ),
   ]);
 
   const nowMs = Date.now();
@@ -359,6 +379,23 @@ async function listTablesWithHolds(env) {
       holdByTable.set(r.table_id, r);
     }
   }
+
+  // Open checks grouped per table. table_id spells one table three ways
+  // ("T-01", "Table 1", "1") — the same normalisation the sweep uses.
+  const checksByTable = new Map();
+  for (const o of openOrders || []) {
+    const key = normaliseTableId(o.table_id);
+    if (!key) continue;
+    if (!checksByTable.has(key)) checksByTable.set(key, []);
+    checksByTable.get(key).push(String(o.payment_status || '').toLowerCase());
+  }
+  const moneyState = (states) => {
+    if (!states || !states.length) return null;
+    const settled = (s) => s === 'paid' || s === 'overpaid';
+    if (states.every(settled)) return 'paid';
+    if (states.some(settled) || states.some((s) => s === 'partial')) return 'partial';
+    return 'unpaid';
+  };
 
   return (tables || []).map((t) => {
     const hold = holdByTable.get(t.id);
@@ -377,6 +414,7 @@ async function listTablesWithHolds(env) {
             blocksNow: blocksSeating(hold, nowMs),
           }
         : null,
+      payment: moneyState(checksByTable.get(normaliseTableId(t.number) || String(t.number || ''))),
     });
   });
 }
@@ -640,6 +678,84 @@ async function handleTables(pathname, method, url, request, env, auth) {
     });
   }
 
+  /**
+   * POST /api/tables/:id/request-bill — the waiter's "table X asks for the
+   * bill".
+   *
+   * The floor has always shouted this across the room; now it has a write.
+   * The stamp lands on the table row, rides the tables SSE channel to the
+   * cashier's screen within seconds, and clears when the bill is settled
+   * (payments.js), the waiter retracts it, or the party ends. Idempotent: a
+   * double tap reports the request already standing rather than restamping
+   * it, so the cashier sees the moment it was first asked, not last asked.
+   *
+   * Who may raise it: the roles the matrix lets write `tables` — the
+   * head-waiter and the manager. The cashier is the recipient, not the
+   * asker; the floor plan is where a table is, and the cashier has no
+   * `tables` write by design.
+   */
+  if (m === 'POST' && parts.length === 4 && parts[3] === 'request-bill') {
+    const role = String((auth && (auth.sessionRole || auth.role)) || '').toLowerCase();
+    if (role !== 'manager' && role !== 'head-waiter') {
+      return json({ ok: false, error: 'Only the floor lead or a manager can request a bill.' }, 403);
+    }
+    const tableId = parts[2];
+    const { results } = await d1Query(env, 'SELECT id, number, status, bill_requested_at FROM tables WHERE id = ?', [tableId]);
+    const table = (results || [])[0];
+    if (!table) return json({ ok: false, error: 'Table not found' }, 404);
+    if (String(table.status || '').toLowerCase() !== 'occupied') {
+      return json({ ok: false, error: `Table ${table.number} has no party to bill.` }, 409);
+    }
+    if (String(table.bill_requested_at || '').trim()) {
+      return json({ ok: true, alreadyRequested: true, requestedAt: table.bill_requested_at });
+    }
+    const stampIso = new Date().toISOString();
+    await d1Run(
+      env,
+      "UPDATE tables SET bill_requested_at = ?, bill_requested_by = ? WHERE id = ?",
+      [stampIso, actorName(auth), tableId]
+    );
+    await writeAudit(env, auth, {
+      action: 'update',
+      entity: 'tables',
+      entityId: tableId,
+      reason: `Bill requested for table ${table.number}`,
+    });
+    return json({ ok: true, requestedAt: stampIso });
+  }
+
+  /**
+   * POST /api/tables/:id/cancel-bill-request — retract or dismiss a pending
+   * request. The floor lead who raised it, or a manager. (The cashier's way
+   * of clearing one is settling the bill — that path clears the stamp in
+   * payments.js — and a party leaving clears it with the table status.)
+   */
+  if (m === 'POST' && parts.length === 4 && parts[3] === 'cancel-bill-request') {
+    const role = String((auth && (auth.sessionRole || auth.role)) || '').toLowerCase();
+    if (role !== 'manager' && role !== 'head-waiter') {
+      return json({ ok: false, error: 'Only the floor lead or a manager can clear a bill request.' }, 403);
+    }
+    const tableId = parts[2];
+    const { results } = await d1Query(env, 'SELECT id, number, bill_requested_at FROM tables WHERE id = ?', [tableId]);
+    const table = (results || [])[0];
+    if (!table) return json({ ok: false, error: 'Table not found' }, 404);
+    if (!String(table.bill_requested_at || '').trim()) {
+      return json({ ok: true, alreadyClear: true });
+    }
+    await d1Run(
+      env,
+      "UPDATE tables SET bill_requested_at = '', bill_requested_by = '' WHERE id = ?",
+      [tableId]
+    );
+    await writeAudit(env, auth, {
+      action: 'update',
+      entity: 'tables',
+      entityId: tableId,
+      reason: `Bill request cleared for table ${table.number}`,
+    });
+    return json({ ok: true });
+  }
+
   if (m === 'PUT' && parts.length === 3) {
     const tableId = parts[2];
     // Clone before reading: a request body can only be consumed once, and this
@@ -698,6 +814,32 @@ async function handleTables(pathname, method, url, request, env, auth) {
     }
 
     const nextStatus = String(data.status || '').toLowerCase();
+
+    // ── Bill-request clearing ────────────────────────────────────────────────
+    // A request that outlives its party is a lie on the cashier's screen: the
+    // moment a table stops being occupied — freed at checkout, swept to
+    // cleaning, moved to reserved — its pending "bring the bill" is dropped.
+    // Its own write rather than smuggled fields: the generic handler reads
+    // the original body, which was already cloned for the gate above.
+    // Column-missing (pre-migration-026) fails soft — the PUT proceeds.
+    if (data.status !== undefined && nextStatus && nextStatus !== 'occupied') {
+      try {
+        const { meta: cleared } = await d1Run(
+          env,
+          "UPDATE tables SET bill_requested_at = '', bill_requested_by = '' WHERE id = ? AND COALESCE(bill_requested_at, '') <> ''",
+          [tableId]
+        );
+        if (cleared && cleared.changes) {
+          await writeAudit(env, auth, {
+            action: 'update',
+            entity: 'tables',
+            entityId: tableId,
+            reason: `Bill request cleared — table moved to '${nextStatus}'`,
+          });
+        }
+      } catch { /* pre-migration schema: nothing to clear */ }
+    }
+
     if (!SEATING_STATUSES.includes(nextStatus)) return null; // not a seating change
 
     // ── Is somebody already sitting here? ────────────────────────────────────

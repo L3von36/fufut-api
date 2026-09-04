@@ -18,6 +18,7 @@
 import { d1Query, d1Run, json, readBody, now, vid } from '../lib/db.js';
 import { writeAudit } from '../lib/audit.js';
 import { actorName } from '../auth.js';
+import { normaliseTableId } from '../lib/staleness.js';
 import {
   evaluateAll,
   dedupeKey,
@@ -98,6 +99,57 @@ async function loadSweepRows(env) {
 }
 
 /**
+ * Stamp each order row with the name of the waiter its table is assigned to
+ * (`table_server`), so a ready-now ping can name — and be aimed at — the
+ * person waiting on it. A JS join because orders.table_id spells one table
+ * three ways ("T-01", "Table 1", "1"); the same normalisation the sweep's
+ * own rules use folds them together.
+ */
+function withTableServers(orders, tables) {
+  if (!orders || !orders.length) return orders;
+  const serverByTable = new Map();
+  for (const t of tables || []) {
+    const key = normaliseTableId(t.number);
+    if (key) serverByTable.set(key, String(t.server || '').trim());
+  }
+  for (const o of orders) {
+    o.table_server = serverByTable.get(normaliseTableId(o.table_id || o.table_number)) || '';
+  }
+  return orders;
+}
+
+/**
+ * Map of "first last" (lowercased, the way tables.server writes it) to the
+ * staff id, for stamping ready-now pings with their intended reader. One
+ * query per sweep, built only when a ping actually needs it.
+ */
+async function loadStaffByName(env) {
+  try {
+    const { results } = await d1Query(env, 'SELECT id, firstName, lastName FROM staff');
+    const map = new Map();
+    for (const s of results || []) {
+      const full = [s.firstName, s.lastName].filter(Boolean).join(' ').trim().toLowerCase();
+      if (full && s.id) map.set(full, s.id);
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
+/**
+ * Who a ready-now ping is for: the waiter assigned to the table, else the
+ * staff member who created the order (takeaways ring up under a person),
+ * else nobody — an untargeted row broadcasts to every head-waiter.
+ */
+function resolveReadyNowTarget(v, staffByName) {
+  const byName = v.target_name && staffByName.get(String(v.target_name).trim().toLowerCase());
+  if (byName) return byName;
+  const creator = String(v.created_by || '').trim();
+  return creator || '';
+}
+
+/**
  * Run the rules and reconcile `alerts` with what they found.
  *
  * Raises, escalates and de-escalates in place, and resolves everything whose
@@ -110,7 +162,19 @@ export async function runAlertSweep(env) {
   if (!th.enabled) return { skipped: true, raised: 0, changed: 0, resolved: 0 };
 
   const rows = await loadSweepRows(env);
+  withTableServers(rows.orders, rows.tables);
   const violations = evaluateAll(rows, Date.now(), th);
+
+  // Ready-now pings name a person: resolve tables.server / created_by to a
+  // staff id here, so the audience filter can aim the row. One staff read
+  // per sweep, only when a ping is live.
+  let staffByName = null;
+  for (const v of violations) {
+    if (v.rule_id !== RULE_IDS.READY_NOW) continue;
+    if (!staffByName) staffByName = await loadStaffByName(env);
+    v.target_staff_id = resolveReadyNowTarget(v, staffByName);
+  }
+
   const wanted = new Map();
   for (const v of violations) wanted.set(dedupeKey(v), v);
 
@@ -118,7 +182,7 @@ export async function runAlertSweep(env) {
   // re-raising; a resolved row is forgotten here on purpose.
   const { results: live } = await d1Query(
     env,
-    "SELECT id, rule_id, entity_type, entity_id, severity, status FROM alerts WHERE status IN ('open','acknowledged')"
+    "SELECT id, rule_id, entity_type, entity_id, severity, status, station, target_staff_id FROM alerts WHERE status IN ('open','acknowledged')"
   );
   const existing = new Map();
   for (const r of live || []) existing.set(`${r.rule_id}|${r.entity_type}|${r.entity_id}`, r);
@@ -133,22 +197,28 @@ export async function runAlertSweep(env) {
     if (!row) {
       await d1Run(
         env,
-        `INSERT INTO alerts (id, rule_id, severity, entity_type, entity_id, entity_label, message, status, created, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`,
-        [vid(), v.rule_id, v.severity, v.entity_type, v.entity_id, v.entity_label || '', v.message, stamp, stamp]
+        `INSERT INTO alerts (id, rule_id, severity, entity_type, entity_id, entity_label, message, status, station, target_staff_id, created, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)`,
+        [vid(), v.rule_id, v.severity, v.entity_type, v.entity_id, v.entity_label || '', v.message, v.station || '', v.target_staff_id || '', stamp, stamp]
       );
       raised += 1;
       continue;
     }
     // Severity moves with the condition while the alert is open: a ticket
     // that crossed from warning into critical must say so, and one that was
-    // re-timed back under must not keep shouting. Acked rows are the floor's
-    // problem now, not the sweep's.
-    if (row.status === 'open' && row.severity !== v.severity) {
+    // re-timed back under must not keep shouting. Station and target are
+    // refreshed the same way — a legacy row picks up its station on the
+    // first sweep that can classify it, and a ping re-aims if the table's
+    // assignment changed. Acked rows are the floor's problem now.
+    if (row.status === 'open' && (
+      row.severity !== v.severity ||
+      String(row.station || '') !== String(v.station || '') ||
+      String(row.target_staff_id || '') !== String(v.target_staff_id || '')
+    )) {
       await d1Run(
         env,
-        'UPDATE alerts SET severity = ?, message = ?, updated_at = ? WHERE id = ?',
-        [v.severity, v.message, stamp, row.id]
+        'UPDATE alerts SET severity = ?, message = ?, station = ?, target_staff_id = ?, updated_at = ? WHERE id = ?',
+        [v.severity, v.message, v.station || '', v.target_staff_id || '', stamp, row.id]
       );
       changed += 1;
     }
@@ -181,54 +251,129 @@ function isManager(auth) {
  * kitchen can act on. The chef ignored the banner, which is the same as not
  * having one.
  *
- * The map is keyed by `rule_id` (stable strings from RULE_IDS) and the value
- * is the set of roles that should see alerts raised by that rule. A manager
- * always sees everything — they are the floor's fallback for any problem.
+ * The map is keyed by `rule_id` (stable strings from RULE_IDS) and each entry
+ * describes its audience in one of three shapes:
  *
- * Order rules split by stage:
- *   - PREPARING_TOO_LONG, NEW_UNACCEPTED — kitchen's clock, kitchen's job
- *   - READY_NOT_SERVED — kitchen marked it ready, but the waiter is who
- *     needs to fetch it. Both need to see it (the kitchen to know the food
- *     is sitting, the waiter to know it is theirs to pick up).
- *   - SERVED_UNPAID — money on the floor. Cashier owns it; head-waiter can
- *     remind the guest. The kitchen has no part in this.
+ *   { all: [roles] }          — every row of this rule goes to every listed
+ *                               role (money rules, floor rules, HR rules).
+ *   { kitchen: […], bar: […] } — order-stage rules split by STATION: the row's
+ *                               `station` column ('bar' | 'kitchen' | 'mixed'
+ *                               | '' legacy) picks the bucket. 'mixed' reaches
+ *                               both buckets — both stations hold unfinished
+ *                               lines on that ticket. '' (unclassifiable legacy
+ *                               rows) lands in the kitchen bucket, which was
+ *                               the audience before the split existed.
+ *   { targeted: [roles] }     — rows meant for one person: the pickup ping is
+ *                               stamped with `target_staff_id` (the waiter
+ *                               assigned to the table, else the order's
+ *                               creator). A targeted role sees rows with no
+ *                               target or with their own id — a cashier never
+ *                               receives the chef's table ping.
  *
- * Filtering by `rule_id` rather than `entity_type` is deliberate: an order
- * can be the entity behind four different rules with four different
+ * The manager is deliberately absent from every list: they bypass the map and
+ * see everything, because they are the floor's fallback for any problem.
+ *
+ * Filtering by `rule_id` + station rather than `entity_type` is deliberate:
+ * an order can be the entity behind five different rules with five different
  * audiences, and `entity_type='order'` alone cannot tell them apart.
  */
 const RULE_AUDIENCE = {
-  'order-preparing-too-long':     new Set(['manager', 'head-chef', 'assistant-chef']),
-  'order-new-unaccepted':         new Set(['manager', 'head-chef', 'assistant-chef']),
-  'order-ready-not-served':       new Set(['manager', 'head-chef', 'assistant-chef', 'head-waiter']),
-  'order-served-unpaid':          new Set(['manager', 'cashier', 'head-waiter']),
-  'delivery-ready-unassigned':    new Set(['manager', 'delivery-staff']),
-  'delivery-in-transit-too-long': new Set(['manager', 'delivery-staff']),
-  'reservation-no-show':          new Set(['manager', 'head-waiter']),
-  'table-seated-too-long':        new Set(['manager', 'head-waiter']),
-  'employee-forgot-clock-out':    new Set(['manager']),
-  'employee-late-arrival':        new Set(['manager']),
+  // Kitchen's clock, kitchen's job — and the bar's clock, the barista's job.
+  // A tea ticket nobody accepted is a bar problem; before the station split
+  // these all rang on the kitchen tablet while the drinks sat.
+  'order-preparing-too-long':     { kitchen: ['head-chef', 'assistant-chef'], bar: ['barista'] },
+  'order-new-unaccepted':         { kitchen: ['head-chef', 'assistant-chef'], bar: ['barista'] },
+  // Kitchen marked it ready, but the waiter is who needs to fetch it. The
+  // station that made it also needs to see it sitting. A drink ready on the
+  // pass is the barista's + the waiter's; food ready is kitchen + waiter.
+  'order-ready-not-served':       { kitchen: ['head-chef', 'assistant-chef', 'head-waiter'], bar: ['barista', 'head-waiter'] },
+  // The instant pickup ping. Targeted at the assigned waiter (fallback: the
+  // order's creator, then every head-waiter). Cashier is in the list for the
+  // takeaway case — a takeaway ticket they rung up pings them, not the floor.
+  'order-ready-now':              { targeted: ['head-waiter', 'cashier'] },
+  // Money on the floor. Cashier owns it; head-waiter can remind the guest.
+  // The kitchen has no part in this — before the audience map, the pass was
+  // reading "bill still open" between tickets.
+  'order-served-unpaid':          { all: ['cashier', 'head-waiter'] },
+  'delivery-ready-unassigned':    { all: ['delivery-staff'] },
+  'delivery-in-transit-too-long': { all: ['delivery-staff'] },
+  'reservation-no-show':          { all: ['head-waiter'] },
+  'table-seated-too-long':        { all: ['head-waiter'] },
+  // People clocks are the manager's alone — no other role can act on them.
+  'employee-forgot-clock-out':    { all: [] },
+  'employee-late-arrival':        { all: [] },
 };
 
 /**
- * The rule_ids a given role should see, as a SQL IN-list placeholder string
- * (e.g. `'order-preparing-too-long','order-new-unaccepted'`). Returns `null`
- * for a manager — they see every rule, so no WHERE clause is needed.
- *
- * Also returns `null` when `auth` is missing (anonymous caller — the auth
- * gate should have refused the request already, but defense in depth).
+ * Can this auth see this alert row? The single source of truth for every
+ * surface that serves alerts — the list endpoint, the SSE channel and the
+ * acknowledge gate all call this, so the three can never disagree about who
+ * saw what (the drift this replaces is exactly how one dashboard ended up
+ * reading another's alerts).
  */
-function ruleWhitelistForRole(auth) {
-  if (!auth) return null;
-  const role = String(auth.sessionRole || auth.role || '').toLowerCase();
-  if (!role) return null;
+function alertVisibleTo(row, auth) {
+  if (!row) return false;
+  const role = String((auth && (auth.sessionRole || auth.role)) || '').toLowerCase();
+  if (!role) return false;
+  if (role === 'manager') return true; // the floor's fallback sees everything
+  const spec = RULE_AUDIENCE[row.rule_id];
+  if (!spec) return false; // unknown rule — manager-only by definition
+
+  if (spec.all) return spec.all.includes(role);
+
+  if (spec.targeted) {
+    if (!spec.targeted.includes(role)) return false;
+    const target = String(row.target_staff_id || '').trim();
+    if (!target) return true; // untargeted row: broadcast to the whole list
+    // A targeted row is for one person. If the session carries no staff id
+    // (defensive — sessions always do), fail closed rather than leak.
+    const myId = String((auth && auth.staff_id) || '');
+    return !!myId && target === myId;
+  }
+
+  const station = String(row.station || '').toLowerCase();
+  const inBucket = (names) => Array.isArray(names) && names.includes(role);
+  if (station === 'bar') return inBucket(spec.bar);
+  if (station === 'mixed') return inBucket(spec.bar) || inBucket(spec.kitchen);
+  // '', 'kitchen' and anything unreadable land in the kitchen bucket — the
+  // audience the pre-station rows were written for.
+  return inBucket(spec.kitchen);
+}
+
+/**
+ * The rule_ids a given role could see at least some rows of, as a SQL
+ * IN-list (index-friendly pre-filter). Returns `null` for a manager — they
+ * see every rule, so no WHERE clause is needed — and `[]` for a role with no
+ * audience at all. Rows are then refined by alertVisibleTo, so this list is
+ * an optimisation, never the permission itself.
+ */
+function allowedRuleIdsForRole(auth) {
+  if (!auth) return [];
+  const role = String((auth && (auth.sessionRole || auth.role)) || '').toLowerCase();
+  if (!role) return [];
   if (role === 'manager') return null; // manager sees everything
   const allowed = new Set();
-  for (const [ruleId, roles] of Object.entries(RULE_AUDIENCE)) {
-    if (roles.has(role)) allowed.add(ruleId);
+  for (const [ruleId, spec] of Object.entries(RULE_AUDIENCE)) {
+    if (spec.all) {
+      if (spec.all.includes(role)) allowed.add(ruleId);
+      continue;
+    }
+    if (spec.targeted) {
+      if (spec.targeted.includes(role)) allowed.add(ruleId);
+      continue;
+    }
+    const buckets = [spec.kitchen, spec.bar];
+    if (buckets.some((b) => Array.isArray(b) && b.includes(role))) allowed.add(ruleId);
   }
-  if (!allowed.size) return []; // role has no business seeing any alert
   return [...allowed];
+}
+
+/**
+ * Back-compat shim — the pre-station filter by rule_id alone. The SSE
+ * handler and tests used this name; both callers now use the pair above.
+ */
+function ruleWhitelistForRole(auth) {
+  return allowedRuleIdsForRole(auth);
 }
 
 /** GET /api/alerts — open by default, ?status=… or ?all=1 to widen. */
@@ -239,10 +384,12 @@ async function listAlerts(url, env, auth) {
   const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 500) : 200;
 
   // Role-targeted filtering: only managers see every alert. Everyone else
-  // sees only the rules in their audience. Applied on top of the status
-  // filter so a head-chef asking for ?status=acknowledged still only sees
-  // kitchen-relevant acked rows, not the cashier's.
-  const allowedRules = ruleWhitelistForRole(auth);
+  // sees only the rules in their audience — refined per row by station (a
+  // chef sees kitchen tickets, the barista sees bar tickets) and by target
+  // (a pickup ping aimed at another waiter stays theirs). Applied on top of
+  // the status filter so a head-chef asking for ?status=acknowledged still
+  // only sees kitchen-relevant acked rows, not the cashier's.
+  const allowedRules = allowedRuleIdsForRole(auth);
   // `wantsAll` is a manager's tool (the SLA Alerts dashboard "show history"
   // toggle). A non-manager who somehow passes ?all=1 still gets the
   // role filter applied — they cannot widen their view by adding a param.
@@ -262,12 +409,16 @@ async function listAlerts(url, env, auth) {
       // through, this is the second door.)
       rows = [];
     } else {
+      // SQL narrows by rule_id (cheap index work); station and target are
+      // row-level judgements, applied here so the list endpoint, the SSE
+      // channel and the ack gate share one implementation.
       const placeholders = allowedRules.map(() => '?').join(',');
       ({ results: rows } = await d1Query(
         env,
         `SELECT * FROM alerts WHERE status = ? AND rule_id IN (${placeholders}) ORDER BY created DESC LIMIT ?`,
         [status, ...allowedRules, limit]
       ));
+      rows = (rows || []).filter((r) => alertVisibleTo(r, auth));
     }
   }
   return json({ ok: true, alerts: rows || [] });
@@ -307,9 +458,9 @@ async function acknowledgeOne(id, request, env, auth) {
   // Defense-in-depth on top of the role-targeted filter: even if a non-manager
   // somehow obtains the id of an alert outside their audience, they cannot ack
   // it. The same RULE_AUDIENCE map that gates listAlerts gates this — a chef
-  // cannot ack a table-seated or served-unpaid alert.
-  const allowedRules = ruleWhitelistForRole(auth);
-  if (allowedRules !== null && !allowedRules.includes(row.rule_id)) {
+  // cannot ack a table-seated or served-unpaid alert, and a cashier cannot
+  // ack a kitchen ticket's alert by id.
+  if (!alertVisibleTo(row, auth)) {
     return json({ ok: false, error: 'Not permitted: this alert is for a different role' }, 403);
   }
 
@@ -364,4 +515,4 @@ async function handleAlerts(pathname, method, url, request, env, auth) {
   return null;
 }
 
-export { handleAlerts, listAlerts, ruleWhitelistForRole, RULE_AUDIENCE, RULE_IDS, SEVERITY };
+export { handleAlerts, listAlerts, alertVisibleTo, allowedRuleIdsForRole, ruleWhitelistForRole, RULE_AUDIENCE, RULE_IDS, SEVERITY };

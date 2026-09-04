@@ -1,4 +1,4 @@
-import { d1Query, d1Run, d1Batch, json, readBody, fireAndForget } from '../lib/db.js';
+import { d1Query, d1Run, d1Batch, json, readBody, fireAndForget, now, vid } from '../lib/db.js';
 import { writeAudit } from '../lib/audit.js';
 import { actorName, isManager } from '../auth.js';
 import { refreshPaymentStatus } from './payments.js';
@@ -14,6 +14,7 @@ import {
   DEFAULT_KITCHEN_STALE_HOURS,
   DEFAULT_TABLE_MAX_HOURS,
 } from '../lib/staleness.js';
+import { RULE_IDS, orderLabel, orderStation } from '../lib/rules.js';
 
 const ACTIVE_LIST = ACTIVE_STATUSES.map((s) => `'${s}'`).join(', ');
 
@@ -52,6 +53,94 @@ const ORDER_TO_ITEM_STATUS = {
 function mapOrderRow(o) {
   const tn = o.table_id || o.table_number || o.tableNum || null;
   return Object.assign({}, o, { tableNum: tn, table_number: tn });
+}
+
+/**
+ * The pickup ping — an order just became ready, tell the person waiting on it.
+ *
+ * Raised in real time here (so the waiter's banner moves within one SSE tick
+ * of the kitchen's tap) and kept alive by the cron sweep for as long as the
+ * ticket sits uncollected, the two paths sharing the rule|order dedupe key so
+ * neither can raise it twice.
+ *
+ * The row is aimed at a person, in this order:
+ *   1. the waiter assigned to the table (tables.server, matched to staff by
+ *      display name — the same matching the section scoping uses);
+ *   2. the staff member who created the order (takeaway tickets ring up
+ *      under a person);
+ *   3. nobody — the row stays untargeted and every head-waiter sees it.
+ *
+ * Delivery orders are skipped on purpose: their job rows carry the driver
+ * state and the delivery rules speak for them.
+ *
+ * Fail-open by design — a ping that cannot be written must never fail the
+ * kitchen's "ready" tap that raised it.
+ */
+async function raiseReadyNowPing(env, order) {
+  try {
+    if (!order || !order.id) return;
+    if (String(order.status || '').toLowerCase() !== 'ready') return;
+    if (String(order.type || '').toLowerCase().includes('deliver')) return;
+
+    // 1. The table's assigned waiter, if this ticket sits on a table.
+    let serverName = '';
+    if (order.table_id) {
+      const wanted = normaliseTableId(order.table_id);
+      const { results: tbl } = await d1Query(env, 'SELECT id, number, server FROM tables');
+      const match = (tbl || []).find(
+        (t) => String(t.id) === String(order.table_id) || normaliseTableId(t.number) === wanted
+      );
+      if (match && String(match.server || '').trim()) serverName = String(match.server).trim();
+    }
+
+    // 2. Resolve the name to a staff id; fall back to the creator.
+    let targetId = '';
+    if (serverName) {
+      const { results: staff } = await d1Query(env, 'SELECT id, firstName, lastName FROM staff');
+      const norm = serverName.trim().toLowerCase();
+      const s = (staff || []).find(
+        (r) => [r.firstName, r.lastName].filter(Boolean).join(' ').trim().toLowerCase() === norm
+      );
+      if (s && s.id) targetId = String(s.id);
+    }
+    if (!targetId && order.created_by) targetId = String(order.created_by);
+
+    const label = orderLabel(order);
+    const message = serverName
+      ? `${label} — order ready for pickup (waiter: ${serverName})`
+      : `${label} — order ready for pickup`;
+
+    // One ping per ready spell: the sweep (or a prior transition) may already
+    // have raised it. If the row exists but nobody resolved, re-aim it — the
+    // sweep runs on a minute tick and can write the row before it knows the
+    // table's server.
+    const { results: existing } = await d1Query(
+      env,
+      "SELECT id, target_staff_id FROM alerts WHERE rule_id = ? AND entity_type = 'order' AND entity_id = ? AND status IN ('open','acknowledged')",
+      [RULE_IDS.READY_NOW, String(order.id)]
+    );
+    if ((existing || []).length) {
+      const row = existing[0];
+      if (!String(row.target_staff_id || '').trim() && targetId) {
+        await d1Run(
+          env,
+          'UPDATE alerts SET target_staff_id = ?, message = ?, updated_at = ? WHERE id = ?',
+          [targetId, message, now(), row.id]
+        );
+      }
+      return;
+    }
+
+    const stamp = now();
+    await d1Run(
+      env,
+      `INSERT INTO alerts (id, rule_id, severity, entity_type, entity_id, entity_label, message, status, station, target_staff_id, created, updated_at)
+       VALUES (?, ?, 'warning', 'order', ?, ?, ?, 'open', ?, ?, ?, ?)`,
+      [vid(), RULE_IDS.READY_NOW, String(order.id), label, message, orderStation(order), targetId, stamp, stamp]
+    );
+  } catch {
+    // The ping must never break the action that raised it.
+  }
 }
 
 /**
@@ -1700,12 +1789,18 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
     const { meta } = await d1Run(env, sql, params);
     if (!meta.changes) return json({ ok: false, error: "Order item not found" }, 404);
 
-    const { results } = await d1Query(
+    // The order's status before this line moved, so the transition into
+    // 'ready' is recognisable — a second tap on an already-ready ticket must
+    // not re-raise the pickup ping.
+    const { results: priorOrder } = await d1Query(env, "SELECT status FROM orders WHERE id = ?", [orderId]);
+    const statusBefore = String((priorOrder && priorOrder[0] && priorOrder[0].status) || "").toLowerCase();
+
+    const { results: lineRows } = await d1Query(
       env,
       "SELECT status FROM order_items WHERE order_id = ?",
       [orderId]
     );
-    const rolled = deriveOrderStatus((results || []).map((r) => r.status));
+    const rolled = deriveOrderStatus((lineRows || []).map((r) => r.status));
     if (rolled) {
       const orderStamp = stampColumnFor(rolled);
       const orderSql = orderStamp
@@ -1716,6 +1811,18 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
         orderSql,
         orderStamp ? [rolled, nowIso, nowIso, orderId] : [rolled, nowIso, orderId]
       );
+
+      // The ticket just became ready: ping whoever is waiting on it, in real
+      // time (the sweep only keeps the ping alive afterwards). Best-effort —
+      // never blocks or fails the kitchen's tap.
+      if (rolled === 'ready' && statusBefore !== 'ready') {
+        const { results: ord } = await d1Query(env, 'SELECT * FROM orders WHERE id = ?', [orderId]);
+        const updated = ord && ord[0];
+        if (updated) {
+          updated.status = 'ready';
+          fireAndForget(ctx, raiseReadyNowPing(env, updated));
+        }
+      }
     }
 
     return json({ ok: true, status, orderStatus: rolled });
@@ -1855,6 +1962,21 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
     // and the delivery sync is the only thing that did not.
     if (data.status !== void 0 && before && String(before.type || '').toLowerCase() === 'delivery') {
       try { await syncDeliveryToOrderStatus(env, id, data.status); } catch { /* delivery sync is best-effort */ }
+    }
+
+    // Pickup ping on the whole-order path: a screen moving the ticket to
+    // 'ready' in one PUT pings the floor exactly as the per-line path does.
+    // Only on the transition into 'ready', and never for delivery — the job
+    // rows speak for those.
+    if (
+      data.status !== void 0 &&
+      String(data.status).toLowerCase() === 'ready' &&
+      before && String(before.status || '').toLowerCase() !== 'ready' &&
+      String(before.type || '').toLowerCase() !== 'delivery'
+    ) {
+      const { results: ord } = await d1Query(env, 'SELECT * FROM orders WHERE id = ?', [id]);
+      const updated = ord && ord[0];
+      if (updated) fireAndForget(ctx, raiseReadyNowPing(env, updated));
     }
 
     // ── Sale → recipe → ingredient consumption ──────────────────────────────

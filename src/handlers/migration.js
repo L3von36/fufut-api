@@ -54,6 +54,33 @@ async function handleMigration(request, env) {
     return json({ ok: true, applied, skipped });
   }
 
+  // One-shot: apply migration 026 — the station column that routes order
+  // alerts to the station that owns them (a slow tea rings at the bar, not
+  // the kitchen), the per-person target of the pickup ping, and the two
+  // table columns behind the waiter's "bring the bill" request. Idempotent
+  // like its siblings: repeats report "duplicate column name" as skipped.
+  // Manager-only via the /api/migrate/ prefix rule in auth.js.
+  if (path === "/api/migrate/alerts-026" && m === "POST") {
+    const statements = [
+      "ALTER TABLE alerts ADD COLUMN station TEXT DEFAULT ''",
+      "ALTER TABLE alerts ADD COLUMN target_staff_id TEXT DEFAULT ''",
+      "ALTER TABLE tables ADD COLUMN bill_requested_at TEXT DEFAULT ''",
+      "ALTER TABLE tables ADD COLUMN bill_requested_by TEXT DEFAULT ''",
+      "CREATE INDEX IF NOT EXISTS idx_alerts_status_rule ON alerts(status, rule_id)",
+    ];
+    const applied = [];
+    const skipped = [];
+    for (const sql of statements) {
+      try {
+        await d1Run(env, sql);
+        applied.push(sql);
+      } catch (e) {
+        skipped.push({ sql, reason: String(e.message || e) });
+      }
+    }
+    return json({ ok: true, applied, skipped });
+  }
+
   // One-time repair: give every stored menu item a stable id.
   //
   // The KV blob was saved without per-item ids, so /api/menu served all 45 items

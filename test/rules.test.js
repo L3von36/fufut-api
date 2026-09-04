@@ -139,7 +139,9 @@ describe('order-ready-not-served', () => {
   it('raises when food sits ready past the limit', () => {
     const v = evaluateOrder(order(), NOW);
     expect(v.rule_id).toBe(RULE_IDS.READY_NOT_SERVED);
-    expect(v.message).toContain('food ready 11 min');
+    // Station-neutral wording: the rule covers a tea sitting on the pass as
+    // much as a burger, so the message no longer says "food".
+    expect(v.message).toContain('ready 11 min');
   });
 
   it('leaves delivery orders to the delivery rules', () => {

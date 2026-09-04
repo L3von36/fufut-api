@@ -22,9 +22,21 @@
  */
 
 import { isLapsedNoShow } from './booking.js';
+import { parseFlatItems } from './timing.js';
 
 /** Severity words, one place. */
 export const SEVERITY = { WARNING: 'warning', CRITICAL: 'critical' };
+
+/**
+ * Station values an order-stage alert can carry.
+ *
+ * The floor is split into two stations — the bar makes the drinks, the
+ * kitchen makes everything else — and an SLA breach on a ticket is that
+ * station's problem, not the whole room's. Station lives on the alert row
+ * (alerts.station) so the audience filter can route it; 'mixed' means both
+ * stations hold unfinished work on the same ticket and both hear about it.
+ */
+export const STATION = { BAR: 'bar', KITCHEN: 'kitchen', MIXED: 'mixed', NONE: '' };
 
 /**
  * The rules, by stable id. These strings are stored in `alerts.rule_id` and
@@ -33,6 +45,7 @@ export const SEVERITY = { WARNING: 'warning', CRITICAL: 'critical' };
 export const RULE_IDS = {
   PREPARING_TOO_LONG: 'order-preparing-too-long',
   NEW_UNACCEPTED: 'order-new-unaccepted',
+  READY_NOW: 'order-ready-now',
   READY_NOT_SERVED: 'order-ready-not-served',
   DELIVERY_UNASSIGNED: 'delivery-ready-unassigned',
   DELIVERY_IN_TRANSIT: 'delivery-in-transit-too-long',
@@ -42,6 +55,61 @@ export const RULE_IDS = {
   FORGOT_CLOCK_OUT: 'employee-forgot-clock-out',
   EMPLOYEE_LATE: 'employee-late-arrival',
 };
+
+/**
+ * What counts as a drink, for station routing.
+ *
+ * Mirror — word for word — of the POS's lib/drinks.js regex, because a ticket
+ * the boards route to the bar cannot have its alert land on the kitchen. The
+ * two lists must move together; test/rules.test.js pins a few names on both
+ * sides of the line to make a silent drift loud.
+ */
+export const DRINK_WORDS = /drink|coffee|beverage|juice|water|soda|\bbar\b|\btea\b|latte|espresso|cappuccino|macchiato|americano|mocha|smoothie|shake|lemonade/i;
+
+export function nameIsDrink(name) {
+  return DRINK_WORDS.test(String(name || ''));
+}
+
+/**
+ * Which station(s) own the work on this order.
+ *
+ * Reads whatever item summary the row carries — the JSON line array the POS
+ * writes today, or the legacy flat "2xLatte, 1xFut breakfast" string — and
+ * classifies each line by the drink word list above. Returns:
+ *   'bar'     every line is a drink — the barista's ticket alone
+ *   'kitchen' no line is a drink — the kitchen's ticket alone
+ *   'mixed'   both stations hold lines — both hear the alert
+ *   ''        the items cannot be parsed into lines at all — legacy free
+ *             text. The alert falls back to the kitchen audience, which was
+ *             the whole room before the split existed.
+ */
+export function orderStation(order) {
+  if (!order) return STATION.NONE;
+  let lines = order.items;
+  if (typeof lines === 'string') {
+    const t = lines.trim();
+    if (t.startsWith('[') && t.endsWith(']')) {
+      try {
+        lines = JSON.parse(t);
+      } catch {
+        lines = parseFlatItems(t);
+        if (!lines.length) return STATION.NONE;
+      }
+    } else {
+      lines = parseFlatItems(t);
+      if (!lines.length) return STATION.NONE;
+    }
+  }
+  if (!Array.isArray(lines)) return STATION.NONE;
+  const named = (lines || [])
+    .map((l) => (l && typeof l === 'object' ? String(l.name || '') : ''))
+    .filter(Boolean);
+  if (!named.length) return STATION.NONE;
+  const drinks = named.filter((n) => nameIsDrink(n)).length;
+  if (drinks === 0) return STATION.KITCHEN;
+  if (drinks === named.length) return STATION.BAR;
+  return STATION.MIXED;
+}
 
 /**
  * Threshold defaults, in minutes.
@@ -109,7 +177,7 @@ function firstStamp(nowMs, ...stamps) {
   return null;
 }
 
-function violation(ruleId, severity, entityType, entityId, label, message) {
+function violation(ruleId, severity, entityType, entityId, label, message, extra) {
   return {
     rule_id: ruleId,
     severity,
@@ -117,7 +185,15 @@ function violation(ruleId, severity, entityType, entityId, label, message) {
     entity_id: String(entityId),
     entity_label: label,
     message,
+    ...(extra || {}),
   };
+}
+
+/** Order-stage violations carry the station so the audience can route them. */
+function orderViolation(ruleId, severity, order, label, message) {
+  return violation(ruleId, severity, 'order', order.id, label, message, {
+    station: orderStation(order),
+  });
 }
 
 const UNPAID = new Set(['unpaid', 'partial', '']);
@@ -141,8 +217,8 @@ export function evaluateOrder(order, nowMs, th = RULE_DEFAULTS) {
   if (status === 'new') {
     const age = firstStamp(nowMs, order.created, order.updated_at);
     if (age !== null && age > th.newUnacceptedMin) {
-      return violation(
-        RULE_IDS.NEW_UNACCEPTED, SEVERITY.WARNING, 'order', order.id,
+      return orderViolation(
+        RULE_IDS.NEW_UNACCEPTED, SEVERITY.WARNING, order,
         orderLabel(order),
         `${orderLabel(order)} waiting ${fmtMin(age)} — nobody has accepted it (limit ${th.newUnacceptedMin} min)`
       );
@@ -154,8 +230,8 @@ export function evaluateOrder(order, nowMs, th = RULE_DEFAULTS) {
     const age = firstStamp(nowMs, order.preparing_at, order.updated_at, order.created);
     if (age !== null && age > th.preparingWarnMin) {
       const severity = age > th.preparingCriticalMin ? SEVERITY.CRITICAL : SEVERITY.WARNING;
-      return violation(
-        RULE_IDS.PREPARING_TOO_LONG, severity, 'order', order.id,
+      return orderViolation(
+        RULE_IDS.PREPARING_TOO_LONG, severity, order,
         orderLabel(order),
         `${orderLabel(order)} in preparing for ${fmtMin(age)} (limit ${th.preparingWarnMin} min${severity === SEVERITY.CRITICAL ? `, critical at ${th.preparingCriticalMin}` : ''})`
       );
@@ -166,10 +242,10 @@ export function evaluateOrder(order, nowMs, th = RULE_DEFAULTS) {
   if (status === 'ready' && !isDelivery) {
     const age = firstStamp(nowMs, order.ready_at, order.updated_at, order.created);
     if (age !== null && age > th.readyUnservedMin) {
-      return violation(
-        RULE_IDS.READY_NOT_SERVED, SEVERITY.WARNING, 'order', order.id,
+      return orderViolation(
+        RULE_IDS.READY_NOT_SERVED, SEVERITY.WARNING, order,
         orderLabel(order),
-        `${orderLabel(order)} — food ready ${fmtMin(age)}, not served (limit ${th.readyUnservedMin} min)`
+        `${orderLabel(order)} — ready ${fmtMin(age)}, not served (limit ${th.readyUnservedMin} min)`
       );
     }
     return null;
@@ -178,8 +254,8 @@ export function evaluateOrder(order, nowMs, th = RULE_DEFAULTS) {
   if ((status === 'served' || status === 'fulfilled') && UNPAID.has(String(order.payment_status || '').toLowerCase())) {
     const age = firstStamp(nowMs, order.served_at, order.updated_at, order.created);
     if (age !== null && age > th.servedUnpaidMin) {
-      return violation(
-        RULE_IDS.SERVED_UNPAID, SEVERITY.WARNING, 'order', order.id,
+      return orderViolation(
+        RULE_IDS.SERVED_UNPAID, SEVERITY.WARNING, order,
         orderLabel(order),
         `${orderLabel(order)} — served ${fmtMin(age)} ago, bill still open (limit ${th.servedUnpaidMin} min)`
       );
@@ -188,6 +264,48 @@ export function evaluateOrder(order, nowMs, th = RULE_DEFAULTS) {
   }
 
   return null;
+}
+
+/**
+ * The instant pickup ping: food or drink is ready, someone has to fetch it.
+ *
+ * Where READY_NOT_SERVED is the escalation that fires only after the pickup
+ * window has already slipped, this rule fires the moment an order enters
+ * 'ready' — raised in real time by the orders handler on the status
+ * transition, and kept alive here by the sweep for as long as the ticket
+ * sits uncollected (so a ping nobody acted on is never lost, and the row
+ * resolves itself the moment the order is served).
+ *
+ * The audience is the waiting staff, not the station that made the thing:
+ * the row targets the waiter assigned to the table (alerts.target_staff_id,
+ * resolved by the sweep/handler from tables.server), falling back to the
+ * order's creator for takeaways, and to every head-waiter when neither
+ * resolves. This function only states the condition and names the
+ * candidate: the caller stamps target_staff_id after matching names to
+ * staff, which is why the violation carries table_server/created_by raw.
+ */
+export function evaluateOrderReadyNow(order) {
+  if (!order || !order.id) return null;
+  if (String(order.status || '').toLowerCase() !== 'ready') return null;
+  const label = orderLabel(order);
+  const server = String(order.table_server || '').trim();
+  const message = server
+    ? `${label} — order ready for pickup (waiter: ${server})`
+    : `${label} — order ready for pickup`;
+  return violation(
+    RULE_IDS.READY_NOW, SEVERITY.WARNING, 'order', order.id, label, message,
+    { station: orderStation(order), target_name: server, created_by: order.created_by || '' }
+  );
+}
+
+/** Every ready-now ping in one pass. */
+export function evaluateOrdersReadyNow(orders) {
+  const out = [];
+  for (const o of orders || []) {
+    const v = evaluateOrderReadyNow(o);
+    if (v) out.push(v);
+  }
+  return out;
 }
 
 /** Every order violation in one pass. */
@@ -381,6 +499,7 @@ export function dedupeKey(v) {
 export function evaluateAll({ orders, deliveryJobs, reservations, tables, timeclockEntries }, nowMs, th = RULE_DEFAULTS) {
   return [
     ...evaluateOrders(orders, nowMs, th),
+    ...evaluateOrdersReadyNow(orders),
     ...evaluateDeliveryJobs(deliveryJobs, nowMs, th),
     ...evaluateReservations(reservations, nowMs, th),
     ...evaluateTables(tables, nowMs, th),
