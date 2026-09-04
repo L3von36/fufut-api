@@ -515,6 +515,22 @@ async function handleResources(pathname, method, url, request, env, auth) {
     if (!data) return json({ ok: false, error: "Invalid JSON body" }, 400);
     const itemId = idPart || data.id;
     if (!itemId) return json({ ok: false, error: "id required" }, 400);
+    // Zone reassignment is floor layout, and floor layout is a manager's
+    // decision. handleTables gates PUT /api/tables/:id; a caller can also
+    // reach the same write through this collection route with id in the body,
+    // so the rule is restated here — echoing the stored zone back (what the
+    // seat/checkout flows do with a fetched row) passes untouched.
+    if (res === "tables" && data.section !== void 0) {
+      var role = auth && (auth.sessionRole || auth.role);
+      var isManagerRole = String(role || "").toLowerCase() === "manager";
+      if (!isManagerRole) {
+        const cur = await d1Query(env, "SELECT section FROM tables WHERE id = ?", [String(itemId)]);
+        const storedZone = String((cur.results || [])[0]?.section || "").trim().toLowerCase();
+        if (String(data.section || "").trim().toLowerCase() !== storedZone) {
+          return json({ ok: false, error: "Only a manager can move a table between zones." }, 403);
+        }
+      }
+    }
     const filtered = {};
     for (const c of cols) {
       if (c !== "id" && c !== "created" && data[c] !== void 0) filtered[c] = data[c];

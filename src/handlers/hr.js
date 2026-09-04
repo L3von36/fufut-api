@@ -22,6 +22,7 @@
 import { d1Query, d1Run, json, readBody } from '../lib/db.js';
 import { writeAudit } from '../lib/audit.js';
 import { actorName, isManager } from '../auth.js';
+import { sectionsError } from './tables.js';
 import { openChecksForStaff } from './orders.js';
 import {
   classifyAttendance,
@@ -729,6 +730,17 @@ async function putSetting(request, env, auth, key) {
   if (key === 'tax.income_bands') {
     const bandError = incomeBandError(value);
     if (bandError) return json({ ok: false, error: bandError }, 400);
+  }
+
+  // Same guard, different list: `tables.sections` holds the floor zones, and
+  // the POS pickers render it verbatim. A malformed row here degrades to the
+  // defaults on read (storedSections refuses it), but refusing at the door is
+  // better than the manager discovering their edit did nothing. Renames and
+  // deletions that must carry tables along belong to POST /api/tables/sections,
+  // which audits the cascade — a bare settings write cannot do that part.
+  if (key === 'tables.sections') {
+    const sectionError = sectionsError(value);
+    if (sectionError) return json({ ok: false, error: sectionError }, 400);
   }
 
   if (existing) {

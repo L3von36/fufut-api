@@ -13,6 +13,306 @@ const ACTIVE_LIST = ACTIVE_STATUSES.map((s) => `'${s}'`).join(', ');
  */
 const SEATING_STATUSES = ['occupied'];
 
+// ─── Floor zones (the sections tables live in) ──────────────────────────────
+// Zones used to be a hardcoded array in the POS — renaming "Patio" or adding a
+// "Terrace" meant a developer and a deploy. They are data now, like the tax
+// bands before them: one settings row (`tables.sections`) holds the ordered
+// list, and every write that changes a name carries its tables along, because
+// a zone renamed out from under six tables would strand them in a zone the
+// pickers no longer offer.
+const SECTIONS_KEY = 'tables.sections';
+const DEFAULT_SECTIONS = ['Patio', 'Main Hall', 'Window', 'VIP Room', 'Bar'];
+// Miller's seven-plus-or-minus-two: a working memory holds about seven items,
+// and the zone picker is exactly such a list — scanned dozens of times a
+// shift, on a phone. Nine is the hard ceiling the API enforces; the editor
+// shows the counter so the manager sees the budget before hitting it.
+const MAX_SECTIONS = 9;
+const SECTION_NAME_MAX = 24;
+
+/**
+ * The validator for a zones list. Accepts the parsed array or the raw JSON
+ * string (settings arrive as strings), and returns a plain-English error or
+ * null — the same convention as incomeBandError, so putSetting can guard the
+ * key the same way it guards tax.income_bands.
+ */
+export function sectionsError(value) {
+  let list = value;
+  if (typeof list === 'string') {
+    try {
+      list = JSON.parse(list);
+    } catch {
+      return 'Zones must be a JSON list of names, e.g. ["Patio","Main Hall","Bar"].';
+    }
+  }
+  if (!Array.isArray(list)) {
+    return 'Zones must be a list of names, e.g. ["Patio","Main Hall","Bar"].';
+  }
+  if (list.length < 1) return 'Keep at least one zone — every table needs somewhere to live.';
+  if (list.length > MAX_SECTIONS) {
+    return `Keep the list to ${MAX_SECTIONS} zones or fewer — past that the picker stops being scannable at a glance.`;
+  }
+  const seen = new Set();
+  for (let i = 0; i < list.length; i++) {
+    const raw = list[i];
+    if (typeof raw !== 'string') return `Zone ${i + 1} is not a name.`;
+    const name = raw.trim();
+    if (!name) return `Zone ${i + 1} is empty.`;
+    if (name.length > SECTION_NAME_MAX) {
+      return `"${name}" is ${name.length} characters — keep zone names to ${SECTION_NAME_MAX} or fewer so chips and pickers stay readable.`;
+    }
+    if (/[\u0000-\u001f<>]/.test(name)) {
+      return `"${name}" contains characters zone names cannot use.`;
+    }
+    const key = name.toLowerCase();
+    if (seen.has(key)) {
+      return `Two zones are named "${name}" (spelling differs only by capitalisation). Zone names must be distinct.`;
+    }
+    seen.add(key);
+  }
+  return null;
+}
+
+/**
+ * The stored list, or null when none is stored (or it no longer validates —
+ * a corrupt row must degrade to the defaults, never break the floor plan).
+ */
+async function storedSections(env) {
+  const { results } = await d1Query(env, 'SELECT value FROM settings WHERE key = ?', [SECTIONS_KEY]);
+  const row = (results || [])[0];
+  if (!row) return null;
+  try {
+    const list = JSON.parse(row.value);
+    if (sectionsError(list)) return null;
+    return list.map((s) => String(s).trim());
+  } catch {
+    return null;
+  }
+}
+
+/** How many tables sit in each zone today, by trimmed name. */
+async function sectionsUsage(env) {
+  const { results } = await d1Query(
+    env,
+    "SELECT TRIM(section) AS section, COUNT(*) AS n FROM tables WHERE section IS NOT NULL AND TRIM(section) <> '' GROUP BY TRIM(section)"
+  );
+  const usage = {};
+  for (const r of results || []) usage[String(r.section)] = r.n;
+  return usage;
+}
+
+/**
+ * The working list: stored order first, then any zone that exists only on
+ * tables (legacy free-text values a manager typed before zones were data).
+ * Tables must never fall out of a picker because the setting moved on.
+ */
+async function workingSections(env) {
+  const fromDb = await storedSections(env);
+  const stored = fromDb || [...DEFAULT_SECTIONS];
+  const usage = await sectionsUsage(env);
+  const have = new Set(stored.map((s) => s.toLowerCase()));
+  const extras = Object.keys(usage).filter((s) => !have.has(s.toLowerCase()));
+  // `fromDb` (not the effective list) is what says whether the manager has
+  // customised anything — the UI uses it to show defaults vs custom.
+  return { list: [...stored, ...extras], usage, stored: fromDb };
+}
+
+/** Persist the list and write the one audit entry that describes the change. */
+async function saveSections(env, auth, list, { beforeValue, moved = 0, reason }) {
+  const value = JSON.stringify(list);
+  const nowIso = new Date().toISOString();
+  const by = auth ? actorName(auth) : null;
+  const { results } = await d1Query(env, 'SELECT value FROM settings WHERE key = ?', [SECTIONS_KEY]);
+  if ((results || [])[0]) {
+    await d1Run(env, 'UPDATE settings SET value = ?, updated_at = ?, updated_by = ? WHERE key = ?', [
+      value, nowIso, by, SECTIONS_KEY,
+    ]);
+  } else {
+    await d1Run(
+      env,
+      "INSERT INTO settings (key, value, category, label, updated_at, updated_by) VALUES (?, ?, 'tables', 'Floor zones', ?, ?)",
+      [SECTIONS_KEY, value, nowIso, by]
+    );
+  }
+  await writeAudit(env, auth, {
+    action: 'update',
+    entity: 'settings',
+    entityId: SECTIONS_KEY,
+    before: beforeValue != null ? { value: beforeValue } : null,
+    after: { value, tables_moved: moved },
+    reason,
+  });
+  return value;
+}
+
+/**
+ * Zone edits. One endpoint, four verbs of intent, because they all mutate the
+ * same list and all of them except `add` may carry tables with them.
+ *
+ *   rename  { from, to }   — renames the zone and every table sitting in it
+ *   add     { name }       — appends a zone (capped at MAX_SECTIONS)
+ *   remove  { name, moveTo } — deletes a zone; if tables live there, `moveTo`
+ *                            says which surviving zone absorbs them
+ *   reorder { sections }   — the same zones, new order (pickers keep order)
+ *
+ * Manager-only: the floor layout is the manager's decision the same way the
+ * server-on-table assignment is. Audited, because a rename that moved twelve
+ * tables will be asked about.
+ */
+async function handleSections(pathname, method, request, env, auth) {
+  const parts = pathname.split('/').filter(Boolean);
+  if (parts[0] !== 'api' || parts[1] !== 'tables' || parts[2] !== 'sections') return null;
+  const m = method.toUpperCase();
+
+  // Reads are open to every signed-in role: the POS filter, the Add Table
+  // form and the backoffice editor all render from this, and head-waiters
+  // need the zones to read their own floor. Writes are the manager's.
+  if (m === 'GET') {
+    const { list, usage, stored } = await workingSections(env);
+    return json({
+      ok: true,
+      sections: list,
+      usage,
+      custom: Boolean(stored),
+      max: MAX_SECTIONS,
+      nameMax: SECTION_NAME_MAX,
+    });
+  }
+
+  if (m === 'POST') {
+    if (!isManager(auth)) return json({ ok: false, error: 'Manager access required' }, 403);
+
+    const data = await readBody(request);
+    if (!data || !data.action) {
+      return json({ ok: false, error: 'Send an action: rename, add, remove or reorder.' }, 400);
+    }
+
+    const { list: work, usage } = await workingSections(env);
+    const findIdx = (name) =>
+      work.findIndex((s) => s.toLowerCase() === String(name || '').trim().toLowerCase());
+    const lower = (arr) => arr.map((s) => s.trim().toLowerCase());
+
+    if (data.action === 'rename') {
+      const from = String(data.from || '').trim();
+      const to = String(data.to || '').trim();
+      if (!from) return json({ ok: false, error: 'Send the zone to rename as "from".' }, 400);
+      const at = findIdx(from);
+      if (at === -1) return json({ ok: false, error: `No zone named "${from}" on the floor.` }, 404);
+      const nameError = sectionsError([to]);
+      if (nameError) return json({ ok: false, error: nameError }, 400);
+      if (work.some((s, i) => i !== at && s.toLowerCase() === to.toLowerCase())) {
+        return json({ ok: false, error: `"${to}" is already a zone. Rename to something distinct.` }, 400);
+      }
+      const beforeValue = JSON.stringify(work);
+      const next = work.map((s) => (s.toLowerCase() === from.toLowerCase() ? to : s));
+      const { meta } = await d1Run(
+        env,
+        'UPDATE tables SET section = ? WHERE LOWER(TRIM(section)) = LOWER(?)',
+        [to, from]
+      );
+      const moved = meta ? meta.changes : 0;
+      await saveSections(env, auth, next, {
+        beforeValue,
+        moved,
+        reason: `Zone "${from}" renamed to "${to}"${moved ? ` — ${moved} table${moved === 1 ? '' : 's'} moved with it` : ''}`,
+      });
+      return json({ ok: true, sections: next, tablesMoved: moved });
+    }
+
+    if (data.action === 'add') {
+      const name = String(data.name || '').trim();
+      const nameError = sectionsError([name]);
+      if (nameError) return json({ ok: false, error: nameError }, 400);
+      if (findIdx(name) !== -1) {
+        return json({ ok: false, error: `"${name}" is already a zone.` }, 400);
+      }
+      if (work.length + 1 > MAX_SECTIONS) {
+        return json(
+          {
+            ok: false,
+            error: `${MAX_SECTIONS} zones is the limit — the picker has to stay scannable. Merge or rename instead.`,
+          },
+          400
+        );
+      }
+      const beforeValue = JSON.stringify(work);
+      const next = [...work, name];
+      await saveSections(env, auth, next, {
+        beforeValue,
+        reason: `Zone "${name}" added to the floor plan`,
+      });
+      return json({ ok: true, sections: next });
+    }
+
+    if (data.action === 'remove') {
+      const name = String(data.name || '').trim();
+      const at = findIdx(name);
+      if (at === -1) return json({ ok: false, error: `No zone named "${name}" on the floor.` }, 404);
+      const inUse = usage[name] || 0;
+      let moved = 0;
+      let moveTo = null;
+      if (inUse > 0) {
+        moveTo = String(data.moveTo || '').trim();
+        if (!moveTo) {
+          return json(
+            {
+              ok: false,
+              error: `${inUse} table${inUse === 1 ? ' sits' : 's sit'} in "${name}". Send "moveTo" with a surviving zone for them.`,
+              tables: inUse,
+            },
+            400
+          );
+        }
+        if (moveTo.toLowerCase() === name.toLowerCase()) {
+          return json({ ok: false, error: 'moveTo names the zone being removed — pick a surviving zone.' }, 400);
+        }
+        if (findIdx(moveTo) === -1) {
+          return json({ ok: false, error: `No zone named "${moveTo}" to move the tables into.` }, 404);
+        }
+        const { meta } = await d1Run(
+          env,
+          'UPDATE tables SET section = ? WHERE LOWER(TRIM(section)) = LOWER(?)',
+          [moveTo, name]
+        );
+        moved = meta ? meta.changes : 0;
+      }
+      const beforeValue = JSON.stringify(work);
+      const next = work.filter((s) => s.toLowerCase() !== name.toLowerCase());
+      const listError = sectionsError(next);
+      if (listError) return json({ ok: false, error: listError }, 400);
+      await saveSections(env, auth, next, {
+        beforeValue,
+        moved,
+        reason: `Zone "${name}" removed${moveTo ? ` — its ${moved} table${moved === 1 ? '' : 's'} moved to "${moveTo}"` : ' — no tables were in it'}`,
+      });
+      return json({ ok: true, sections: next, tablesMoved: moved });
+    }
+
+    if (data.action === 'reorder') {
+      const orderError = sectionsError(data.sections);
+      if (orderError) return json({ ok: false, error: orderError }, 400);
+      const next = data.sections.map((s) => String(s).trim());
+      const a = lower(next).sort().join('|');
+      const b = lower(work).sort().join('|');
+      if (a !== b) {
+        return json(
+          { ok: false, error: 'Reorder must send the same zones that exist today — add, rename or remove separately.' },
+          400
+        );
+      }
+      const beforeValue = JSON.stringify(work);
+      await saveSections(env, auth, next, {
+        beforeValue,
+        reason: 'Zone order updated — pickers follow this order',
+      });
+      return json({ ok: true, sections: next });
+    }
+
+    return json({ ok: false, error: 'Unknown action — use rename, add, remove or reorder.' }, 400);
+  }
+
+  return null;
+}
+
 function isManager(auth) {
   const role = auth && (auth.sessionRole || auth.role);
   return String(role || '').toLowerCase() === 'manager';
@@ -234,6 +534,11 @@ async function handleTables(pathname, method, url, request, env, auth) {
   const parts = pathname.split('/').filter(Boolean);
   if (parts[0] !== 'api' || parts[1] !== 'tables') return null;
 
+  // Zone reads/writes are their own sub-resource (/tables/sections) and must
+  // be matched before the generic list/table routes below.
+  const sectionsResult = await handleSections(pathname, method, request, env, auth);
+  if (sectionsResult !== null) return sectionsResult;
+
   if (m === 'GET' && parts.length === 2) {
     const all = await listTablesWithHolds(env);
     // A waiter works their section, not the whole room: the floor plan a
@@ -362,7 +667,7 @@ async function handleTables(pathname, method, url, request, env, auth) {
     {
       const { results: curRows } = await d1Query(
         env,
-        'SELECT id, number, server FROM tables WHERE id = ?',
+        'SELECT id, number, server, section FROM tables WHERE id = ?',
         [tableId]
       );
       const current = (curRows || [])[0];
@@ -373,6 +678,19 @@ async function handleTables(pathname, method, url, request, env, auth) {
         if (nextServer && nextServer !== storedServer) {
           return json(
             { ok: false, error: 'Only a manager can assign a server to a table.' },
+            403
+          );
+        }
+      }
+      // Moving a table between zones is floor layout, and floor layout is the
+      // manager's call — same rule as the server assignment above. Service
+      // flows never write `section`, so this only bites a direct API caller.
+      if (!isManager(auth) && data.section !== undefined) {
+        const nextZone = String(data.section || '').trim().toLowerCase();
+        const storedZone = String(current.section || '').trim().toLowerCase();
+        if (nextZone !== storedZone) {
+          return json(
+            { ok: false, error: 'Only a manager can move a table between zones.' },
             403
           );
         }
