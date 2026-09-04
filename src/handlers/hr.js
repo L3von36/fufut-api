@@ -654,6 +654,66 @@ async function getSettings(env, url) {
   return json({ ok: true, settings: results || [] });
 }
 
+/**
+ * Structural check on a tax band table before it can be stored.
+ *
+ * The engine reads `band.upTo`, `band.rate` and `band.deduct`, and treats a
+ * missing rate as zero rather than guessing — so a typo (`upto`, a dropped
+ * band, `15` where `0.15` was meant) would not fail anywhere: it would store
+ * fine and then quietly change what every future payslip deducts. Editing
+ * this row without a developer is the design (§46: the table is data), and
+ * refusing a malformed one here is what makes that safe for the manager who
+ * is doing it alone at 9pm.
+ *
+ * Returns null when the table is sound, otherwise a plain-English reason the
+ * manager can act on without knowing the engine.
+ */
+export function incomeBandError(value) {
+  let bands;
+  try {
+    bands = typeof value === 'string' ? JSON.parse(value) : value;
+  } catch {
+    return 'That is not valid JSON — check brackets, commas and quotes.';
+  }
+  if (!Array.isArray(bands) || !bands.length) {
+    return 'Tax bands must be a non-empty list, e.g. [{"upTo":2000,"rate":0,"deduct":0},{"upTo":null,"rate":0.35,"deduct":2050}].';
+  }
+  if (bands.length > 12) return 'At most 12 bands — check the table was not pasted twice.';
+  let prev = 0;
+  for (let i = 0; i < bands.length; i++) {
+    const b = bands[i];
+    const label = `Band ${i + 1}`;
+    if (!b || typeof b !== 'object' || Array.isArray(b)) {
+      return `${label}: every band must be an object like {"upTo":4000,"rate":0.15,"deduct":300}.`;
+    }
+    const keys = Object.keys(b);
+    const missing = ['upTo', 'rate', 'deduct'].filter((k) => !(k in b));
+    const extra = keys.filter((k) => !['upTo', 'rate', 'deduct'].includes(k));
+    if (missing.length || extra.length) {
+      return `${label}: each band needs exactly "upTo", "rate" and "deduct" spelled that way (upTo, not upto).`
+        + (missing.length ? ` Missing: ${missing.join(', ')}.` : '')
+        + (extra.length ? ` Unrecognised: ${extra.join(', ')}.` : '');
+    }
+    if (b.upTo === null) {
+      if (i !== bands.length - 1) return `${label}: only the last band may have "upTo": null.`;
+    } else if (typeof b.upTo !== 'number' || !Number.isFinite(b.upTo) || b.upTo <= prev) {
+      return `${label}: "upTo" must be a number greater than the previous band's upper limit`
+        + `${prev ? ` (${prev})` : ''}, or null on the last band only.`;
+    }
+    if (typeof b.rate !== 'number' || !Number.isFinite(b.rate) || b.rate < 0 || b.rate >= 1) {
+      return `${label}: "rate" must be a decimal between 0 and 1 — write 15% as 0.15, not 15.`;
+    }
+    if (typeof b.deduct !== 'number' || !Number.isFinite(b.deduct) || b.deduct < 0) {
+      return `${label}: "deduct" must be zero or a positive number of birr.`;
+    }
+    if (b.upTo !== null) prev = b.upTo;
+  }
+  return null;
+}
+
+/** Settings whose edit means "the rates just changed under somebody's payslip". */
+const RATE_KEYS = new Set(['tax.income_bands', 'payroll.pension', 'payroll.overtime_multipliers']);
+
 async function putSetting(request, env, auth, key) {
   const data = await readBody(request);
   if (!data || data.value === undefined) return json({ ok: false, error: 'value required' }, 400);
@@ -662,6 +722,14 @@ async function putSetting(request, env, auth, key) {
   const existing = results && results[0];
   const value = typeof data.value === 'string' ? data.value : JSON.stringify(data.value);
   const nowIso = new Date().toISOString();
+
+  // A malformed band table would store fine and then read back as 0% tax —
+  // the engine treats a missing rate as zero rather than guessing — so the one
+  // setting whose typo can mispay everybody is structurally checked first.
+  if (key === 'tax.income_bands') {
+    const bandError = incomeBandError(value);
+    if (bandError) return json({ ok: false, error: bandError }, 400);
+  }
 
   if (existing) {
     await d1Run(env, 'UPDATE settings SET value = ?, updated_at = ?, updated_by = ? WHERE key = ?', [
@@ -683,6 +751,19 @@ async function putSetting(request, env, auth, key) {
     after: { value },
     reason: data.reason || null,
   });
+
+  // Editing a rate is what the provisional flag exists for: every payslip
+  // computed from here on uses figures nobody has confirmed yet. Flip the flag
+  // so the banner says so, instead of the change silently inheriting the old
+  // "confirmed" mark. Absence of the row already means unverified, so a no-op
+  // update here is harmless.
+  if (RATE_KEYS.has(key)) {
+    await d1Run(
+      env,
+      "UPDATE settings SET value = 'true', updated_at = ?, updated_by = ? WHERE key = 'payroll._unverified'",
+      [nowIso, auth ? actorName(auth) : null]
+    );
+  }
 
   return json({ ok: true, key, value });
 }
