@@ -368,14 +368,6 @@ function allowedRuleIdsForRole(auth) {
   return [...allowed];
 }
 
-/**
- * Back-compat shim — the pre-station filter by rule_id alone. The SSE
- * handler and tests used this name; both callers now use the pair above.
- */
-function ruleWhitelistForRole(auth) {
-  return allowedRuleIdsForRole(auth);
-}
-
 /** GET /api/alerts — open by default, ?status=… or ?all=1 to widen. */
 async function listAlerts(url, env, auth) {
   const wantsAll = ['1', 'true', 'yes'].includes(String(url.searchParams.get('all') || '').toLowerCase());
@@ -515,4 +507,4 @@ async function handleAlerts(pathname, method, url, request, env, auth) {
   return null;
 }
 
-export { handleAlerts, listAlerts, alertVisibleTo, allowedRuleIdsForRole, ruleWhitelistForRole, RULE_AUDIENCE, RULE_IDS, SEVERITY };
+export { handleAlerts, listAlerts, alertVisibleTo, allowedRuleIdsForRole, RULE_AUDIENCE, RULE_IDS, SEVERITY };

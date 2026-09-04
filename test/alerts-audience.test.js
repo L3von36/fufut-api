@@ -30,7 +30,6 @@ import { d1Query, d1Run } from '../src/lib/db.js';
 import {
   alertVisibleTo,
   allowedRuleIdsForRole,
-  ruleWhitelistForRole,
   runAlertSweep,
 } from '../src/handlers/alerts.js';
 import {
@@ -172,10 +171,9 @@ describe('allowedRuleIdsForRole — the SQL pre-filter', () => {
     expect(barista).not.toContain('table-seated-too-long');
   });
 
-  it('gives a role with no audience an empty list, and keeps the old name working', () => {
+  it('gives a role with no audience an empty list', () => {
     expect(allowedRuleIdsForRole(auth('cleaner'))).toEqual([]);
-    expect(ruleWhitelistForRole(auth('cleaner'))).toEqual([]);
-    expect(ruleWhitelistForRole(auth('manager'))).toBeNull();
+    expect(allowedRuleIdsForRole(null)).toEqual([]);
   });
 });
 
