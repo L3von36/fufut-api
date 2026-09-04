@@ -1150,6 +1150,12 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
         items,
         total: round2(data.total),
         payment: data.payment || null,
+        // Stamped at birth: the SSE kitchen probe keys on MAX(updated_at) over
+        // active orders, so a brand-new ticket must carry a non-NULL value or
+        // it exists on the board only at the next refresh that had some other
+        // reason to run. NULL would also keep the row out of migration 027's
+        // partial index, which is what makes that probe a one-row read.
+        updated_at: nowIso,
         type: qr.table ? 'dine-in' : orderType,
         /* Normalised like every other reference. Filing a QR order under
          * the raw `tables.id` put it under "Table 6" while the POS filed the
@@ -1595,8 +1601,8 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
       const share = i === seatCount - 1 ? round2(outstanding - evenShare * (seatCount - 1)) : evenShare;
       await d1Run(
         env,
-        `INSERT INTO orders (id, type, table_id, customer, status, payment_status, items, subtotal, total, created, notes)
-         VALUES (?, ?, ?, ?, 'new', 'unpaid', ?, ?, ?, ?, ?)`,
+        `INSERT INTO orders (id, type, table_id, customer, status, payment_status, items, subtotal, total, created, notes, updated_at)
+         VALUES (?, ?, ?, ?, 'new', 'unpaid', ?, ?, ?, ?, ?, ?)`,
         [
           splitId,
           order.type || "dine-in",
@@ -1607,6 +1613,7 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
           share,
           nowIso,
           `Split bill ${i+1} of ${seatCount} from #${orderId.slice(-4)}`,
+          nowIso,
         ]
       );
       createdSplits.push({ id: splitId, total: share });

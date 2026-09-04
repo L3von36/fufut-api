@@ -16,6 +16,14 @@
 
 import { json } from './lib/db.js';
 import { authorize, redactStaffForRole } from './auth.js';
+import {
+  CACHE_TTL,
+  cacheablePath,
+  microCacheGet,
+  microCacheKey,
+  microCachePut,
+  microCacheFlush,
+} from './lib/microcache.js';
 
 import { handleContent, checkScheduledPublish } from './handlers/content.js';
 import { handleOrders, loadStaleHours, autoCompleteStaleOrders } from './handlers/orders.js';
@@ -254,7 +262,48 @@ export default {
     const decision = await authorize(request, env, pathname, method.toUpperCase(), url);
     if (!decision.ok) return decision.response;
 
+    // ── Poll coalescing (see lib/microcache.js) ─────────────────────────
+    // Only exact whitelisted paths, only GET, keyed by role + query string.
+    // The lookup sits AFTER the authorization gate: the cache can only ever
+    // answer for a session that would have been allowed to make the call.
+    const isGet = method.toUpperCase() === 'GET';
+    const roleKey = String(
+      (decision.auth && (decision.auth.sessionRole || decision.auth.role)) || 'anon'
+    ).toLowerCase();
+    const cacheKey =
+      isGet && cacheablePath(pathname)
+        ? microCacheKey(roleKey, pathname, url.search)
+        : null;
+    if (cacheKey) {
+      const hit = microCacheGet(cacheKey, CACHE_TTL[pathname]);
+      if (hit) {
+        return new Response(hit.body, {
+          status: hit.status,
+          headers: { 'Content-Type': hit.contentType },
+        });
+      }
+    }
+
     const response = await route(pathname, method, url, request, env, ctx, decision.auth);
+
+    // A successful write invalidates every cached read: the writer's very
+    // next read must see what they just did, and 3-15s TTLs are short enough
+    // that a blunt flush costs nothing. Failed writes change nothing.
+    if (!isGet && response && response.status >= 200 && response.status < 300) {
+      microCacheFlush();
+    }
+
+    // Cache the poll endpoints' 200 JSON answers. Bodies are read as text so
+    // the cached copy is a plain string — safe to hand to many Responses.
+    if (cacheKey && response && response.status === 200) {
+      try {
+        const body = await response.clone().text();
+        const contentType = response.headers.get('Content-Type') || 'application/json';
+        microCachePut(cacheKey, response.status, body, contentType);
+      } catch {
+        // A body that cannot be cloned is simply not cached.
+      }
+    }
 
     // Staff listings carry colleague phone numbers and emails. Time Clock and
     // Shifts need names, so redact contact details rather than blocking.
