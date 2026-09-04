@@ -6,12 +6,17 @@
     "check-drift.mjs fails when the deployed script contains a function this repo",
     "does not, because that is what an out-of-band deploy looks like. A commit",
     "that legitimately deletes or renames a function looks identical, and without",
-    "this file it would block every deploy from then on — which in practice means",
+    "this file it would block every deploy from then on \u2014 which in practice means",
     "somebody disables the check, and the guardrail is worth more than that.",
     "",
     "An entry here is a claim, made in a reviewable diff, that a name's",
     "disappearance was intended. Entries become unnecessary the moment the deploy",
     "lands; the check says which ones can go."
   ],
-  "removed": []
+  "removed": [
+    {
+      "name": "ruleWhitelistForRole",
+      "why": "Superseded by the station-aware audience: allowedRuleIdsForRole (SQL pre-filter) + alertVisibleTo (per-row station/target refinement) now gate every alert surface. The old rule_id-only shim had no remaining callers, so esbuild tree-shook it out of the bundle."
+    }
+  ]
 }
