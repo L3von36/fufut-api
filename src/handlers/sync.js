@@ -14,6 +14,7 @@
  */
 
 import { json, readBody, d1Query, d1Run } from '../lib/db.js';
+import { countRowsRead } from '../lib/quota.js';
 import { decide, reasonFor } from '../lib/ownership.js';
 
 /** Never hand over the whole journal at once; a reconnect after a long outage
@@ -33,7 +34,11 @@ const MAX_BATCH = 500;
 async function replay(env, payload) {
   const sql = String(payload.sql || '');
   const params = Array.isArray(payload.params) ? payload.params : [];
-  return await env.DB.prepare(sql).bind(...params).run();
+  const res = await env.DB.prepare(sql).bind(...params).run();
+  // Raw prepare here (not d1Run) so a replayed write is not re-journalled —
+  // but the quota breaker must still see it, so count it by hand.
+  countRowsRead(res && res.meta ? res.meta.rows_read : 0);
+  return res;
 }
 
 function isDuplicate(err) {

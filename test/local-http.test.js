@@ -162,10 +162,15 @@ describe('the API always wins over the web directory', () => {
   it('never serves a stray file for an /api/* path', async () => {
     /**
      * web/api/index.html is sitting there deliberately. If the static server
-     * ever picked it up for /api/health, a file in an app bundle could
-     * shadow a real endpoint and take the till offline.
+     * ever picked it up for an unimplemented /api/* path, a file in an app
+     * bundle could shadow a real endpoint and take the till offline.
+     *
+     * /api/health used to be this test's example of a path that does not
+     * exist — until the quota circuit breaker made it a real public endpoint
+     * (handlers/health.js). The shadowing guarantee is path-independent, so
+     * the test now aims at a name that is still unimplemented.
      */
-    const response = await fetch(`${base}/api/health`);
+    const response = await fetch(`${base}/api/not-a-real-endpoint`);
     expect([401, 404]).toContain(response.status);
     expect(await response.text()).not.toContain('stray-api-file');
   });

@@ -1,4 +1,5 @@
 import { outboxCapture, outboxBatchStatements } from './outbox.js';
+import { countRowsRead } from './quota.js';
 
 var D1_BINDING = "DB";
 
@@ -26,11 +27,17 @@ function vid() {
 }
 
 async function d1Query(env, sql, params = []) {
-  return await env[D1_BINDING].prepare(sql).bind(...params).all();
+  const res = await env[D1_BINDING].prepare(sql).bind(...params).all();
+  // meta.rows_read is the same counter Cloudflare bills the daily budget
+  // against — the quota circuit breaker (lib/quota.js) runs on exact numbers,
+  // not estimates. A response without meta (some test doubles) counts zero.
+  countRowsRead(res && res.meta ? res.meta.rows_read : 0);
+  return res;
 }
 
 async function d1Run(env, sql, params = []) {
   const result = await env[D1_BINDING].prepare(sql).bind(...params).run();
+  countRowsRead(result && result.meta ? result.meta.rows_read : 0);
   // After the write, never before: the journal describes what happened, so a
   // statement that failed must leave no entry behind for the other side to
   // replay.
@@ -52,7 +59,9 @@ async function d1Batch(env, entries) {
   const list = Array.isArray(entries) ? entries : [];
   const statements = list.map(({ sql, params = [] }) => env[D1_BINDING].prepare(sql).bind(...params));
   if (!statements.length) return [];
-  return await env[D1_BINDING].batch([...statements, ...outboxBatchStatements(env, list)]);
+  const results = await env[D1_BINDING].batch([...statements, ...outboxBatchStatements(env, list)]);
+  for (const r of results) countRowsRead(r && r.meta ? r.meta.rows_read : 0);
+  return results;
 }
 
 function stripMeta(content) {

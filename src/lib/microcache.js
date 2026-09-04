@@ -32,6 +32,20 @@ export const CACHE_TTL = {
   '/api/tables': 3000, // floor plan, bill-request card, payment summary
   '/api/orders': 3000, // kitchen boards (their SSE covers live updates)
   '/api/stats': 15000, // dashboard aggregates, polled at 30-60s
+  // The manager dashboard loads eleven shared lists in one burst, and two
+  // managers opening it at once used to be two full bursts. These are all
+  // role-shared collections — no per-person shape — so one cache entry per
+  // role+query is safe. Deliberately NOT here: anything per-user
+  // (timeclock/me, cashdrawer/shift-log) — the cache key carries the ROLE,
+  // not the staff id, and a shared key there would show one person's shift
+  // to another.
+  '/api/payments': 5000,
+  '/api/tips': 5000,
+  '/api/expenses': 5000,
+  '/api/inventory': 5000,
+  '/api/waste': 5000,
+  '/api/delivery': 5000,
+  '/api/reservations': 5000,
 };
 
 export function microCacheKey(roleKey, pathname, search) {

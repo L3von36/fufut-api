@@ -44,6 +44,10 @@ const PUBLIC = [
   // Website CMS + catalogue reads.
   { method: 'GET', exact: '/api/content' },
   { method: 'GET', exact: '/api/stats' },
+  // Liveness + quota mode for uptime monitors. Must answer even while D1 is
+  // the thing that is down, so it is public and reads no D1 on the gate (the
+  // handler resolves a manager session itself for the optional detail block).
+  { method: 'GET', exact: '/api/health' },
   // Whether the venue can take an order at all. Public because the website
   // needs it before a customer has done anything.
   { method: 'GET', exact: '/api/venue/status' },

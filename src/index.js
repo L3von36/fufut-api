@@ -17,6 +17,13 @@
 import { json } from './lib/db.js';
 import { authorize, redactStaffForRole } from './auth.js';
 import {
+  getModeSync,
+  quotaTick,
+  cacheTtlMultiplier,
+  cronShouldSweep,
+} from './lib/quota.js';
+import { handleHealth, handleHealthMode } from './handlers/health.js';
+import {
   CACHE_TTL,
   cacheablePath,
   microCacheGet,
@@ -64,6 +71,9 @@ const CORS_PREFLIGHT = {
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   'Access-Control-Max-Age': '86400',
+  // The website (fufutcoffee.com) is a different origin from the API: without
+  // this the X-Fufut-Mode degradation hint is invisible to its JS.
+  'Access-Control-Expose-Headers': 'X-Fufut-Mode',
 };
 
 async function serveImage(env, pathname) {
@@ -85,6 +95,11 @@ async function serveImage(env, pathname) {
 /** Dispatch to the original handlers, in the original order. */
 async function route(pathname, method, url, request, env, ctx, auth) {
   const upper = method.toUpperCase();
+
+  // Liveness + quota mode. Reads no D1 (see handlers/health.js) — deliberately
+  // first, before anything that might touch the database that may be down.
+  if (pathname === '/api/health' && upper === 'GET') return handleHealth(request, env);
+  if (pathname === '/api/health/mode' && upper === 'POST') return handleHealthMode(request, env);
 
   if (pathname === '/api/auth/login' && upper === 'POST') return handleStaffLogin(request, env);
   if (pathname === '/api/auth/me' && upper === 'GET') return handleSessionCheck(request, env);
@@ -258,6 +273,39 @@ export default {
       return new Response(null, { status: 204, headers: CORS_PREFLIGHT });
     }
 
+    // ── Quota circuit breaker (lib/quota.js) ────────────────────────────
+    // Lazy maintenance: refresh the KV day-total view (≤1 read/min/isolate)
+    // and flush this isolate's exact row count (≤1 write/5min/isolate). Both
+    // draw on KV's separate quota and neither ever throws into the request.
+    try {
+      quotaTick(env, ctx);
+    } catch {
+      // Bookkeeping must never break a request.
+    }
+    const mode = getModeSync();
+
+    // Shed the expensive convenience reads BEFORE they touch D1 once the day
+    // is nearly spent: reports are on-demand manager analytics, exactly what
+    // the breaker's contract says goes first. Everything the POS needs to
+    // trade — login, orders, payments, tables, the live boards — is never
+    // gated here. Answered ahead of the auth gate so a dying database does
+    // zero work: 503 with a Retry-After, no session lookup, no query.
+    if (
+      mode === 'critical' &&
+      method.toUpperCase() === 'GET' &&
+      pathname.startsWith('/api/reports')
+    ) {
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: 'Daily data budget nearly exhausted — reports are paused and will return at 00:00 UTC',
+          mode,
+          resets_at_utc: '00:00',
+        }),
+        { status: 503, headers: { 'Content-Type': 'application/json', 'Retry-After': '300' } }
+      );
+    }
+
     // ── Authorization gate ──────────────────────────────────────────────
     const decision = await authorize(request, env, pathname, method.toUpperCase(), url);
     if (!decision.ok) return decision.response;
@@ -270,12 +318,14 @@ export default {
     const roleKey = String(
       (decision.auth && (decision.auth.sessionRole || decision.auth.role)) || 'anon'
     ).toLowerCase();
+    // TTLs stretch as the budget drains (x3 conserve, x8 emergency) — the
+    // same coalescing doing proportionally more work with less headroom.
     const cacheKey =
       isGet && cacheablePath(pathname)
         ? microCacheKey(roleKey, pathname, url.search)
         : null;
     if (cacheKey) {
-      const hit = microCacheGet(cacheKey, CACHE_TTL[pathname]);
+      const hit = microCacheGet(cacheKey, CACHE_TTL[pathname] * cacheTtlMultiplier(mode));
       if (hit) {
         return new Response(hit.body, {
           status: hit.status,
@@ -284,7 +334,21 @@ export default {
       }
     }
 
-    const response = await route(pathname, method, url, request, env, ctx, decision.auth);
+    let response;
+    try {
+      response = await route(pathname, method, url, request, env, ctx, decision.auth);
+    } catch (e) {
+      // The outage of 2026-09-04 surfaced to staff as the raw text
+      // "error code: 1101" — an unhandled Worker exception with no status
+      // contract the clients could parse. Whatever escapes a handler now
+      // leaves as JSON, so the POS sees a normal error shape it can show,
+      // queue offline, or retry — and the logs keep the stack via console.
+      console.error('[API] unhandled error on', method, pathname, e);
+      response = json(
+        { ok: false, error: 'Internal error', detail: String((e && e.message) || e).slice(0, 200) },
+        500
+      );
+    }
 
     // A successful write invalidates every cached read: the writer's very
     // next read must see what they just did, and 3-15s TTLs are short enough
@@ -303,6 +367,14 @@ export default {
       } catch {
         // A body that cannot be cloned is simply not cached.
       }
+    }
+
+    // Tell every client which degradation mode the API is in — the POS can
+    // surface "live updates slowed to conserve quota" without a new endpoint.
+    try {
+      response.headers.set('X-Fufut-Mode', mode);
+    } catch {
+      // An immutable-headers response is simply returned without the hint.
     }
 
     // Staff listings carry colleague phone numbers and emails. Time Clock and
@@ -329,7 +401,22 @@ export default {
   // cleared, and run the SLA rules over live orders. All three only happen if
   // something asks — this is the something.
   async scheduled(event, env, ctx) {
+    // Awaited here: cron is the one caller that wants the quota view current
+    // BEFORE deciding what this minute may afford.
+    try {
+      await quotaTick(env, ctx);
+    } catch {
+      // Same contract as everywhere else: bookkeeping never breaks the job.
+    }
+    // KV-only — content publishing is priced in a different currency and
+    // keeps running in every mode.
     await checkScheduledPublish(env);
+    // The three D1-backed sweeps throttle themselves as the budget drains:
+    // every minute in normal/conserve, every other minute in emergency, not
+    // at all in critical. A paused sweep delays SLA banners and stale-table
+    // release by minutes; it does not lose them — the next unpaused minute
+    // catches up.
+    if (!cronShouldSweep()) return;
     try {
       const { table } = await loadStaleHours(env);
       await releaseOverstayedTables(env, table);

@@ -1,6 +1,7 @@
 import { mapResourceRow } from './resources.js';
 import { d1Query } from '../lib/db.js';
 import { alertVisibleTo, allowedRuleIdsForRole } from './alerts.js';
+import { getModeSync, freshnessMultiplier, noteSseOpen, noteSseClose } from '../lib/quota.js';
 
 function sseEvent(event, data) {
   const enc = new TextEncoder();
@@ -156,9 +157,17 @@ function clientView(channel, payload, client) {
  */
 export async function tickChannel(channel, env, client, opts = {}) {
   const nowMs = Number(opts.nowMs) || Date.now();
+  // The degradation throttle: in normal mode the window is the designed 8s;
+  // conserve x4, emergency x8. The tick interval itself never changes — the
+  // keepalive must keep flowing through proxies — what stretches is how stale
+  // the shared payload may be before a tick re-queries. In critical mode the
+  // broad queries stop entirely: every screen freezes on its last payload
+  // (the board is old, but it is not blank, and midnight is coming).
+  const mode = getModeSync();
+  const freshMs = PAYLOAD_FRESH_MS * freshnessMultiplier(mode);
   let cache = channelCache.get(channel);
 
-  if (!cache || nowMs - cache.at >= PAYLOAD_FRESH_MS) {
+  if (mode !== 'critical' && (!cache || nowMs - cache.at >= freshMs)) {
     try {
       const probe = await probeChannel(channel, env);
       if (cache && cache.payload && probe !== undefined && probe === cache.probe) {
@@ -215,10 +224,12 @@ async function handleSSE(request, env, channel, auth) {
     // always emits so a freshly connected screen gets the current state
     // rather than waiting for the floor to move.
     lastSig: null,
+    lastMode: null,
   };
 
   const stream = new ReadableStream({
     async start(controller) {
+      noteSseOpen(channel); // per-isolate gauge for /api/health
       const safe = (fn) => {
         try {
           fn();
@@ -226,6 +237,13 @@ async function handleSSE(request, env, channel, auth) {
       };
       const tick = async () => {
         try {
+          // Live clients learn about degradation the moment it starts — a
+          // board that slows down says so, instead of looking broken.
+          const m = getModeSync();
+          if (m !== client.lastMode) {
+            client.lastMode = m;
+            safe(() => controller.enqueue(sseEvent('quota_mode', { mode: m })));
+          }
           const r = await tickChannel(channel, env, client);
           if (!r.keepaliveOnly && r.sig !== client.lastSig) {
             client.lastSig = r.sig;
@@ -235,7 +253,7 @@ async function handleSSE(request, env, channel, auth) {
         safe(() => controller.enqueue(encoder.encode(': keepalive\n\n')));
       };
 
-      safe(() => controller.enqueue(sseEvent('connected', { ok: true, channel })));
+      safe(() => controller.enqueue(sseEvent('connected', { ok: true, channel, mode: getModeSync() })));
       const timer = setInterval(tick, TICK_MS);
       tick();
       if (request && request.signal) {
@@ -243,6 +261,7 @@ async function handleSSE(request, env, channel, auth) {
           'abort',
           () => {
             clearInterval(timer);
+            noteSseClose(channel);
           },
           { once: true }
         );
@@ -251,8 +270,8 @@ async function handleSSE(request, env, channel, auth) {
     cancel() {
       // clearInterval happens in the abort listener; a cancelled stream with
       // no abort event is the closed-connection case the runtime already
-      // surfaces through the signal on Workers. Nothing per-client lives in
-      // module state, so there is nothing else to tear down.
+      // surfaces through the signal on Workers. The SSE gauge decrements
+      // there too; nothing per-client lives in module state beyond it.
     },
   });
 
