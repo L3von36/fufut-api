@@ -3,6 +3,7 @@ import { writeAudit } from '../lib/audit.js';
 import { actorName, isManager } from '../auth.js';
 import { refreshPaymentStatus } from './payments.js';
 import { addToOpenDrawerCash } from '../lib/drawer.js';
+import { alertsHaveStationColumns } from './alerts.js';
 import { syncDeliveryToOrderStatus } from './delivery.js';
 import { consumeForOrder, reverseOrderConsumption } from '../lib/ledger.js';
 import { blocksSeating, ACTIVE_STATUSES } from '../lib/booking.js';
@@ -81,6 +82,10 @@ async function raiseReadyNowPing(env, order) {
     if (!order || !order.id) return;
     if (String(order.status || '').toLowerCase() !== 'ready') return;
     if (String(order.type || '').toLowerCase().includes('deliver')) return;
+    // The ping row carries station/target columns from migration 026. Until
+    // that lands, there is nowhere to write it — skip quietly rather than
+    // throw inside every ready tap (the sweep degrades the same way).
+    if (!(await alertsHaveStationColumns(env))) return;
 
     // 1. The table's assigned waiter, if this ticket sits on a table.
     let serverName = '';

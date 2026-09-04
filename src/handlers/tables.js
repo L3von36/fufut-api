@@ -700,21 +700,32 @@ async function handleTables(pathname, method, url, request, env, auth) {
       return json({ ok: false, error: 'Only the floor lead or a manager can request a bill.' }, 403);
     }
     const tableId = parts[2];
-    const { results } = await d1Query(env, 'SELECT id, number, status, bill_requested_at FROM tables WHERE id = ?', [tableId]);
+    const { results } = await d1Query(env, 'SELECT id, number, status FROM tables WHERE id = ?', [tableId]);
     const table = (results || [])[0];
     if (!table) return json({ ok: false, error: 'Table not found' }, 404);
     if (String(table.status || '').toLowerCase() !== 'occupied') {
       return json({ ok: false, error: `Table ${table.number} has no party to bill.` }, 409);
     }
-    if (String(table.bill_requested_at || '').trim()) {
-      return json({ ok: true, alreadyRequested: true, requestedAt: table.bill_requested_at });
+    // Idempotence needs the stamp; pre-migration-026 the column does not
+    // exist, so the read is defensive and the write explains what to do.
+    let existingStamp = '';
+    try {
+      const { results: cur } = await d1Query(env, 'SELECT bill_requested_at FROM tables WHERE id = ?', [tableId]);
+      existingStamp = String((cur || [])[0]?.bill_requested_at || '').trim();
+    } catch { existingStamp = ''; }
+    if (existingStamp) {
+      return json({ ok: true, alreadyRequested: true, requestedAt: existingStamp });
     }
     const stampIso = new Date().toISOString();
-    await d1Run(
-      env,
-      "UPDATE tables SET bill_requested_at = ?, bill_requested_by = ? WHERE id = ?",
-      [stampIso, actorName(auth), tableId]
-    );
+    try {
+      await d1Run(
+        env,
+        "UPDATE tables SET bill_requested_at = ?, bill_requested_by = ? WHERE id = ?",
+        [stampIso, actorName(auth), tableId]
+      );
+    } catch {
+      return json({ ok: false, error: 'Bill requests are not live yet — apply migration 026 (POST /api/migrate/alerts-026)' }, 503);
+    }
     await writeAudit(env, auth, {
       action: 'update',
       entity: 'tables',
@@ -736,17 +747,26 @@ async function handleTables(pathname, method, url, request, env, auth) {
       return json({ ok: false, error: 'Only the floor lead or a manager can clear a bill request.' }, 403);
     }
     const tableId = parts[2];
-    const { results } = await d1Query(env, 'SELECT id, number, bill_requested_at FROM tables WHERE id = ?', [tableId]);
+    const { results } = await d1Query(env, 'SELECT id, number FROM tables WHERE id = ?', [tableId]);
     const table = (results || [])[0];
     if (!table) return json({ ok: false, error: 'Table not found' }, 404);
-    if (!String(table.bill_requested_at || '').trim()) {
+    let standing = '';
+    try {
+      const { results: cur } = await d1Query(env, 'SELECT bill_requested_at FROM tables WHERE id = ?', [tableId]);
+      standing = String((cur || [])[0]?.bill_requested_at || '').trim();
+    } catch { standing = ''; }
+    if (!standing) {
       return json({ ok: true, alreadyClear: true });
     }
-    await d1Run(
-      env,
-      "UPDATE tables SET bill_requested_at = '', bill_requested_by = '' WHERE id = ?",
-      [tableId]
-    );
+    try {
+      await d1Run(
+        env,
+        "UPDATE tables SET bill_requested_at = '', bill_requested_by = '' WHERE id = ?",
+        [tableId]
+      );
+    } catch {
+      return json({ ok: false, error: 'Bill requests are not live yet — apply migration 026 (POST /api/migrate/alerts-026)' }, 503);
+    }
     await writeAudit(env, auth, {
       action: 'update',
       entity: 'tables',

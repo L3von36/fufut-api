@@ -150,6 +150,30 @@ function resolveReadyNowTarget(v, staffByName) {
 }
 
 /**
+ * Does this database have migration 026's columns yet?
+ *
+ * The station/target columns arrive with migration 026, and the deploy must
+ * never depend on a human running it first: probed once per warm isolate,
+ * cached, and everything the columns carry degrades gracefully when they are
+ * missing — the sweep keeps raising, escalating and resolving alerts exactly
+ * as the pre-station code did (rule-level audiences still apply; every order
+ * alert reads as station '' and lands in the kitchen bucket, the audience it
+ * had before the split), and the bill-request writes answer with a clear
+ * "apply migration 026" instead of a 500.
+ */
+let _stationColumns = null;
+async function alertsHaveStationColumns(env) {
+  if (_stationColumns !== null) return _stationColumns;
+  try {
+    await d1Query(env, 'SELECT station, target_staff_id FROM alerts LIMIT 1');
+    _stationColumns = true;
+  } catch {
+    _stationColumns = false; // migration 026 not applied yet
+  }
+  return _stationColumns;
+}
+
+/**
  * Run the rules and reconcile `alerts` with what they found.
  *
  * Raises, escalates and de-escalates in place, and resolves everything whose
@@ -167,12 +191,16 @@ export async function runAlertSweep(env) {
 
   // Ready-now pings name a person: resolve tables.server / created_by to a
   // staff id here, so the audience filter can aim the row. One staff read
-  // per sweep, only when a ping is live.
-  let staffByName = null;
-  for (const v of violations) {
-    if (v.rule_id !== RULE_IDS.READY_NOW) continue;
-    if (!staffByName) staffByName = await loadStaffByName(env);
-    v.target_staff_id = resolveReadyNowTarget(v, staffByName);
+  // per sweep, only when a ping is live — and only when the row can carry
+  // a target at all (pre-migration-026 the column does not exist).
+  const extended = await alertsHaveStationColumns(env);
+  if (extended) {
+    let staffByName = null;
+    for (const v of violations) {
+      if (v.rule_id !== RULE_IDS.READY_NOW) continue;
+      if (!staffByName) staffByName = await loadStaffByName(env);
+      v.target_staff_id = resolveReadyNowTarget(v, staffByName);
+    }
   }
 
   const wanted = new Map();
@@ -182,7 +210,7 @@ export async function runAlertSweep(env) {
   // re-raising; a resolved row is forgotten here on purpose.
   const { results: live } = await d1Query(
     env,
-    "SELECT id, rule_id, entity_type, entity_id, severity, status, station, target_staff_id FROM alerts WHERE status IN ('open','acknowledged')"
+    "SELECT id, rule_id, entity_type, entity_id, severity, status" + (extended ? ", station, target_staff_id" : "") + " FROM alerts WHERE status IN ('open','acknowledged')"
   );
   const existing = new Map();
   for (const r of live || []) existing.set(`${r.rule_id}|${r.entity_type}|${r.entity_id}`, r);
@@ -195,12 +223,21 @@ export async function runAlertSweep(env) {
   for (const [key, v] of wanted) {
     const row = existing.get(key);
     if (!row) {
-      await d1Run(
-        env,
-        `INSERT INTO alerts (id, rule_id, severity, entity_type, entity_id, entity_label, message, status, station, target_staff_id, created, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)`,
-        [vid(), v.rule_id, v.severity, v.entity_type, v.entity_id, v.entity_label || '', v.message, v.station || '', v.target_staff_id || '', stamp, stamp]
-      );
+      if (extended) {
+        await d1Run(
+          env,
+          `INSERT INTO alerts (id, rule_id, severity, entity_type, entity_id, entity_label, message, status, station, target_staff_id, created, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)`,
+          [vid(), v.rule_id, v.severity, v.entity_type, v.entity_id, v.entity_label || '', v.message, v.station || '', v.target_staff_id || '', stamp, stamp]
+        );
+      } else {
+        await d1Run(
+          env,
+          `INSERT INTO alerts (id, rule_id, severity, entity_type, entity_id, entity_label, message, status, created, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`,
+          [vid(), v.rule_id, v.severity, v.entity_type, v.entity_id, v.entity_label || '', v.message, stamp, stamp]
+        );
+      }
       raised += 1;
       continue;
     }
@@ -210,17 +247,27 @@ export async function runAlertSweep(env) {
     // refreshed the same way — a legacy row picks up its station on the
     // first sweep that can classify it, and a ping re-aims if the table's
     // assignment changed. Acked rows are the floor's problem now.
-    if (row.status === 'open' && (
-      row.severity !== v.severity ||
-      String(row.station || '') !== String(v.station || '') ||
-      String(row.target_staff_id || '') !== String(v.target_staff_id || '')
-    )) {
-      await d1Run(
-        env,
-        'UPDATE alerts SET severity = ?, message = ?, station = ?, target_staff_id = ?, updated_at = ? WHERE id = ?',
-        [v.severity, v.message, v.station || '', v.target_staff_id || '', stamp, row.id]
+    if (row.status === 'open') {
+      const differs = extended && (
+        row.severity !== v.severity ||
+        String(row.station || '') !== String(v.station || '') ||
+        String(row.target_staff_id || '') !== String(v.target_staff_id || '')
       );
-      changed += 1;
+      if (differs) {
+        await d1Run(
+          env,
+          'UPDATE alerts SET severity = ?, message = ?, station = ?, target_staff_id = ?, updated_at = ? WHERE id = ?',
+          [v.severity, v.message, v.station || '', v.target_staff_id || '', stamp, row.id]
+        );
+        changed += 1;
+      } else if (!extended && row.severity !== v.severity) {
+        await d1Run(
+          env,
+          'UPDATE alerts SET severity = ?, message = ?, updated_at = ? WHERE id = ?',
+          [v.severity, v.message, stamp, row.id]
+        );
+        changed += 1;
+      }
     }
   }
 
@@ -507,4 +554,4 @@ async function handleAlerts(pathname, method, url, request, env, auth) {
   return null;
 }
 
-export { handleAlerts, listAlerts, alertVisibleTo, allowedRuleIdsForRole, RULE_AUDIENCE, RULE_IDS, SEVERITY };
+export { handleAlerts, listAlerts, alertVisibleTo, allowedRuleIdsForRole, alertsHaveStationColumns, RULE_AUDIENCE, RULE_IDS, SEVERITY };

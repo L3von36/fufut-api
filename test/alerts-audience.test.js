@@ -309,3 +309,54 @@ describe('the word list is pinned', () => {
     expect(DRINK_WORDS.source).toContain('lemonade');
   });
 });
+
+describe('runAlertSweep before migration 026 — the deploy cannot wait for a human', () => {
+  it('keeps raising and resolving alerts without the station columns', async () => {
+    // Fresh module instance: the column probe caches per isolate, and the
+    // sweeps above ran against the post-migration shape.
+    vi.resetModules();
+    const fresh = await import('../src/handlers/alerts.js');
+
+    const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'fufut-pre026-'));
+    try {
+      const opened = openLocalD1(path.join(dir2, 'test.sqlite'));
+      const db2 = opened.db;
+      applySchema(db2);
+      // The pre-026 alerts table: no station, no target.
+      db2.exec(`
+        CREATE TABLE alerts (
+          id TEXT PRIMARY KEY, rule_id TEXT NOT NULL,
+          severity TEXT NOT NULL DEFAULT 'warning',
+          entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
+          entity_label TEXT, message TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'open', created TEXT NOT NULL,
+          acknowledged_at TEXT, acknowledged_by TEXT,
+          resolved_at TEXT, updated_at TEXT
+        )`);
+      const env2 = { DB: opened.DB, SITE_ID: 'local' };
+
+      const stale = new Date(Date.now() - 30 * 60000).toISOString();
+      await d1Run(
+        env2,
+        "INSERT INTO orders (id, status, type, items, created, updated_at) VALUES ('ord-tea', 'new', 'dine-in', ?, ?, ?)",
+        [JSON.stringify([{ name: 'Tea' }]), stale, stale]
+      );
+
+      const result = await fresh.runAlertSweep(env2);
+      expect(result.skipped).toBe(false);
+      expect(result.raised).toBeGreaterThanOrEqual(1);
+
+      const row = (await d1Query(env2, "SELECT * FROM alerts WHERE entity_id = 'ord-tea'")).results[0];
+      expect(row.rule_id).toBe('order-new-unaccepted');
+      expect(row.station).toBeUndefined();
+
+      // And the audience filter still routes the legacy row: station '' lands
+      // in the kitchen bucket, so the chef hears it and the barista does not —
+      // exactly the pre-split behaviour, kept working until the migration lands.
+      expect(fresh.alertVisibleTo(row, { sessionRole: 'head-chef' })).toBe(true);
+      expect(fresh.alertVisibleTo(row, { sessionRole: 'barista' })).toBe(false);
+    } finally {
+      fs.rmSync(dir2, { recursive: true, force: true });
+    }
+  });
+});
