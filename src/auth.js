@@ -168,6 +168,13 @@ const SELF_SERVICE = new Set([
   '/api/timeclock/break-end',
   '/api/handovers',
   '/api/handovers/latest',
+  // Your own payslips. Salary is confidential between a person and the
+  // business — confidential in BOTH directions: a cashier must not read the
+  // manager's wage (redactStaffForRole), and a waiter must not need the
+  // manager to look up their own. The handler scopes every row to the
+  // caller's staff_id; a staffId query parameter is ignored for anyone but
+  // nobody — /me has exactly one meaning and no parameters.
+  '/api/payroll/me',
 ]);
 
 /**
@@ -648,19 +655,60 @@ export async function authorize(request, env, pathname, method, url) {
 }
 
 /**
- * Strip colleague contact details from staff listings for anyone who is not a
- * manager. Time Clock and Shifts legitimately need names and roles, so those
- * stay; personal phone numbers and emails do not.
+ * Staff fields that are private to the manager (and the record holder).
+ *
+ * A staff row is two things at once: the face a roster shows — a name, a role,
+ * an on/off status — and an employment record the manager holds in trust. Time
+ * Clock and Shifts legitimately need the first; they have no use for the
+ * second, and neither has any other non-manager role. The worst of those
+ * fields is `base_salary`: pay is confidential between a person and their
+ * employer, and a cashier opening Time Clock must not read the manager's wage
+ * any more than the manager's mail. The bank, TIN and pension numbers sit one
+ * step behind it — each is a direct route to somebody's money or identity —
+ * and the emergency contact, address and free-text notes are the person's
+ * private life, not the floor's.
+ *
+ * Kept as one list and deleted by name rather than kept by allow-list, so a
+ * future harmless column (a new status flag, a preference) still flows to the
+ * screens that need it without anyone remembering to re-approve it here. The
+ * cost of that choice is that a new *sensitive* column must be added to this
+ * list — the test below (staff PII redaction) asserts the important ones, so
+ * a forgotten field fails a suite rather than leaking quietly.
+ */
+const STAFF_PRIVATE_FIELDS = [
+  // Pay. What the payroll engine keys on.
+  'base_salary', 'salary_period',
+  // Money and identity documents.
+  'bank_account', 'tin', 'pension_id',
+  // The employment record the manager holds in trust.
+  'employment_type', 'hire_date', 'end_date',
+  // The person's private life.
+  'emergency_contact', 'emergency_phone', 'address', 'notes',
+];
+
+/**
+ * Shape a staff payload for the caller's role.
+ *
+ * The manager reads the whole record — they wrote it, and StaffView edits it:
+ * stripping a field here would blank the form and silently null the value on
+ * the next save. Every other role gets the roster fields: id, name, role,
+ * status and the harmless extras. Contact details (phone, email) are stripped
+ * for non-managers too, as they always have been; salary and the employment
+ * record join them. password_hash is stripped for everyone, always —
+ * mapResourceRow removes it upstream as well, so a new read path cannot
+ * reintroduce the leak.
  */
 export function redactStaffForRole(payload, role) {
   const manager = isManager(role);
   const scrub = (row) => {
     if (!row || typeof row !== 'object') return row;
-    // password_hash is stripped for everyone, always. mapResourceRow already
-    // removes it upstream; doing it here too means a new read path cannot
-    // reintroduce the leak.
-    const { password_hash, phone, email, ...rest } = row;
-    return manager ? { ...rest, phone, email } : rest;
+    const clean = { ...row };
+    delete clean.password_hash;
+    if (manager) return clean;
+    for (const f of STAFF_PRIVATE_FIELDS) delete clean[f];
+    delete clean.phone;
+    delete clean.email;
+    return clean;
   };
   return Array.isArray(payload) ? payload.map(scrub) : scrub(payload);
 }

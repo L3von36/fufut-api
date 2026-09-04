@@ -258,13 +258,24 @@ describe('manager-only operations', () => {
 
 describe('staff PII redaction', () => {
   const rows = [
-    { id: 'S8', firstName: 'Tigist', lastName: 'M', role: 'Assistant Chef', phone: '+2519...', email: 'a@b.c', password_hash: 'x' },
+    {
+      id: 'S8', firstName: 'Tigist', lastName: 'M', role: 'Assistant Chef', status: 'active',
+      phone: '+2519...', email: 'a@b.c', password_hash: 'x',
+      // The employment record: pay, the documents payroll needs, and the
+      // person's private life. None of it has a use on a roster screen.
+      base_salary: 9500, salary_period: 'monthly',
+      bank_account: '1000123456789', tin: '0052345678', pension_id: 'P-4471',
+      employment_type: 'full-time', hire_date: '2024-01-15', end_date: null,
+      emergency_contact: 'Abebe', emergency_phone: '+2519...', address: 'Bole, Addis', notes: 'prefers closing shifts',
+    },
   ];
 
-  it('keeps contact details for a manager', () => {
+  it('keeps the whole record for a manager', () => {
     const out = redactStaffForRole(rows, 'Manager');
     expect(out[0].phone).toBeDefined();
     expect(out[0].email).toBeDefined();
+    expect(out[0].base_salary).toBe(9500);
+    expect(out[0].bank_account).toBeDefined();
   });
 
   it('strips phone and email for everyone else', () => {
@@ -274,6 +285,33 @@ describe('staff PII redaction', () => {
     // Time Clock and Shifts still need names and roles.
     expect(out[0].firstName).toBe('Tigist');
     expect(out[0].role).toBe('Assistant Chef');
+  });
+
+  it('strips salary and pay figures for everyone but the manager', () => {
+    // The whole point of the widening: a cashier reading /api/staff for the
+    // Time Clock roster used to receive every colleague's wage.
+    for (const role of ['Cashier', 'cleaner', 'head-chef', 'barista', 'accountant', 'delivery-staff']) {
+      const out = redactStaffForRole(rows, role);
+      expect(out[0].base_salary).toBeUndefined();
+      expect(out[0].salary_period).toBeUndefined();
+    }
+  });
+
+  it('strips bank, tax and pension identifiers for everyone but the manager', () => {
+    for (const role of ['Cashier', 'accountant']) {
+      const out = redactStaffForRole(rows, role);
+      expect(out[0].bank_account).toBeUndefined();
+      expect(out[0].tin).toBeUndefined();
+      expect(out[0].pension_id).toBeUndefined();
+    }
+  });
+
+  it("strips the person's private details for everyone but the manager", () => {
+    const out = redactStaffForRole(rows, 'Cashier');
+    expect(out[0].emergency_contact).toBeUndefined();
+    expect(out[0].emergency_phone).toBeUndefined();
+    expect(out[0].address).toBeUndefined();
+    expect(out[0].notes).toBeUndefined();
   });
 
   it('never returns a password hash', () => {

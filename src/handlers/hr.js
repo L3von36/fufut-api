@@ -568,6 +568,80 @@ async function listPayrollRuns(env, url) {
   return json({ ok: true, runs: results || [] });
 }
 
+/**
+ * Your own payslips — the self-service half of payroll.
+ *
+ * Payroll documents were reachable only through the run list, which holds the
+ * `payroll` read: manager and accountant. That was the right call for the
+ * documents as a whole — a run is the whole café's pay in one place — and it
+ * left the individual person with no way to see their own payslip without
+ * asking the manager for it, which is the one request privacy makes awkward.
+ *
+ * `/api/payroll/me` closes that gap without reopening anything. Three rules
+ * hold:
+ *
+ *   1. The caller is the only subject. The staff id comes from the session,
+ *      never from the query string — there is no parameter by which this
+ *      endpoint can be pointed at a colleague, so no caller mistake or
+ *      forged link can widen it.
+ *   2. Lines are joined to their run only for the period dates and the
+ *      provisional flag. Totals of the run — which reveal other people's
+ *      pay in aggregate — are not returned.
+ *   3. The person's current base salary comes from their own staff row,
+ *      which is their data. The employment fields that redactStaffForRole
+ *      strips from *colleague* rows are fine here precisely because this row
+ *      is the caller.
+ *
+ * Payslips are stored, not recomputed (see runPayroll), so what a person
+ * reads here in December is what they were told in June — the snapshot rule
+ * the rest of the system lives by.
+ */
+async function myPayslips(env, auth) {
+  const staffId = auth && auth.staff_id;
+  if (!staffId) return json({ ok: false, error: 'Authentication required' }, 401);
+
+  const [{ results: rows }, { results: mine }] = await Promise.all([
+    d1Query(
+      env,
+      `SELECT l.id, l.run_id, l.base_salary, l.overtime_pay, l.bonuses, l.deductions,
+              l.gross_pay, l.taxable_pay, l.income_tax, l.pension_employee,
+              l.pension_employer, l.net_pay, l.tips_earned, l.days_worked,
+              l.days_absent, l.breakdown, l.created_at,
+              r.period_start, r.period_end, r.status AS run_status, r.provisional
+         FROM payroll_lines l
+         JOIN payroll_runs r ON r.id = l.run_id
+        WHERE l.staff_id = ?
+        ORDER BY r.period_start DESC, r.created_at DESC
+        LIMIT 60`,
+      [String(staffId)]
+    ),
+    d1Query(
+      env,
+      'SELECT base_salary, salary_period, employment_type FROM staff WHERE id = ?',
+      [String(staffId)]
+    ).catch(() => ({ results: [] })),
+  ]);
+
+  const payslips = (rows || []).map((l) => {
+    let breakdown = null;
+    try { breakdown = l.breakdown ? JSON.parse(l.breakdown) : null; } catch { /* keep null */ }
+    return { ...l, breakdown };
+  });
+
+  const me = (mine && mine[0]) || null;
+  return json({
+    ok: true,
+    payslips,
+    current: me
+      ? {
+          baseSalary: num(me.base_salary),
+          salaryPeriod: me.salary_period || 'monthly',
+          employmentType: me.employment_type || null,
+        }
+      : null,
+  });
+}
+
 // ── Settings ────────────────────────────────────────────────────────────────
 
 async function getSettings(env, url) {
@@ -921,6 +995,12 @@ export async function handleHR(pathname, method, url, request, env, auth) {
 
   if (pathname.startsWith('/api/payroll')) {
     const sub = pathname.replace(/^\/api\/payroll/, '');
+    // Self-service payslips, ahead of the run list. See SELF_SERVICE in
+    // auth.js: every signed-in role may read their OWN payslips — salary is
+    // confidential in both directions, so a waiter must not need the manager
+    // to look up their own pay any more than the manager needs the waiter's.
+    // The run list below stays manager-and-accountant only.
+    if (m === 'GET' && sub === '/me') return myPayslips(env, auth);
     if (m === 'GET' && sub === '') return listPayrollRuns(env, url);
     if (m === 'POST' && sub === '/run') {
       if (!isManager((auth && (auth.sessionRole || auth.role)) || '')) {
