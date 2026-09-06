@@ -65,12 +65,14 @@ const KV_OVERRIDE_KEY = 'quota:mode:override';
 const KV_DAY_PREFIX = 'quota:day:';
 
 // KV budgets on the free tier: 100k reads/day, 1k writes/day. These cadences
-// keep this module inside ~1.5k reads and ~300 writes per isolate per day —
-// a rounding error next to the menus the site already reads, and invisible
-// next to what D1 was dying of.
+// keep this module inside ~1.5k reads and ~150 writes per isolate per day,
+// surviving a high cold-start churn (Cloudflare can spin up a new isolate every
+// few minutes under load — without these guards each cold-start would flush
+// once, and 5 isolates × 60 cold-starts/hour × 24h would burn 7,200 writes/day).
+// With the cold-start skip we are at ~25 writes/isolate/day at the floor.
 const KV_REFRESH_MS = 60_000; // how often one isolate re-reads the day total
 const FLUSH_MIN_MS = 300_000; // never flush more often than this
-const FLUSH_MAX_MS = 900_000; // ...but always flush at least this often
+const FLUSH_MAX_MS = 1_800_000; // ...but always flush at least this often (30min)
 const FLUSH_DELTA_ROWS = 200_000; // ...or as soon as this much has accrued
 
 const state = {
@@ -217,12 +219,15 @@ export function quotaTick(env, ctx) {
       await refreshQuota(env);
       const delta = state.local - state.lastFlushLocal;
       const sinceFlush = Date.now() - state.lastFlushAt;
-      const firstFlush = state.lastFlushAt === 0;
-      // Flush when: this isolate's first flush of the day, the accrued delta
-      // is worth a write (>=200k rows = 0.1% of the error bar we tolerate),
-      // or the max cadence elapsed. FLUSH_MAX_MS > FLUSH_MIN_MS, so the max
-      // branch implies the min-cadence gate; a large delta bypasses it.
-      if (delta > 0 && (firstFlush || delta >= FLUSH_DELTA_ROWS || sinceFlush >= FLUSH_MAX_MS)) {
+      // Flush when: this isolate's accrued delta is worth a write (>=200k rows
+      // = 0.1% of the error bar we tolerate), or the max cadence elapsed.
+      // The firstFlush-on-cold-start path was removed: a cold-start isolate's
+      // count is picked up by the next delta or max-cadence flush on whatever
+      // isolate is alive, and the breaker only needs to be within a few percent
+      // within a minute — not within a few percent within a millisecond. This
+      // eliminates the cold-start churn that 5+ active isolates would otherwise
+      // burn through the free-tier 1k writes/day budget on.
+      if (delta > 0 && (delta >= FLUSH_DELTA_ROWS || sinceFlush >= FLUSH_MAX_MS)) {
         await flushNow(env);
       }
     } catch {

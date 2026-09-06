@@ -155,7 +155,7 @@ export async function refreshPaymentStatus(env, orderId) {
  *   - payment greater than the total   → 400 unless explicitly allowed
  *   - payment against a voided order   → 409
  */
-async function recordPayment(request, env, auth) {
+async function recordPayment(request, env, ctx, auth) {
   const data = await readBody(request);
   if (!data) return json({ ok: false, error: 'Invalid JSON body' }, 400);
 
@@ -260,7 +260,7 @@ async function recordPayment(request, env, auth) {
  * the driver: the point of the step is that a second pair of eyes sees the
  * evidence. Enforced by role — delivery staff cannot reach this endpoint at all.
  */
-async function verifyPayment(request, env, auth, paymentId) {
+async function verifyPayment(request, env, ctx, auth, paymentId) {
   const data = (await readBody(request)) || {};
   const { results } = await d1Query(env, 'SELECT * FROM payments WHERE id = ?', [paymentId]);
   const payment = results && results[0];
@@ -309,7 +309,7 @@ async function verifyPayment(request, env, auth, paymentId) {
  * that was taken would destroy the fact that money changed hands twice, which
  * is the thing a refund most needs to prove.
  */
-async function refundPayment(request, env, auth, paymentId) {
+async function refundPayment(request, env, ctx, auth, paymentId) {
   const data = (await readBody(request)) || {};
   if (!data.reason) return json({ ok: false, error: 'A reason is required to refund' }, 400);
 
@@ -422,7 +422,7 @@ async function paymentSummary(env, url) {
  * closing their own table, but a cashier settling a driver's round needs to
  * name the driver, so it stays overridable.
  */
-async function recordTip(request, env, auth) {
+async function recordTip(request, env, ctx, auth) {
   const data = await readBody(request);
   if (!data) return json({ ok: false, error: 'Invalid JSON body' }, 400);
 
@@ -563,7 +563,7 @@ export async function handlePayments(pathname, method, url, request, env, ctx, a
       return json(results || []);
     }
 
-    if (m === 'POST' && sub === '') return recordPayment(request, env, auth);
+    if (m === 'POST' && sub === '') return recordPayment(request, env, ctx, auth);
 
     const verify = sub.match(/^\/([^/]+)\/verify$/);
     if (m === 'POST' && verify) {
@@ -574,7 +574,7 @@ export async function handlePayments(pathname, method, url, request, env, ctx, a
       if (role !== 'cashier' && !isManager(role)) {
         return json({ ok: false, error: 'Only a cashier or manager can verify a payment' }, 403);
       }
-      return verifyPayment(request, env, auth, verify[1]);
+      return verifyPayment(request, env, ctx, auth, verify[1]);
     }
 
     const refund = sub.match(/^\/([^/]+)\/refund$/);
@@ -582,7 +582,7 @@ export async function handlePayments(pathname, method, url, request, env, ctx, a
       if (!isManager((auth && (auth.sessionRole || auth.role)) || '')) {
         return json({ ok: false, error: 'Only a manager can refund a payment' }, 403);
       }
-      return refundPayment(request, env, auth, refund[1]);
+      return refundPayment(request, env, ctx, auth, refund[1]);
     }
 
     // Payments are never deleted. Reversal is a refund; a mistake is a rejection.
@@ -617,7 +617,7 @@ export async function handlePayments(pathname, method, url, request, env, ctx, a
       return json(results || []);
     }
 
-    if (m === 'POST' && sub === '') return recordTip(request, env, auth);
+    if (m === 'POST' && sub === '') return recordTip(request, env, ctx, auth);
   }
 
   return null;
