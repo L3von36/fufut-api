@@ -76,7 +76,18 @@ const CORS_PREFLIGHT = {
   'Access-Control-Expose-Headers': 'X-Fufut-Mode',
 };
 
-async function serveImage(env, pathname) {
+async function serveImage(request, env, ctx, pathname) {
+  const cacheKey = request ? new Request(request.url, request) : null;
+  const cache = typeof caches !== 'undefined' ? caches.default : null;
+  if (cache && cacheKey) {
+    try {
+      const cached = await cache.match(cacheKey);
+      if (cached) return cached;
+    } catch {
+      // Cache match failed (e.g. test environment) — fall through to R2
+    }
+  }
+
   const key = decodeURIComponent(pathname.replace('/api/images/', ''));
   if (!key) return json({ ok: false, error: 'No image key' }, 400);
   try {
@@ -84,9 +95,17 @@ async function serveImage(env, pathname) {
     if (!object) return json({ ok: false, error: 'Not found' }, 404);
     const headers = new Headers();
     object.writeHttpMetadata(headers);
-    headers.set('Cache-Control', 'public, max-age=86400');
+    headers.set('Cache-Control', 'public, max-age=86400, s-maxage=604800, stale-while-revalidate=86400');
     headers.set('ETag', object.httpEtag);
-    return new Response(object.body, { headers });
+    const response = new Response(object.body, { headers });
+    if (cache && cacheKey && ctx && typeof ctx.waitUntil === 'function') {
+      try {
+        ctx.waitUntil(cache.put(cacheKey, response.clone()));
+      } catch {
+        // Swallowed — cache put failure must not fail the image delivery
+      }
+    }
+    return response;
   } catch (e) {
     return json({ ok: false, error: String(e.message || e) }, 500);
   }
@@ -107,7 +126,7 @@ async function route(pathname, method, url, request, env, ctx, auth) {
   if (pathname === '/api/auth/reset-password' && upper === 'POST') return handleResetPassword(request, env);
   if (pathname === '/api/auth/change-password' && upper === 'POST') return handleChangePassword(request, env);
   if (pathname === '/api/upload' && upper === 'POST') return handleUpload(request, env);
-  if (pathname.startsWith('/api/images/') && upper === 'GET') return serveImage(env, pathname);
+  if (pathname.startsWith('/api/images/') && upper === 'GET') return serveImage(request, env, ctx, pathname);
 
   if (pathname === '/api/payments/proxy' && upper === 'GET') {
     const targetUrl = url.searchParams.get('url');

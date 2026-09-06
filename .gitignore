@@ -10,3 +10,11 @@ data/
 # Runtime dirs on the box: the served app bundles and the nightly snapshots.
 web/
 backups/
+
+# Secrets and environment files
+.env
+.env.*
+.dev.vars
+*.pem
+*.key
+.secrets*
