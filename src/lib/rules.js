@@ -54,6 +54,15 @@ export const RULE_IDS = {
   TABLE_SEATED_TOO_LONG: 'table-seated-too-long',
   FORGOT_CLOCK_OUT: 'employee-forgot-clock-out',
   EMPLOYEE_LATE: 'employee-late-arrival',
+  // Added by the full-day simulation: low-stock items never raised an alert,
+  // so the manager dashboard showed the count but no row landed in /api/alerts.
+  // The cron sweep now pulls inventory rows at or below reorder_point and
+  // raises one alert per item. Severity is CRITICAL only when stock hits zero.
+  INVENTORY_LOW: 'inventory-low-stock',
+  // When a chef 86s a dish, the same sweep raises an alert so the manager can
+  // react even without opening the dashboard. Resolves the moment the chef
+  // marks the dish available again.
+  MENU_ITEM_86ED: 'menu-item-86ed',
 };
 
 /**
@@ -496,7 +505,7 @@ export function dedupeKey(v) {
   return `${v.rule_id}|${v.entity_type}|${v.entity_id}`;
 }
 
-export function evaluateAll({ orders, deliveryJobs, reservations, tables, timeclockEntries }, nowMs, th = RULE_DEFAULTS) {
+export function evaluateAll({ orders, deliveryJobs, reservations, tables, timeclockEntries, inventory, menuItems }, nowMs, th = RULE_DEFAULTS) {
   return [
     ...evaluateOrders(orders, nowMs, th),
     ...evaluateOrdersReadyNow(orders),
@@ -504,5 +513,65 @@ export function evaluateAll({ orders, deliveryJobs, reservations, tables, timecl
     ...evaluateReservations(reservations, nowMs, th),
     ...evaluateTables(tables, nowMs, th),
     ...evaluateTimeclockEntries(timeclockEntries, nowMs, th),
+    ...evaluateInventory(inventory || []),
+    ...evaluateMenuItems(menuItems || []),
   ];
+}
+
+/**
+ * Low-stock alert. The manager dashboard already shows the count, but no row
+ * landed in /api/alerts — so the only way a manager heard about low stock was
+ * by opening the dashboard. The sweep now raises one alert per item at or
+ * below its reorder_point, severity WARNING unless stock hits zero (CRITICAL).
+ *
+ * The `inventory` rows are the same shape as the inventory table: { id, name,
+ * stock, unit, reorder_point, min_level }. `reorder_point` is the floor at
+ * which a reorder should be placed; `min_level` is the safety stock floor.
+ */
+export function evaluateInventory(items) {
+  const out = [];
+  for (const it of items) {
+    if (!it || !it.id) continue;
+    const stock = Number(it.stock || 0);
+    const reorder = Number(it.reorder_point ?? it.min_level ?? 0);
+    if (reorder > 0 && stock <= reorder) {
+      const critical = stock <= 0;
+      const label = it.name || it.id;
+      out.push(violation(
+        RULE_IDS.INVENTORY_LOW,
+        critical ? SEVERITY.CRITICAL : SEVERITY.WARNING,
+        'inventory',
+        it.id,
+        label,
+        `${label}: ${stock}${it.unit || ''} on hand (reorder at ${reorder}${it.unit || ''})${critical ? ' — OUT OF STOCK' : ''}`,
+      ));
+    }
+  }
+  return out;
+}
+
+/**
+ * 86'd dish alert. The chef's PUT /api/menu/:id/availability toggles
+ * `available` between 1 and 0; the sweep reads the menu_items table and raises
+ * an alert for every dish currently 86ed (available = 0). Resolves the moment
+ * the chef marks it available again. The manager dashboard doesn't surface
+ * 86s today — this gives the manager a heads-up via /api/alerts.
+ */
+export function evaluateMenuItems(items) {
+  const out = [];
+  for (const it of items) {
+    if (!it || !it.id) continue;
+    if (Number(it.available ?? 1) === 0) {
+      const label = it.name || it.id;
+      out.push(violation(
+        RULE_IDS.MENU_ITEM_86ED,
+        SEVERITY.WARNING,
+        'menu',
+        it.id,
+        label,
+        `${label} is 86'd — POS will refuse new orders`,
+      ));
+    }
+  }
+  return out;
 }

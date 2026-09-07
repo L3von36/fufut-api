@@ -62,7 +62,7 @@ function num(v) {
 
 /** Rows the stage rules judge: anything not finished and not cancelled. */
 async function loadSweepRows(env) {
-  const [ordersStage, ordersUnpaid, deliveryJobs, reservations, tables, timeclockOpen] = await Promise.all([
+  const [ordersStage, ordersUnpaid, deliveryJobs, reservations, tables, timeclockOpen, inventory, menuItems] = await Promise.all([
     d1Query(
       env,
       "SELECT * FROM orders WHERE status IN ('new','confirmed','preparing','ready') ORDER BY created"
@@ -88,6 +88,12 @@ async function loadSweepRows(env) {
       "SELECT t.*, s.firstName, s.lastName FROM timeclock t LEFT JOIN staff s ON s.id = t.staff_id " +
       "WHERE t.clock_out IS NULL OR t.clock_out = '' ORDER BY t.clock_in"
     ),
+    // Added by the full-day simulation: low-stock items + 86'd dishes.
+    // The inventory read is cheap (12 rows in a typical café) and the menu
+    // read is the same shape. Both feed the new INVENTORY_LOW and
+    // MENU_ITEM_86ED rules in lib/rules.js.
+    d1Query(env, "SELECT id, name, stock, unit, reorder_point, min_level FROM inventory WHERE COALESCE(active, 1) = 1").catch(() => ({ results: [] })),
+    d1Query(env, "SELECT id, name, available FROM menu_items").catch(() => ({ results: [] })),
   ]);
   return {
     orders: [...(ordersStage.results || []), ...(ordersUnpaid.results || [])],
@@ -95,6 +101,8 @@ async function loadSweepRows(env) {
     reservations: reservations.results || [],
     tables: tables.results || [],
     timeclockEntries: timeclockOpen.results || [],
+    inventory: inventory.results || [],
+    menuItems: menuItems.results || [],
   };
 }
 

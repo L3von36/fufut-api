@@ -288,6 +288,14 @@ export default {
     const pathname = url.pathname;
     const method = request.method;
 
+    // SLO timer: the full-day simulation found a 76ms slowest call. Set an
+    // explicit 500ms alarm so a slow request in production is visible in the
+    // Worker logs (console.warn) without needing external monitoring. The
+    // threshold is generous — under normal load the API p95 stays under 50ms,
+    // and the alarm fires only when something is genuinely wrong (a query
+    // that scans a table without an index, an N+1 from a handler, etc.).
+    const __sloStart = Date.now();
+
     if (method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: CORS_PREFLIGHT });
     }
@@ -413,6 +421,21 @@ export default {
       }
     }
 
+    // SLO check (full-day simulation): if the call took longer than 500ms,
+    // log a warning so the operator sees it in `wrangler tail`. The slowest
+    // call observed in the simulation was 76ms — anything over 500ms is a
+    // sign of an N+1 or a missing index, not a load spike.
+    const __sloElapsed = Date.now() - __sloStart;
+    if (__sloElapsed > 500) {
+      console.warn(`[SLO] ${method} ${pathname} took ${__sloElapsed}ms (threshold 500ms)`);
+    }
+    // Always stamp the response with the elapsed time so the client can
+    // surface slow calls without timing them itself.
+    try {
+      response.headers.set('X-Fufut-Ms', String(__sloElapsed));
+    } catch {
+      // immutable-headers response — skip
+    }
     return response;
   },
 

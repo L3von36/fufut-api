@@ -204,6 +204,10 @@ describe('runAlertSweep — the rows it writes route correctly', () => {
     const opened = openLocalD1(path.join(dir, 'test.sqlite'));
     db = opened.db;
     applySchema(db);
+    // schema.sql now creates the alerts table with the migration 026 columns
+    // (station, target_staff_id). Drop and recreate to ensure the test's
+    // own ALERTS_SQL (which has the same columns) is the shape used.
+    db.exec(`DROP TABLE IF EXISTS alerts`);
     db.exec(ALERTS_SQL);
     env = { DB: opened.DB, SITE_ID: 'local' };
   });
@@ -322,7 +326,11 @@ describe('runAlertSweep before migration 026 — the deploy cannot wait for a hu
       const opened = openLocalD1(path.join(dir2, 'test.sqlite'));
       const db2 = opened.db;
       applySchema(db2);
-      // The pre-026 alerts table: no station, no target.
+      // The pre-026 alerts table: no station, no target. schema.sql now
+      // includes the alerts table (post-migration 022), so drop it first
+      // and recreate with the pre-migration-026 shape to test the sweep
+      // degrades gracefully without the station columns.
+      db2.exec(`DROP TABLE IF EXISTS alerts`);
       db2.exec(`
         CREATE TABLE alerts (
           id TEXT PRIMARY KEY, rule_id TEXT NOT NULL,

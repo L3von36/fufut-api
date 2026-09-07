@@ -624,3 +624,11 @@ CREATE TABLE IF NOT EXISTS alerts (
 CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status, created);
 CREATE INDEX IF NOT EXISTS idx_alerts_entity ON alerts(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_alerts_rule_entity ON alerts(rule_id, entity_id, status);
+
+-- Migration 026 — station-aware alerts + bill requests.
+-- See migrations/026-alerts-station-bill-requests.sql.
+ALTER TABLE alerts ADD COLUMN station TEXT DEFAULT '';
+ALTER TABLE alerts ADD COLUMN target_staff_id TEXT DEFAULT '';
+ALTER TABLE tables ADD COLUMN bill_requested_at TEXT DEFAULT '';
+ALTER TABLE tables ADD COLUMN bill_requested_by TEXT DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_alerts_status_rule ON alerts(status, rule_id);

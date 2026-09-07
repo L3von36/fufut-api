@@ -1612,11 +1612,19 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
           share,
           share,
           nowIso,
-          `Split bill ${i+1} of ${seatCount} from #${orderId.slice(-4)}`,
+          // The notes field carries the parent order id so reports, the
+          // integrity checker, and the audit log can all trace a split
+          // child back to its parent. Previously the parent-child link
+          // lived only in the audit_log entry against the parent, which
+          // made child orders look like standalone tickets and triggered
+          // false-positive "duplicate payments" warnings when each child
+          // was paid. The notes field now reads:
+          //   "Split bill N of M from #PARENT — parent:ORD-XXX"
+          `Split bill ${i+1} of ${seatCount} from #${orderId.slice(-4)} — parent:${orderId}`,
           nowIso,
         ]
       );
-      createdSplits.push({ id: splitId, total: share });
+      createdSplits.push({ id: splitId, total: share, parent: orderId });
     }
 
     await d1Run(
@@ -1626,13 +1634,42 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
         WHERE id = ?`,
       [`Split into ${seatCount} checks`, nowIso, nowIso, orderId]
     );
+    // Audit the split with explicit parent + children so downstream reports
+    // and the integrity checker can reconstruct the relationship without
+    // having to parse the notes field. The audit `before` carries the parent's
+    // pre-split state; `after` carries the parent's new state plus the array
+    // of child order ids with their totals.
     await writeAudit(env, auth, {
       action: "split",
       entity: "orders",
       entityId: orderId,
-      before: { status: order.status, total: order.total },
-      after: { status: "cancelled", splitsCount: seatCount, createdSplits: createdSplits.map(s => s.id) },
+      before: { status: order.status, total: order.total, payment_status: order.payment_status },
+      after: {
+        status: "cancelled",
+        payment_status: "split",
+        splitsCount: seatCount,
+        createdSplits: createdSplits.map(s => ({ id: s.id, total: s.total, parent: s.parent })),
+      },
     });
+    // Also audit each child as a "create" with `split_parent` so the audit log
+    // has a row pointing AT each child, not just one row pointing at the parent.
+    // The reports can then GROUP BY entity_id and find every child of a split
+    // in one query.
+    for (const s of createdSplits) {
+      await writeAudit(env, auth, {
+        action: "create",
+        entity: "orders",
+        entityId: s.id,
+        after: {
+          status: "new",
+          payment_status: "unpaid",
+          total: s.total,
+          split_parent: orderId,
+          split_index: createdSplits.indexOf(s) + 1,
+          split_count: seatCount,
+        },
+      });
+    }
 
     return json({ ok: true, parentOrderId: orderId, splits: createdSplits });
   }
@@ -2096,6 +2133,20 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
             ? String(body.void_category).toLowerCase()
             : 'other')
         : 'other';
+
+    // Permission ordering (full-day simulation finding): the role matrix
+    // grants `orders:write` to floor roles (head-waiter, barista, cashier)
+    // so they can CREATE orders, but a void is a manager-only action — undoing
+    // a paid ticket and reversing stock consumption are not floor work. The
+    // old code looked the order up first and returned 404 for non-existent
+    // IDs, which let a non-manager probe for valid order IDs without ever
+    // getting a 403. The check is now at the top: refuse 403 before lookup.
+    if (!isManager((auth && (auth.sessionRole || auth.role)) || "")) {
+      return json(
+        { ok: false, error: "Only a manager can void an order" },
+        403
+      );
+    }
 
     const { results } = await d1Query(env, "SELECT * FROM orders WHERE id = ?", [id]);
     const order = results && results[0];

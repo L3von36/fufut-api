@@ -211,16 +211,23 @@ describe('Findings 2 & 3: DELETE /api/orders/:id voids with refund + category', 
     expect(refundInsert).toBeUndefined();
   });
 
-  it('refuses a non-manager void of a paid order with the original 409', async () => {
+  it('refuses a non-manager void with 403 (permission check fires before order lookup)', async () => {
+    // Full-day simulation finding: the old code looked the order up first and
+    // returned 404 for non-existent IDs, which let a non-manager probe for
+    // valid order IDs without ever getting a 403. The check now fires at
+    // the top of the DELETE handler — any non-manager gets 403 regardless
+    // of whether the order exists or is paid. The old 409 "paid, manager
+    // must refund" message is no longer reachable for non-managers because
+    // they're blocked before the payment check runs.
     const { env } = makeEnv({
       orderRows: [PAID_ORDER],
       paymentRows: [CASH_PAYMENT],
     });
     const ctx = makeRequest('/api/orders/Opd0001', 'DELETE', { reason: 'attempt' });
     const res = await handleOrders(ctx.pathname, ctx.method, ctx.url, ctx.request, env, WAITER);
-    expect(res.status).toBe(409);
+    expect(res.status).toBe(403);
     const body = await res.json();
-    expect(body.error).toMatch(/paid. A manager must refund/);
+    expect(body.error).toMatch(/Only a manager can void/);
   });
 
   it('stores void_category on the order and surfaces an unknown value as "other"', async () => {

@@ -175,6 +175,31 @@ async function recordPayment(request, env, ctx, auth) {
   const amount = round2(data.amount);
   if (!amount) return json({ ok: false, error: 'amount must be non-zero' }, 400);
 
+  // Duplicate-payment race guard (full-day simulation finding): without this
+  // block, two concurrent cashier ticks could both observe payment_status='unpaid',
+  // both pass the overpayment check below, and both INSERT a payment row —
+  // leaving the order with two identical payments and double-counting revenue.
+  // The atomic UPDATE-then-check-changes pattern serializes the two callers:
+  // only the winner sees meta.changes===1; the loser gets 0 and bails with 409.
+  // The claim is reversed on failure so the order can be re-paid (e.g. retry
+  // after a transient error). Verifying transfers also pass through here, so
+  // the claim accepts 'verifying' as a valid prior state to upgrade from.
+  if (amount > 0) {
+    const claimSql =
+      "UPDATE orders SET payment_status = 'verifying', updated_at = ? " +
+      "WHERE id = ? AND COALESCE(payment_status, 'unpaid') IN ('unpaid', 'partial', '')";
+    const claimMeta = await d1Run(env, claimSql, [new Date().toISOString(), orderId]);
+    if (!claimMeta || !claimMeta.changes) {
+      // Re-read to give a precise error
+      const { results: r2 } = await d1Query(env, 'SELECT payment_status, voided_at FROM orders WHERE id = ?', [orderId]);
+      const o2 = r2 && r2[0];
+      if (o2 && o2.voided_at) return json({ ok: false, error: 'Order has been voided' }, 409);
+      if (o2 && o2.payment_status === 'paid') return json({ ok: false, error: 'Order is already paid' }, 409);
+      if (o2 && o2.payment_status === 'verifying') return json({ ok: false, error: 'Payment is already in progress' }, 409);
+      return json({ ok: false, error: `Cannot pay this order (status: ${o2 ? o2.payment_status : 'unknown'})` }, 409);
+    }
+  }
+
   // Overpayment is refused rather than silently accepted. A cash guest handing
   // over more than the bill is change, not a larger payment — `tendered` and
   // `change_due` carry that, and `amount` stays the sum actually kept.
@@ -187,6 +212,8 @@ async function recordPayment(request, env, ctx, auth) {
     const already = round2((existing || []).reduce((s, p) => s + (Number(p.amount) || 0), 0));
     const outstanding = round2(round2(order.total) - already);
     if (amount - outstanding > EPSILON && !data.allowOverpayment) {
+      // Release the claim so the order can be re-paid with a correct amount.
+      await d1Run(env, "UPDATE orders SET payment_status = 'unpaid', updated_at = ? WHERE id = ? AND payment_status = 'verifying'", [new Date().toISOString(), orderId]);
       return json(
         {
           ok: false,
