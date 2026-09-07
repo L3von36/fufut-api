@@ -188,8 +188,10 @@ async function recordPayment(request, env, ctx, auth) {
     const claimSql =
       "UPDATE orders SET payment_status = 'verifying', updated_at = ? " +
       "WHERE id = ? AND COALESCE(payment_status, 'unpaid') IN ('unpaid', 'partial', '')";
-    const claimMeta = await d1Run(env, claimSql, [new Date().toISOString(), orderId]);
-    if (!claimMeta || !claimMeta.changes) {
+    const claimResult = await d1Run(env, claimSql, [new Date().toISOString(), orderId]);
+    // D1 returns the change count at meta.changes (not .changes directly).
+    const claimChanges = claimResult && claimResult.meta ? Number(claimResult.meta.changes) || 0 : 0;
+    if (!claimChanges) {
       // Re-read to give a precise error
       const { results: r2 } = await d1Query(env, 'SELECT payment_status, voided_at FROM orders WHERE id = ?', [orderId]);
       const o2 = r2 && r2[0];
