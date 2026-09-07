@@ -65,7 +65,10 @@ async function handleResources(pathname, method, url, request, env, auth) {
     if (idPart === "open" && m === "POST") {
       const data = (await readBody(request)) || {};
       const id = "CD" + crypto.randomUUID().slice(0, 7);
-      const openingBal = Number(data.openingBal) || 0;
+      // Accept either `openingFloat` (preferred) or `openingBal` (legacy field
+      // name from the original bundled Hono build). The README documents
+      // `openingFloat`; older POS builds that send `openingBal` keep working.
+      const openingBal = Number(data.openingFloat ?? data.openingBal) || 0;
       try {
         await d1Run(
           env,
@@ -78,7 +81,7 @@ async function handleResources(pathname, method, url, request, env, auth) {
           entityId: id,
           after: { opening_balance: openingBal, status: 'open' }
         });
-        return json({ ok: true, id });
+        return json({ ok: true, id, opening_balance: openingBal });
       } catch (e) {
         return json({ ok: false, error: String(e.message || e) }, 500);
       }
