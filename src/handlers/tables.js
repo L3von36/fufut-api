@@ -776,6 +776,94 @@ async function handleTables(pathname, method, url, request, env, auth) {
     return json({ ok: true });
   }
 
+  /**
+   * POST /api/tables/:id/free — clear the party off a table whose guests
+   * have gone.
+   *
+   * Freeing used to belong to the floor alone, and the owner added the
+   * kitchen (2026-09): the pass sees the room empty before anyone walks it,
+   * and a table left 'occupied' ghosts the whole floor plan — the kitchen
+   * board says served while the floor still says seated. Like the
+   * request-bill endpoints, the role list is inline rather than a matrix
+   * grant, because "may reset a party" is deliberately narrower than the
+   * generic tables write: the chefs still cannot seat, reassign or rename.
+   *
+   * Two guards keep the action honest:
+   *   - unpaid checks refuse the free (409). The kitchen can turn a table;
+   *     it cannot erase a bill. 'paid'/'overpaid' and checkless tables free.
+   *   - freeing a table nobody is sitting at answers ok:alreadyFree, so a
+   *     double tap on a slow connection is a no-op, not an error toast.
+   *
+   * The party resets the way the checkout free does — status, timer, guests
+   * and the server name (clearing a name is housekeeping, per the PUT gate)
+   * — and a pending bill request dies with it, because a stamp that
+   * outlives its party is a lie on the cashier's screen.
+   */
+  if (m === 'POST' && parts.length === 4 && parts[3] === 'free') {
+    const role = String((auth && (auth.sessionRole || auth.role)) || '').toLowerCase();
+    if (!['manager', 'head-waiter', 'head-chef', 'assistant-chef'].includes(role)) {
+      return json(
+        { ok: false, error: 'Only the floor lead, the kitchen or a manager can free a table.' },
+        403
+      );
+    }
+    const tableId = parts[2];
+    const { results } = await d1Query(env, 'SELECT id, number, status FROM tables WHERE id = ?', [tableId]);
+    const table = (results || [])[0];
+    if (!table) return json({ ok: false, error: 'Table not found' }, 404);
+    if (String(table.status || '').toLowerCase() !== 'occupied') {
+      return json({ ok: true, alreadyFree: true });
+    }
+
+    // The money guard: any active check on this table that is not settled
+    // stops the free. Same shape as the floor plan's payment derivation —
+    // voided tickets and finished statuses never block.
+    const { results: openOrders } = await d1Query(
+      env,
+      "SELECT id, table_id, payment_status FROM orders " +
+      "WHERE table_id IS NOT NULL AND COALESCE(voided_at, '') = '' " +
+      "AND status IN ('new','confirmed','preparing','ready','served','fulfilled')"
+    );
+    const tableKey = normaliseTableId(table.number) || String(table.number || '');
+    const unsettled = (openOrders || []).filter(
+      (o) =>
+        (normaliseTableId(o.table_id) || String(o.table_id || '')) === tableKey &&
+        !['paid', 'overpaid'].includes(String(o.payment_status || '').toLowerCase())
+    );
+    if (unsettled.length) {
+      return json(
+        {
+          ok: false,
+          error: `Table ${table.number} still has ${unsettled.length} unsettled check${unsettled.length === 1 ? '' : 's'}. Settle at the till before freeing.`,
+          unsettledChecks: unsettled.map((o) => o.id),
+        },
+        409
+      );
+    }
+
+    await d1Run(
+      env,
+      "UPDATE tables SET status = 'available', seated_at = '', guests = 0, server = '' WHERE id = ?",
+      [tableId]
+    );
+    try {
+      await d1Run(
+        env,
+        "UPDATE tables SET bill_requested_at = '', bill_requested_by = '' WHERE id = ? AND COALESCE(bill_requested_at, '') <> ''",
+        [tableId]
+      );
+    } catch { /* pre-migration schema: nothing to clear */ }
+    await writeAudit(env, auth, {
+      action: 'update',
+      entity: 'tables',
+      entityId: tableId,
+      before: { status: 'occupied' },
+      after: { status: 'available', freed_by: actorName(auth) },
+      reason: `Table ${table.number} freed — party cleared`,
+    });
+    return json({ ok: true, freed: true });
+  }
+
   if (m === 'PUT' && parts.length === 3) {
     const tableId = parts[2];
     // Clone before reading: a request body can only be consumed once, and this

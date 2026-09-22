@@ -210,11 +210,18 @@ const ROLE_ACCESS = {
     // stock-control analytics and the reporting screens were removed at the
     // owner's direction — what arrived and what it cost is now read in the
     // backoffice by the manager and the accountant, not on the line.
-    read: ['orders', 'inventory', 'waste', 'recipes', 'units', 'alerts', 'tasks'],
+    // `tables` joined (owner's call, 2026-09): the kitchen sees the room it
+    // cooks for — which tables are buried, whose party asked for the bill —
+    // and turns a table when the guests have gone (POST /tables/:id/free
+    // below; the generic tables write stays closed to this role).
+    read: ['orders', 'tables', 'inventory', 'waste', 'recipes', 'units', 'alerts', 'tasks'],
     // menu-availability lets them 86 a dish that has run out. The menu itself
     // stays manager-only, so pricing is untouched. Acknowledging an alert is
     // a kitchen act — "I have this ticket" — so the board's owner signs it.
-    write: ['orders', 'inventory', 'waste', 'menu-availability', 'recipes', 'alerts', 'tasks'],
+    // table-free is the narrow write that turns a table after the party
+    // leaves; the generic tables write stays closed (no seating, no
+    // reassignment, no renaming from the kitchen).
+    write: ['orders', 'inventory', 'waste', 'menu-availability', 'recipes', 'table-free', 'alerts', 'tasks'],
   },
   // Reads stock, does not own it. Monitoring levels, ordering supplies and
   // controlling food cost belong to the head chef; an assistant executes
@@ -224,8 +231,10 @@ const ROLE_ACCESS = {
     // Reads recipes because they cook from them; writes none of it, for the
     // same reason they do not own the stock counts. Reads alerts because the
     // ticket going late is theirs to rescue — they just cannot sign it off.
-    read: ['orders', 'inventory', 'recipes', 'units', 'alerts', 'tasks'],
-    write: ['orders'],
+    // `tables` rides with the head chef's floor grant (read + the narrow
+    // table-free write; no ordering, no seating).
+    read: ['orders', 'tables', 'inventory', 'recipes', 'units', 'alerts', 'tasks'],
+    write: ['orders', 'table-free'],
   },
   // The drinks station. The barista board still rides on plain `orders`
   // read/write — lines route by category, drinks to this screen, food to the
@@ -261,7 +270,9 @@ const ROLE_ACCESS = {
     // write payments: taking the money is the cashier's, and a floor tablet
     // that can mark a bill paid is a hole with no compensating control.
     read: ['orders', 'tables', 'reservations', 'payments', 'tips', 'alerts', 'tasks'],
-    write: ['orders', 'tables', 'reservations', 'tips', 'alerts', 'tasks'],
+    // The floor's own writes, plus table-free so the sheet's Free Table
+    // action rides the same narrow resource the kitchen uses.
+    write: ['orders', 'tables', 'reservations', 'table-free', 'tips', 'alerts', 'tasks'],
   },
   cashier: {
     // `reports` is load-bearing: the Dashboard's till tiles and the Cash
@@ -271,6 +282,11 @@ const ROLE_ACCESS = {
     // and off rides the SELF_SERVICE routes below; the timeclock resource
     // (and with it the power to rewrite hours) and the colleague list were
     // removed with the Time Clock screen.
+    // `tables` stayed after the floor plan left the cashier's nav (owner's
+    // call, 2026-09): the Dashboard's Bill Requests card reads it, and the
+    // checkout this role runs frees the table it settles — the write is what
+    // closes that loop. What the till may no longer do is WALK the floor:
+    // opening a table's ticket and seating parties are the head-waiter's.
     read: ['orders', 'tables', 'reservations', 'cashdrawer', 'payments', 'tips', 'delivery', 'alerts', 'tasks', 'reports'],
     // `upload` is the transfer screenshot that §9 requires against a Telebirr,
     // CBE or bank payment. Without it the evidence has nowhere to go and the
@@ -441,6 +457,12 @@ export function resourceForPath(pathname) {
   // margin live. The endpoint itself reads only `available`, so this grant
   // cannot widen into repricing.
   if (head === 'menu' && parts[3] === 'availability') return 'menu-availability';
+  // Freeing a table is its own resource for the same reason: the kitchen can
+  // turn a table whose guests have gone (owner's call, 2026-09) without
+  // holding the generic tables write, which would also let it seat parties,
+  // reassign servers and rename tables. The endpoint's own guard refuses the
+  // free while an open check is unsettled.
+  if (head === 'tables' && parts[3] === 'free') return 'table-free';
   if (head === 'menus') return 'menu';
   if (head === 'save-content') return 'content';
   if (head === 'events') {

@@ -95,19 +95,28 @@ describe('head chef', () => {
   });
 
   // The exact leak this enforcement was written for: all four returned 200.
+  // `tables` left this list in 2026-09 (the owner gave the kitchen the floor:
+  // read-only visibility + the narrow free-table turn, see table-free.test.js);
+  // the money, colleague and roster screens are still refused.
   it('is refused the screens the UI hides from it', () => {
     expect(roleMayAccess('head-chef', '/api/staff', GET)).toBe(false);
     expect(roleMayAccess('head-chef', '/api/cashdrawer', GET)).toBe(false);
-    expect(roleMayAccess('head-chef', '/api/tables', GET)).toBe(false);
     expect(roleMayAccess('head-chef', '/api/shifts', GET)).toBe(false);
     expect(roleMayAccess('head-chef', '/api/timeclock', GET)).toBe(false);
     expect(roleMayAccess('head-chef', '/api/reservations', GET)).toBe(false);
     expect(roleMayAccess('head-chef', '/api/delivery', GET)).toBe(false);
   });
 
-  it('may subscribe to the kitchen stream but not the floor stream', () => {
+  it('sees the floor read-only: tables read yes, tables write no', () => {
+    expect(roleMayAccess('head-chef', '/api/tables', GET)).toBe(true);
+    expect(roleMayAccess('head-chef', '/api/tables/T7', PUT)).toBe(false);
+    expect(roleMayAccess('head-chef', '/api/tables', POST)).toBe(false);
+    expect(roleMayAccess('head-chef', '/api/tables/T7', DELETE)).toBe(false);
+  });
+
+  it('may subscribe to the kitchen stream and now the floor stream too', () => {
     expect(roleMayAccess('head-chef', '/api/events/kitchen', GET)).toBe(true);
-    expect(roleMayAccess('head-chef', '/api/events/tables', GET)).toBe(false);
+    expect(roleMayAccess('head-chef', '/api/events/tables', GET)).toBe(true);
   });
 });
 
