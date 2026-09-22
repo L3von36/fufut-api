@@ -57,6 +57,60 @@ function mapOrderRow(o) {
 }
 
 /**
+ * Day-window params for GET /api/orders.
+ *
+ * `from` / `to` are venue-local day keys ("YYYY-MM-DD") in the same shape the
+ * reports handlers already use (resolveWindow + DATE_CLAUSE in reports.js):
+ * orders.created is a local wall-clock stamp ("2026-08-06 01:55:46"), so
+ * date(created) buckets rows into the day the venue experienced, matching the
+ * dashboard, the reports and the bot's addisToday() day key. Anything that is
+ * not a plain day key is ignored rather than trusted (the operator-facing
+ * clients are the only writers of these params).
+ */
+function dayParam(params, name) {
+  if (!params) return null;
+  const raw = String(params.get(name) || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
+  // Shape alone is not enough ("2026-13-99" matches) — require a real
+  // calendar day so the window can never silently swallow or drop rows.
+  const [y, m, d] = raw.split('-').map(Number);
+  const asUtc = new Date(Date.UTC(y, m - 1, d));
+  if (asUtc.getUTCFullYear() !== y || asUtc.getUTCMonth() !== m - 1 || asUtc.getUTCDate() !== d) return null;
+  return raw;
+}
+
+/** Optional row cap for paged reads (order history). Default keeps the
+ *  historical LIMIT 200; callers may ask for 1..500. */
+function listLimit(params) {
+  if (!params) return 200;
+  const n = Number.parseInt(params.get('limit') || '', 10);
+  if (!Number.isFinite(n)) return 200;
+  return Math.min(500, Math.max(1, n));
+}
+
+/** Optional row skip for paged reads. */
+function listOffset(params) {
+  if (!params) return 0;
+  const n = Number.parseInt(params.get('offset') || '', 10);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.min(100000, n);
+}
+
+/** JS-side day window for the branches that already have their rows
+ *  (open checks / per-table lists): keep only rows whose created stamp falls
+ *  on [from, to]. Same date-prefix rule as DATE_CLAUSE. */
+function rowsWithinDays(rows, from, to) {
+  if (!from && !to) return rows;
+  return (rows || []).filter((o) => {
+    const day = String((o && o.created) || '').slice(0, 10);
+    if (!day) return false;
+    if (from && day < from) return false;
+    if (to && day > to) return false;
+    return true;
+  });
+}
+
+/**
  * The pickup ping — an order just became ready, tell the person waiting on it.
  *
  * Raised in real time here (so the waiter's banner moves within one SSE tick
@@ -1027,11 +1081,32 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
     const params = url && url.searchParams ? url.searchParams : null;
     const tableFilter = params ? params.get("table_number") : null;
     const openOnly = params ? ['1', 'true', 'yes'].includes(String(params.get("open") || '').toLowerCase()) : false;
+    const from = dayParam(params, 'from');
+    const to = dayParam(params, 'to');
     let rows;
     if (openOnly) {
-      rows = await listOpenChecks(env);
+      rows = rowsWithinDays(await listOpenChecks(env), from, to);
     } else if (tableFilter) {
       const { results } = await d1Query(env, "SELECT * FROM orders WHERE table_id = ? ORDER BY created DESC", [String(tableFilter)]);
+      rows = rowsWithinDays(results, from, to);
+    } else if (from || to) {
+      // Day-window read — the Order History pages (web / Flutter / bot) page
+      // through specific days, and the dashboard's "yesterday" panel already
+      // sends from/to. Same date-prefix clause as reports.js DATE_CLAUSE so a
+      // day key means the same thing everywhere. limit/offset power the
+      // history pagers; the plain default list below stays untouched.
+      const limit = listLimit(params);
+      const offset = listOffset(params);
+      const clauses = [];
+      const args = [];
+      if (from) { clauses.push("date(created) >= ?"); args.push(from); }
+      if (to) { clauses.push("date(created) <= ?"); args.push(to); }
+      const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+      const { results } = await d1Query(
+        env,
+        `SELECT * FROM orders ${where} ORDER BY created DESC LIMIT ${limit} OFFSET ${offset}`,
+        args,
+      );
       rows = results || [];
     } else {
       // Default list. The POS KitchenView and PipelineView call this on every
@@ -1039,8 +1114,8 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
       // the wrong default — a busy week puts thousands of rows in here, and
       // each row carries items, notes, customer_phone… the response gets big
       // enough to dominate the request. LIMIT 200 covers a full service day
-      // with headroom; older history is reachable via the dedicated reports
-      // endpoints which already paginate.
+      // with headroom; older history is reachable via the day-window read
+      // above and the dedicated reports endpoints which already paginate.
       const { results } = await d1Query(env, "SELECT * FROM orders ORDER BY created DESC LIMIT 200");
       rows = results || [];
     }
