@@ -69,11 +69,20 @@ describe('head chef', () => {
     }
   });
 
-  // Load-bearing: Reports fetches expenses unconditionally, so removing this
-  // read blanks the chef's Reports screen.
-  it('may read expenses because Reports needs them, but may not write them', () => {
-    expect(roleMayAccess('head-chef', '/api/expenses', GET)).toBe(true);
+  // The owner's least-privilege pass: the Reports screen left the chef's nav,
+  // and no kept screen fetches expenses — so the money read went with it.
+  it('no longer reads expenses — reporting is a backoffice screen now', () => {
+    expect(roleMayAccess('head-chef', '/api/expenses', GET)).toBe(false);
     expect(roleMayAccess('head-chef', '/api/expenses', POST)).toBe(false);
+  });
+
+  // Suppliers, purchases and the reports resource left with them: what
+  // arrived, what it cost and how the margin looks are backoffice reading.
+  it('is refused procurement, stock intelligence and reporting reads', () => {
+    for (const p of ['/api/suppliers', '/api/purchases', '/api/reports/dashboard']) {
+      expect(roleMayAccess('head-chef', p, GET)).toBe(false);
+    }
+    expect(roleMayAccess('head-chef', '/api/purchases', POST)).toBe(false);
   });
 
   it('may read the menu, which every order screen renders', () => {
@@ -262,22 +271,27 @@ describe('head waiter', () => {
 
 describe('cashier', () => {
   it('reaches the till and the floor', () => {
-    for (const p of ['/api/cashdrawer', '/api/orders', '/api/tables', '/api/reservations', '/api/timeclock']) {
+    for (const p of ['/api/cashdrawer', '/api/orders', '/api/tables', '/api/reservations']) {
       expect(roleMayAccess('cashier', p, GET)).toBe(true);
       expect(roleMayAccess('cashier', p, POST)).toBe(true);
     }
   });
 
-  // Load-bearing: Time Clock lists who is on shift.
-  it('may read staff for Time Clock but never change them', () => {
-    expect(roleMayAccess('cashier', '/api/staff', GET)).toBe(true);
-    expect(roleMayAccess('cashier', '/api/staff', PUT)).toBe(false);
-    expect(roleMayAccess('cashier', '/api/staff', DELETE)).toBe(false);
+  // The Time Clock screen left the cashier's nav in the least-privilege pass;
+  // clocking in and out rides the SELF_SERVICE routes, so the colleague list
+  // and the hours-editing grant went with it.
+  it('no longer reads the colleague list or the hours ledger', () => {
+    expect(roleMayAccess('cashier', '/api/staff', GET)).toBe(false);
+    expect(roleMayAccess('cashier', '/api/timeclock', GET)).toBe(false);
+    expect(roleMayAccess('cashier', '/api/timeclock', POST)).toBe(false);
   });
 
-  it('may read expenses for Reports but not write them', () => {
-    expect(roleMayAccess('cashier', '/api/expenses', GET)).toBe(true);
-    expect(roleMayAccess('cashier', '/api/expenses', POST)).toBe(false);
+  // The Reports, Revenue and Analytics screens left too, and expenses went
+  // with them — but the `reports` resource stays: the Dashboard's till tiles
+  // and the Cash Drawer screen read /api/reports/dashboard.
+  it('reads the reports aggregation for its own tiles, not the money list', () => {
+    expect(roleMayAccess('cashier', '/api/reports/dashboard', GET)).toBe(true);
+    expect(roleMayAccess('cashier', '/api/expenses', GET)).toBe(false);
   });
 
   it('is refused stock and kitchen data', () => {
@@ -471,9 +485,15 @@ describe('HR and payroll', () => {
 
 describe('reports reach the screens that fetch them', () => {
   // A Reports or Revenue nav item that opens onto a 403 reads as a broken app.
-  it('is readable by every role with a reporting screen', () => {
-    for (const role of ['manager', 'accountant', 'cashier', 'head-chef', 'head-waiter']) {
+  it('is readable by every role whose remaining screens fetch it', () => {
+    // The cashier holds it for the Dashboard's till tiles and the Cash
+    // Drawer, not for a Reports screen; head-chef and head-waiter lost that
+    // screen in the least-privilege pass and nothing of theirs fetches it.
+    for (const role of ['manager', 'accountant', 'cashier']) {
       expect(roleMayAccess(role, '/api/reports/dashboard', GET)).toBe(true);
+    }
+    for (const role of ['head-chef', 'head-waiter']) {
+      expect(roleMayAccess(role, '/api/reports/dashboard', GET)).toBe(false);
     }
   });
 

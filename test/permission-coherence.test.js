@@ -55,27 +55,37 @@ const SCREEN_NEEDS = {
   'stock-control': ['inventory'],
   suppliers: ['suppliers'],
   purchases: ['inventory', 'purchases', 'suppliers'],
+  'my-pay': [],           // self-service; the server scopes /api/payroll/me
+  'my-activity': [],      // self-scoped audit reads (actor_id = caller)
+  'orders-history': ['orders'],
+  audit: [],              // manager-only system trail
 };
 
 /**
  * Kept in step with pos/src/api/index.js by the assertions below rather than by
  * hope: a screen granted here and missing there is caught, and vice versa.
+ *
+ * Least-privilege edition (the owner's call): suppliers, purchases,
+ * stock-control and the reporting/BI screens are manager and accountant
+ * reading; the HR self-service trio rides for the manager alone. Clocking in
+ * and out is unaffected — the server's SELF_SERVICE routes never consulted
+ * the nav.
  */
 const POS_PERMISSIONS = {
-  manager: ['dashboard', 'orders', 'open-checks', 'tables', 'menu-mgmt', 'menu-view', 'expenses', 'pnl', 'cashdrawer', 'inventory', 'waste', 'shifts', 'timeclock', 'kitchen', 'reports', 'reservations', 'delivery', 'analytics', 'checkout', 'recipes', 'suppliers', 'purchases', 'stock-control'],
-  'head-chef': ['kitchen', 'orders', 'dashboard', 'inventory', 'waste', 'reports', 'pipeline', 'menu-mgmt', 'recipes', 'stock-control', 'suppliers', 'purchases', 'timeclock'],
-  'assistant-chef': ['kitchen', 'orders', 'dashboard', 'inventory', 'recipes', 'timeclock'],
+  manager: ['dashboard', 'orders', 'orders-history', 'open-checks', 'tables', 'menu-mgmt', 'menu-view', 'expenses', 'pnl', 'cashdrawer', 'inventory', 'waste', 'shifts', 'timeclock', 'kitchen', 'barista', 'reports', 'reservations', 'delivery', 'analytics', 'checkout', 'recipes', 'suppliers', 'purchases', 'stock-control', 'pipeline', 'audit', 'my-activity', 'my-pay', 'alerts'],
+  'head-chef': ['kitchen', 'orders', 'orders-history', 'dashboard', 'inventory', 'waste', 'pipeline', 'menu-mgmt', 'recipes', 'alerts'],
+  'assistant-chef': ['kitchen', 'orders', 'orders-history', 'dashboard', 'inventory', 'recipes', 'alerts'],
   // The drinks station. The board is home; around it the role reads the full
   // Orders list, the SLA warnings, the waste log (with the inventory read
   // that names the item thrown away) and the drink recipes. No dashboard:
   // the board IS the overview, and when the role was widened the owner chose
   // the recipe book over one. Mirrors pos/src/api/index.js.
-  barista: ['barista', 'orders', 'alerts', 'waste', 'recipes', 'timeclock'],
-  'head-waiter': ['tables', 'orders', 'open-checks', 'dashboard', 'menu-view', 'reservations', 'checkout', 'timeclock'],
-  cashier: ['cashdrawer', 'orders', 'open-checks', 'dashboard', 'tables', 'reports', 'timeclock', 'reservations', 'revenue', 'menu-view', 'analytics', 'checkout'],
-  'delivery-staff': ['delivery', 'dashboard', 'timeclock'],
-  cleaner: ['waste', 'dashboard', 'timeclock'],
-  accountant: ['dashboard', 'reports', 'revenue', 'pnl', 'expenses', 'analytics', 'orders', 'purchases', 'suppliers', 'timeclock'],
+  barista: ['barista', 'orders', 'orders-history', 'alerts', 'waste', 'recipes'],
+  'head-waiter': ['tables', 'orders', 'orders-history', 'open-checks', 'dashboard', 'menu-view', 'reservations', 'alerts'],
+  cashier: ['cashdrawer', 'orders', 'orders-history', 'open-checks', 'dashboard', 'tables', 'reservations', 'menu-view', 'checkout', 'alerts'],
+  'delivery-staff': ['delivery', 'dashboard', 'alerts'],
+  cleaner: ['waste', 'dashboard'],
+  accountant: ['dashboard', 'reports', 'revenue', 'pnl', 'expenses', 'analytics', 'orders', 'orders-history', 'purchases', 'suppliers'],
 };
 
 /**
@@ -177,11 +187,10 @@ describe('separation of duties survives', () => {
   // The reads that look wrong and are load-bearing, per auth.js. Removing one
   // blanks a page, so they are pinned.
   it('keeps the load-bearing surprises', () => {
-    expect(roleMayAccess('head-chef', '/api/expenses', 'GET')).toBe(true);   // Reports
-    expect(roleMayAccess('cashier', '/api/staff', 'GET')).toBe(true);        // Time Clock
-    expect(roleMayAccess('cleaner', '/api/tables', 'GET')).toBe(true);       // Dashboard
+    expect(roleMayAccess('cashier', '/api/reports/dashboard', 'GET')).toBe(true); // till tiles
+    expect(roleMayAccess('cleaner', '/api/tables', 'GET')).toBe(true);            // Dashboard
     for (const role of ROLES) {
-      expect(roleMayAccess(role, '/api/menu', 'GET')).toBe(true);            // dish names
+      expect(roleMayAccess(role, '/api/menu', 'GET')).toBe(true);                 // dish names
     }
   });
 
@@ -208,10 +217,26 @@ describe('separation of duties survives', () => {
     }
   });
 
-  it('lets the chef see what stock costs without letting them commit spend', () => {
-    expect(roleMayAccess('head-chef', '/api/purchases', 'GET')).toBe(true);
+  it('keeps procurement and reporting away from the kitchen and the floor', () => {
+    // The owner's least-privilege pass: what arrived, what it cost and how
+    // the margin looks are backoffice reading — manager and accountant.
+    for (const role of ['head-chef', 'assistant-chef', 'barista', 'head-waiter', 'cashier', 'delivery-staff', 'cleaner']) {
+      expect(roleMayAccess(role, '/api/purchases', 'GET')).toBe(false);
+      expect(roleMayAccess(role, '/api/suppliers', 'GET')).toBe(false);
+      expect(roleMayAccess(role, '/api/reports/dashboard', 'GET')).toBe(role === 'cashier');
+    }
     expect(roleMayAccess('head-chef', '/api/purchases', 'POST')).toBe(false);
     expect(roleMayAccess('head-chef', '/api/suppliers', 'POST')).toBe(false);
+  });
+
+  it('keeps the HR ledger with the manager and the accountant', () => {
+    // The Time Clock screen left the staff nav; the resource grants went with
+    // it. Clocking yourself in and out never needed them (SELF_SERVICE).
+    for (const role of ['head-chef', 'assistant-chef', 'barista', 'head-waiter', 'cashier', 'delivery-staff', 'cleaner']) {
+      expect(roleMayAccess(role, '/api/timeclock', 'GET')).toBe(false);
+      expect(roleMayAccess(role, '/api/timeclock', 'POST')).toBe(false);
+      expect(roleMayAccess(role, '/api/staff', 'GET')).toBe(false);
+    }
   });
 
   it('leaves the manager unrestricted', () => {

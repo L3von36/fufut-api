@@ -188,9 +188,16 @@ const SELF_SERVICE = new Set([
  * absent from both lists is refused. Manager is deliberately unrestricted -
  * every screen in the application is theirs.
  *
+ * The owner's least-privilege call (2026-09): an employed staff member sees
+ * the screens their job needs and nothing else. Procurement (suppliers,
+ * purchases), stock intelligence (stock-control), business reporting
+ * (reports/revenue/analytics screens) and the HR self-service trio are no
+ * longer granted to the kitchen or the floor; the manager — and for the
+ * financial slice the accountant — hold them.
+ *
  * The reads that look wrong are the ones to leave alone:
- *   head-chef  -> expenses   Reports fetches expenses unconditionally
- *   cashier    -> staff      Time Clock lists who is on shift
+ *   cashier    -> reports   the Dashboard's till tiles and the Cash Drawer
+ *                           screen read /api/reports/dashboard
  *   cleaner    -> tables     their Dashboard counts tables needing attention
  *   every POS role -> menu   order screens render dish names and prices
  */
@@ -198,10 +205,12 @@ const ROLE_ACCESS = {
   manager: { read: '*', write: '*' },
 
   'head-chef': {
-    // Recipes, stock movements and suppliers all belong to the person who owns
-    // food cost. Purchases are readable — they need to see what arrived and at
-    // what price — but committing spend stays with the manager.
-    read: ['orders', 'inventory', 'waste', 'expenses', 'recipes', 'units', 'suppliers', 'purchases', 'alerts', 'tasks'],
+    // The kitchen and its stock: the board, the tickets, the counts they take,
+    // the recipes they cook from and the bin they fill. Suppliers, purchases,
+    // stock-control analytics and the reporting screens were removed at the
+    // owner's direction — what arrived and what it cost is now read in the
+    // backoffice by the manager and the accountant, not on the line.
+    read: ['orders', 'inventory', 'waste', 'recipes', 'units', 'alerts', 'tasks'],
     // menu-availability lets them 86 a dish that has run out. The menu itself
     // stays manager-only, so pricing is untouched. Acknowledging an alert is
     // a kitchen act — "I have this ticket" — so the board's owner signs it.
@@ -255,11 +264,18 @@ const ROLE_ACCESS = {
     write: ['orders', 'tables', 'reservations', 'tips', 'alerts', 'tasks'],
   },
   cashier: {
-    read: ['orders', 'tables', 'reservations', 'expenses', 'staff', 'timeclock', 'cashdrawer', 'payments', 'tips', 'delivery', 'alerts', 'tasks'],
+    // `reports` is load-bearing: the Dashboard's till tiles and the Cash
+    // Drawer screen both read /api/reports/dashboard. The Reports, Revenue
+    // and Analytics SCREENS are not theirs — those are manager and
+    // accountant views — but this one aggregation endpoint is. Clocking on
+    // and off rides the SELF_SERVICE routes below; the timeclock resource
+    // (and with it the power to rewrite hours) and the colleague list were
+    // removed with the Time Clock screen.
+    read: ['orders', 'tables', 'reservations', 'cashdrawer', 'payments', 'tips', 'delivery', 'alerts', 'tasks', 'reports'],
     // `upload` is the transfer screenshot that §9 requires against a Telebirr,
     // CBE or bank payment. Without it the evidence has nowhere to go and the
     // verification step has nothing to verify against.
-    write: ['orders', 'tables', 'reservations', 'timeclock', 'cashdrawer', 'payments', 'tips', 'delivery', 'upload', 'alerts', 'tasks'],
+    write: ['orders', 'tables', 'reservations', 'cashdrawer', 'payments', 'tips', 'delivery', 'upload', 'alerts', 'tasks'],
   },
   // A driver needs the order behind the job — what is in the bag, what it comes
   // to, and whether it is already paid — plus a way to record the cash or the
@@ -307,16 +323,13 @@ const ROLE_ACCESS = {
 };
 
 /**
- * Resources every role that has a Reports or Revenue screen must be able to
- * read, or those screens render empty.
- *
- * Kept as a separate list rather than repeated per role, because the failure it
- * prevents — a nav item that opens onto nothing — is the one this matrix has
- * already caused once.
+ * The reporting resource now sits explicitly on the roles whose remaining
+ * screens fetch it — the cashier's Dashboard and Cash Drawer tiles read
+ * /api/reports/dashboard (see ROLE_ACCESS.cashier). The head-chef and
+ * head-waiter lost their Reports screen in the least-privilege pass and no
+ * kept screen of theirs fetches /api/reports/*, so they no longer hold the
+ * grant; the former blanket loop here is gone so the matrix reads whole.
  */
-for (const role of ['cashier', 'head-chef', 'head-waiter']) {
-  ROLE_ACCESS[role].read.push('reports');
-}
 
 /**
  * The canonical form of a role: lowercase, hyphenated.
