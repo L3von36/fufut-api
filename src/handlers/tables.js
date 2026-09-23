@@ -706,6 +706,23 @@ async function handleTables(pathname, method, url, request, env, auth) {
     if (String(table.status || '').toLowerCase() !== 'occupied') {
       return json({ ok: false, error: `Table ${table.number} has no party to bill.` }, 409);
     }
+    // The till gate: a bill nobody can take payment for is a promise the
+    // floor cannot keep — after Z-count the request would sit on the
+    // dashboard until tomorrow. Refuse with the reason instead. The manager
+    // keeps the same rule (the answer is "open the till", not "queue it").
+    try {
+      const { results: openDrawer } = await d1Query(
+        env,
+        "SELECT id FROM cashdrawers WHERE status = 'open' ORDER BY created DESC LIMIT 1"
+      );
+      if (!(openDrawer || []).length) {
+        return json(
+          { ok: false, error: 'The till is closed — open the cash drawer before asking for a bill.' },
+          409
+        );
+      }
+    } catch { // pre-drawer schema: never block the floor on a missing table
+    }
     // Idempotence needs the stamp; pre-migration-026 the column does not
     // exist, so the read is defensive and the write explains what to do.
     let existingStamp = '';
@@ -841,9 +858,15 @@ async function handleTables(pathname, method, url, request, env, auth) {
       );
     }
 
+    // The party resets but the SECTION does not — same rule as the sweep:
+    // `server` is what the head-waiter scoping matches on, so freeing must
+    // not scrub the name. The old behaviour wiped it here, which deleted the
+    // table straight out of the waiter's floor list the moment it turned —
+    // the free was un-deleting their section. Only a manager reassignment
+    // moves a table between sections.
     await d1Run(
       env,
-      "UPDATE tables SET status = 'available', seated_at = '', guests = 0, server = '' WHERE id = ?",
+      "UPDATE tables SET status = 'available', seated_at = '', guests = 0 WHERE id = ?",
       [tableId]
     );
     try {
