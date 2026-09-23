@@ -362,3 +362,53 @@ describe('self-scoped audit reads (My Activity)', () => {
     expect(d.ok).toBe(true);
   });
 });
+
+// Regression (all-role RBAC sweep, 2026-09-23): the cashier held the flat
+// `reports` resource so the till tiles could read /api/reports/dashboard —
+// but resourceForPath mapped EVERY /api/reports/* subpath to that one
+// resource, so the same cookie could also pull /api/reports/financial,
+// /accountant (the whole financial export), /staff-performance and the
+// ingredient economics. The dashboard aggregation is now its own resource
+// (`reports-dashboard`); the rest of the reporting surface (`reports`)
+// belongs to the accountant, with the manager wildcard.
+describe('reports resource split: dashboard vs business reporting', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it.each([
+    'GET /api/reports/dashboard',
+    'GET /api/reports',
+  ])('still lets the cashier read the till tiles: %s', async (pair) => {
+    const [m, p] = pair.split(' ');
+    const d = await decide(p, m, { staff_id: 'S7', sessionRole: 'cashier' });
+    expect(d.ok).toBe(true);
+  });
+
+  it.each([
+    'GET /api/reports/financial',
+    'GET /api/reports/accountant',
+    'GET /api/reports/staff-performance',
+    'GET /api/reports/top-items',
+    'GET /api/reports/hourly-heatmap',
+    'GET /api/reports/ingredient/RM3',
+    'GET /api/reports/products',
+  ])('refuses the cashier the business reports: %s', async (pair) => {
+    const [m, p] = pair.split(' ');
+    const d = await decide(p, m, { staff_id: 'S7', sessionRole: 'cashier' });
+    expect(d.ok).toBe(false);
+    expect(d.response.status).toBe(403);
+  });
+
+  it('keeps the accountant on the full reporting surface', async () => {
+    expect((await decide('/api/reports/financial', 'GET', { staff_id: 'Sn', sessionRole: 'accountant' })).ok).toBe(true);
+    expect((await decide('/api/reports/accountant', 'GET', { staff_id: 'Sn', sessionRole: 'accountant' })).ok).toBe(true);
+    expect((await decide('/api/reports/staff-performance', 'GET', { staff_id: 'Sn', sessionRole: 'accountant' })).ok).toBe(true);
+    expect((await decide('/api/reports/dashboard', 'GET', { staff_id: 'Sn', sessionRole: 'accountant' })).ok).toBe(true);
+  });
+
+  it('still refuses head-chef and head-waiter every reports subpath', async () => {
+    for (const role of ['head-chef', 'head-waiter']) {
+      expect((await decide('/api/reports/dashboard', 'GET', { staff_id: 'Sx', sessionRole: role })).ok).toBe(false);
+      expect((await decide('/api/reports/financial', 'GET', { staff_id: 'Sx', sessionRole: role })).ok).toBe(false);
+    }
+  });
+});

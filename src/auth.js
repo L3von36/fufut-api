@@ -275,19 +275,22 @@ const ROLE_ACCESS = {
     write: ['orders', 'tables', 'reservations', 'table-free', 'tips', 'alerts', 'tasks'],
   },
   cashier: {
-    // `reports` is load-bearing: the Dashboard's till tiles and the Cash
-    // Drawer screen both read /api/reports/dashboard. The Reports, Revenue
-    // and Analytics SCREENS are not theirs — those are manager and
-    // accountant views — but this one aggregation endpoint is. Clocking on
-    // and off rides the SELF_SERVICE routes below; the timeclock resource
-    // (and with it the power to rewrite hours) and the colleague list were
-    // removed with the Time Clock screen.
+    // `reports-dashboard` is load-bearing: the Dashboard's till tiles and the
+    // Cash Drawer screen both read /api/reports/dashboard. The Reports,
+    // Revenue and Analytics SCREENS are not theirs — those are manager and
+    // accountant views — and the rest of /api/reports/* (financial,
+    // accountant export, staff performance, top items, heatmap, ingredient
+    // economics) is gated as `reports`, which this role does not hold. The
+    // split lives in resourceForPath above. Clocking on and off rides the
+    // SELF_SERVICE routes below; the timeclock resource (and with it the
+    // power to rewrite hours) and the colleague list were removed with the
+    // Time Clock screen.
     // `tables` stayed after the floor plan left the cashier's nav (owner's
     // call, 2026-09): the Dashboard's Bill Requests card reads it, and the
     // checkout this role runs frees the table it settles — the write is what
     // closes that loop. What the till may no longer do is WALK the floor:
     // opening a table's ticket and seating parties are the head-waiter's.
-    read: ['orders', 'tables', 'reservations', 'cashdrawer', 'payments', 'tips', 'delivery', 'alerts', 'tasks', 'reports'],
+    read: ['orders', 'tables', 'reservations', 'cashdrawer', 'payments', 'tips', 'delivery', 'alerts', 'tasks', 'reports-dashboard'],
     // `upload` is the transfer screenshot that §9 requires against a Telebirr,
     // CBE or bank payment. Without it the evidence has nowhere to go and the
     // verification step has nothing to verify against.
@@ -330,7 +333,7 @@ const ROLE_ACCESS = {
    */
   accountant: {
     read: [
-      'reports', 'orders', 'payments', 'tips', 'expenses', 'purchases', 'suppliers',
+      'reports', 'reports-dashboard', 'orders', 'payments', 'tips', 'expenses', 'purchases', 'suppliers',
       'staff', 'attendance', 'overtime', 'leave', 'adjustments', 'payroll',
       'inventory', 'cashdrawer', 'timeclock', 'shifts', 'audit',
     ],
@@ -339,12 +342,14 @@ const ROLE_ACCESS = {
 };
 
 /**
- * The reporting resource now sits explicitly on the roles whose remaining
- * screens fetch it — the cashier's Dashboard and Cash Drawer tiles read
- * /api/reports/dashboard (see ROLE_ACCESS.cashier). The head-chef and
+ * The reporting surface is split (see resourceForPath): the dashboard
+ * aggregation rides `reports-dashboard`, every other /api/reports/* subpath
+ * rides `reports`. The dashboard grant now sits explicitly on the roles whose
+ * remaining screens fetch it — the cashier's Dashboard and Cash Drawer tiles
+ * (see ROLE_ACCESS.cashier). The full `reports` resource belongs to the
+ * accountant's Reports screen; the manager is wildcard. The head-chef and
  * head-waiter lost their Reports screen in the least-privilege pass and no
- * kept screen of theirs fetches /api/reports/*, so they no longer hold the
- * grant; the former blanket loop here is gone so the matrix reads whole.
+ * kept screen of theirs fetches /api/reports/*, so they hold neither.
  */
 
 /**
@@ -465,6 +470,19 @@ export function resourceForPath(pathname) {
   if (head === 'tables' && parts[3] === 'free') return 'table-free';
   if (head === 'menus') return 'menu';
   if (head === 'save-content') return 'content';
+  // The dashboard aggregation is its own resource, split from the rest of the
+  // reporting surface. The till's Dashboard tiles and the Cash Drawer read
+  // /api/reports/dashboard and nothing else; /api/reports/financial,
+  // /accountant, /staff-performance, /top-items, /hourly-heatmap and
+  // /ingredient/:id are business reporting. Granting one flat `reports`
+  // resource to the cashier would let the till pull the accountant export and
+  // the staff performance ledger with the same cookie — data the Reports,
+  // Revenue and Analytics screens were removed from that role not to show.
+  if (head === 'reports') {
+    return parts.length === 2 || parts[2] === 'dashboard'
+      ? 'reports-dashboard'
+      : 'reports';
+  }
   if (head === 'events') {
     if (parts[2] === 'kitchen') return 'orders';
     if (parts[2] === 'alerts') return 'alerts';
