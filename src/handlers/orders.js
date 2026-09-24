@@ -2137,7 +2137,15 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
       fields.push("picked_up_at = COALESCE(picked_up_at, ?)");
       values.push(nowIso);
     }
-    if (fields.length === 0 && !(data.status !== void 0 && stationScope)) {
+    // A settlement-only PUT (money in the body, nothing else) must reach the
+    // settlement block below — that is where the role gate ("only a cashier
+    // or manager") and the Law-2 till gate live, and where the payment rows
+    // are written. Bouncing it here as "no fields" would silently do nothing
+    // to a client that believes it just took someone's cash.
+    const wantsSettlement =
+      (Array.isArray(data.paymentBreakdown) && data.paymentBreakdown.length > 0) ||
+      round2(data.tip) > 0;
+    if (fields.length === 0 && !(data.status !== void 0 && stationScope) && !wantsSettlement) {
       return json({ ok: false, error: "No fields to update" }, 400);
     }
     fields.push("updated_at = ?");

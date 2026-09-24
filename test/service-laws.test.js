@@ -125,6 +125,32 @@ describe('Law 2 — money needs an open till', () => {
     const parsed = await res.json();
     expect(parsed.reason).toBe('till-closed');
   });
+
+  // The settlement gates (role + till) live in the settlement block, which a
+  // PUT carrying ONLY money used to never reach — "No fields to update" (400)
+  // fired first, silently doing nothing for a client that believes it just
+  // took cash. A settlement-only body must ride the same gates.
+  it('gates a settlement-only PUT (no status, no fields) on the open till', async () => {
+    const { env } = makeEnv({ orderRows: [ORDER], itemRows: MIXED_LINES, tillOpen: false });
+    const { pathname, method, url, request } = makeRequest('/api/orders/Olaw01', 'PUT', {
+      paymentBreakdown: [{ method: 'cash', amount: 200 }],
+    });
+    const res = await handleOrders(pathname, method, url, request, env, CTX, { staff_id: 'S1', role: 'cashier' });
+    expect(res.status).toBe(409);
+    const parsed = await res.json();
+    expect(parsed.reason).toBe('till-closed');
+  });
+
+  it('lets a settlement-only PUT through when the till is open', async () => {
+    const { env } = makeEnv({ orderRows: [ORDER], itemRows: MIXED_LINES, tillOpen: true });
+    const { pathname, method, url, request } = makeRequest('/api/orders/Olaw01', 'PUT', {
+      paymentBreakdown: [{ method: 'cash', amount: 200 }],
+    });
+    const res = await handleOrders(pathname, method, url, request, env, CTX, { staff_id: 'S1', role: 'cashier' });
+    expect(res.status).not.toBe(400);
+    const parsed = await res.json();
+    expect(parsed.ok).toBe(true);
+  });
 });
 
 describe('Law 3 — the floor serves', () => {
