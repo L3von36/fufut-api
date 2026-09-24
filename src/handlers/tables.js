@@ -363,7 +363,7 @@ async function listTablesWithHolds(env) {
     activeReservations(env),
     d1Query(
       env,
-      "SELECT table_id, payment_status FROM orders " +
+      "SELECT table_id, payment_status, created FROM orders " +
       "WHERE table_id IS NOT NULL AND COALESCE(voided_at, '') = '' " +
       "AND status IN ('new','confirmed','preparing','ready','served','fulfilled')"
     ),
@@ -387,13 +387,29 @@ async function listTablesWithHolds(env) {
     const key = normaliseTableId(o.table_id);
     if (!key) continue;
     if (!checksByTable.has(key)) checksByTable.set(key, []);
-    checksByTable.get(key).push(String(o.payment_status || '').toLowerCase());
+    checksByTable.get(key).push({
+      status: String(o.payment_status || '').toLowerCase(),
+      created: String(o.created || ''),
+    });
   }
-  const moneyState = (states) => {
-    if (!states || !states.length) return null;
+  // The money state of the CURRENT party's checks — word for word the
+  // owner's rule (2026-09-24): the badge answers for THIS guest's bill, not
+  // for the table's history. A settled check that is OLDER than an open one
+  // belongs to a previous sitting nobody freed; it must never turn this
+  // guest's unpaid bill into "partly paid". Walk back from the newest check
+  // and stop at the first settled one: the run of unsettled checks above it
+  // is the current tab. Nothing but settled checks means the bill is paid.
+  const moneyState = (checks) => {
+    if (!checks || !checks.length) return null;
     const settled = (s) => s === 'paid' || s === 'overpaid';
-    if (states.every(settled)) return 'paid';
-    if (states.some(settled) || states.some((s) => s === 'partial')) return 'partial';
+    const sorted = [...checks].sort((a, b) =>
+      String(b.created || '').localeCompare(String(a.created || ''))
+    );
+    let i = 0;
+    while (i < sorted.length && !settled(sorted[i].status)) i++;
+    if (i >= sorted.length) return 'paid'; // every check settled — the party paid
+    const states = sorted.slice(0, i).map((c) => c.status);
+    if (states.some((s) => s === 'partial')) return 'partial';
     return 'unpaid';
   };
 

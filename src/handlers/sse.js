@@ -1,6 +1,6 @@
-import { mapResourceRow } from './resources.js';
 import { d1Query } from '../lib/db.js';
 import { alertVisibleTo, allowedRuleIdsForRole } from './alerts.js';
+import { listTablesWithHolds } from './tables.js';
 import { getModeSync, freshnessMultiplier, noteSseOpen, noteSseClose } from '../lib/quota.js';
 
 function sseEvent(event, data) {
@@ -85,8 +85,15 @@ async function probeChannel(channel, env) {
  *  ticks used to run, now run at most once per isolate per freshness window. */
 async function broadQuery(channel, env) {
   if (channel === 'tables') {
-    const { results } = await d1Query(env, 'SELECT * FROM tables ORDER BY created DESC');
-    return { tables: (results || []).map((r) => mapResourceRow('tables', r)) };
+    // The ENRICHED rows — payment per table, bill requests, reservation
+    // holds — the same list GET /api/tables answers. The floor's badges live
+    // on these fields, and neither a settlement nor a bill request writes
+    // the tables table itself: a raw-rows payload here never changed
+    // signature, so table_update never fired after money moved and the
+    // floor plan sat on a stale pay badge until somebody pulled to refresh
+    // (owner's report, 2026-09-24). Enriched rows change signature the
+    // moment payment_status or a bill request does — the push is honest.
+    return { tables: await listTablesWithHolds(env) };
   }
   if (channel === 'alerts') {
     // Broad, role-blind read: the per-client filter below applies the same
