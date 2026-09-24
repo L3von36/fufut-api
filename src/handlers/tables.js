@@ -405,9 +405,13 @@ async function listTablesWithHolds(env) {
     const sorted = [...checks].sort((a, b) =>
       String(b.created || '').localeCompare(String(a.created || ''))
     );
+    if (!sorted.some((c) => !settled(c.status))) return 'paid';
+    // Current tab = the run of unsettled checks from the newest back to the
+    // first settled one. The walk stopping at index 0 means the newest check
+    // is settled yet older open money remains — still partly owed.
     let i = 0;
     while (i < sorted.length && !settled(sorted[i].status)) i++;
-    if (i >= sorted.length) return 'paid'; // every check settled — the party paid
+    if (i === 0) return 'partial';
     const states = sorted.slice(0, i).map((c) => c.status);
     if (states.some((s) => s === 'partial')) return 'partial';
     return 'unpaid';
