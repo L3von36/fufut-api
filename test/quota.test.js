@@ -52,7 +52,7 @@ import {
   freshnessMultiplier,
   cacheTtlMultiplier,
 } from '../src/lib/quota.js';
-import { tickChannel, clearChannelCacheForTest, PAYLOAD_FRESH_MS } from '../src/handlers/sse.js';
+import { tickChannel, clearChannelCacheForTest, PAYLOAD_FRESH_MS, TICK_MS } from '../src/handlers/sse.js';
 
 const MANAGER = { id: 'S-QU-1', email: 'qu-manager@local.test', password: 'localbox123' };
 const CASHIER = { id: 'S-QU-2', email: 'qu-cashier@local.test', password: 'localbox123' };
@@ -147,6 +147,13 @@ beforeEach(() => {
   // staff rows and KV overrides (a previous test's 'critical' pin!) into the
   // next test — the breaker persisting by design, against the wrong scenario.
   ({ env, db } = createLocalEnv({ dir: path.join(dir, 't-' + Math.random().toString(36).slice(2)), quiet: true }));
+  // Service laws (2026-09): ordering and settlement need an open till.
+  // These tests exercise the order lifecycle, not the till gate, so the
+  // drawer starts open here; test/service-laws.test.js owns the closed-till
+  // cases.
+  db.prepare(
+    "INSERT INTO cashdrawers (id, opened_at, opening_balance, cash_sales, status, created) VALUES ('till-open-1', ?, 0, 0, 'open', ?)"
+  ).run(new Date().toISOString(), new Date().toISOString());
   db.exec(ALERTS_SQL);
 });
 
@@ -467,6 +474,11 @@ describe('SSE freshness scales with the mode', () => {
   });
 
   it('the constants the production cadence relies on are unchanged', () => {
-    expect(PAYLOAD_FRESH_MS).toBe(8000);
+    // 3000 since the 2026-09 latency pass: "send to order takes a while to
+    // appear on the kitchen" — the push worst case is tick + freshness, and
+    // 4s + 3s reads live instead of lazy. The quota breaker still scales the
+    // window by mode (x4 conserve, x8 emergency, Infinity critical).
+    expect(PAYLOAD_FRESH_MS).toBe(3000);
+    expect(TICK_MS).toBe(4000);
   });
 });

@@ -37,6 +37,7 @@ function makeEnv({
               if (sql.includes(frag)) return result;
             }
             if (/FROM orders WHERE id/.test(sql)) return { results: orderRows };
+            if (/FROM cashdrawers WHERE status = 'open'/.test(sql)) return { results: [{ id: 'Dtill01' }] };
             if (/FROM order_items/.test(sql)) return { results: itemRows };
             if (/FROM payments WHERE order_id/.test(sql)) return { results: paymentRows };
             if (/FROM tables WHERE id|FROM tables WHERE id|FROM tables WHERE/.test(sql)) return { results: tableRows };

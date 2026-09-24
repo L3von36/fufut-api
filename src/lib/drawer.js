@@ -16,7 +16,7 @@
  * logged and swallowed.
  */
 
-import { d1Run } from './db.js';
+import { d1Query, d1Run } from './db.js';
 
 /** Round to two decimals without float drift. */
 function round2(n) {
@@ -47,5 +47,29 @@ export async function addToOpenDrawerCash(env, amount) {
   } catch (e) {
     console.error('[DRAWER] cash tally not updated:', e);
     return null;
+  }
+}
+
+/**
+ * Is the till open right now?
+ *
+ * The cafe's service laws (owner's 2026-09 brief) hang off this one read:
+ * no new orders and no settlements while the drawer is closed — the till
+ * opens the day, and the Z-count ends it.
+ *
+ * Fail-open on error only: if the probe itself cannot run (the table has not
+ * migrated in, a D1 hiccup) ordering continues exactly as before. An honest
+ * "no open drawer" answer — the normal case overnight — closes the gate.
+ */
+export async function isTillOpen(env) {
+  try {
+    const { results } = await d1Query(
+      env,
+      "SELECT id FROM cashdrawers WHERE status = 'open' ORDER BY created DESC LIMIT 1"
+    );
+    return !!(results && results.length);
+  } catch (e) {
+    console.error('[DRAWER] till probe failed, failing open:', e);
+    return true;
   }
 }

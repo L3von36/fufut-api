@@ -27,6 +27,7 @@ function makeEnv({ orderRows = [], itemRows = [], overrides = {} } = {}) {
               if (sql.includes(frag)) return result;
             }
             if (/FROM orders WHERE id/.test(sql)) return { results: orderRows };
+            if (/FROM cashdrawers WHERE status = 'open'/.test(sql)) return { results: [{ id: 'Dtill01' }] };
             if (/FROM order_items/.test(sql)) return { results: itemRows };
             return { results: [] };
           },

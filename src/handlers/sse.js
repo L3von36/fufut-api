@@ -24,8 +24,8 @@ function sseEvent(event, data) {
  * client's tick almost always finds a fresh cache rather than stacking two
  * queries back to back.
  */
-const PAYLOAD_FRESH_MS = 8000;
-const TICK_MS = 1e4;
+const PAYLOAD_FRESH_MS = 3000;
+const TICK_MS = 4000;
 
 /**
  * Per-isolate channel cache: channel name → { at, payload, sig, probe }.
@@ -127,6 +127,47 @@ async function broadQuery(channel, env) {
 const EVENT_NAMES = { tables: 'table_update', alerts: 'alerts_update', activity: 'activity_update', kitchen: 'new_order' };
 
 /**
+ * The kitchen channel's event name is earned, not fixed (the bogus "new
+ * order" notification, owner report 2026-09): the event was literally named
+ * `new_order` for EVERY board change — a waiter marking a ticket served
+ * stamped updated_at, the probe moved, and every subscriber received an
+ * event named new_order announcing nothing new. Clients from the pipeline
+ * to the floor plan read the name literally and toasts lied.
+ *
+ * Now the refresh computes which order ids are genuinely new against the
+ * previous payload and bakes `newIds` into it: a board that GAINED a ticket
+ * is announced as `new_order` (with the ids), any other change — a status
+ * move, a serve, a table transfer — travels as `order_update`. Clients that
+ * diff snapshots themselves keep working; clients that trusted the name
+ * stop lying.
+ */
+function stampNewIds(previous, payload) {
+  if (channelName(payload) !== 'kitchen') return payload;
+  const ids = new Set((payload.orders || []).map((o) => String(o && o.id)));
+  const prev = previous && Array.isArray(previous.orders)
+    ? new Set(previous.orders.map((o) => String(o && o.id)))
+    : null;
+  // First build after a cold cache is a baseline, never an announcement —
+  // a restarting isolate must not replay the whole board as "new".
+  const newIds = prev ? [...ids].filter((id) => !prev.has(id)) : [];
+  return Object.assign({}, payload, { newIds });
+}
+
+function channelName(payload) {
+  if (payload && Array.isArray(payload.orders)) return 'kitchen';
+  if (payload && Array.isArray(payload.alerts)) return 'alerts';
+  if (payload && Array.isArray(payload.tables)) return 'tables';
+  if (payload && Array.isArray(payload.entries)) return 'activity';
+  return '';
+}
+
+function kitchenEventName(view) {
+  return view && Array.isArray(view.newIds) && view.newIds.length > 0
+    ? 'new_order'
+    : 'order_update';
+}
+
+/**
  * Tests run many channels against fresh databases in one process; without
  * this the previous test's cached payload would answer the next test's tick
  * — coalescing working exactly as designed, against the wrong database.
@@ -175,7 +216,8 @@ export async function tickChannel(channel, env, client, opts = {}) {
         // the next client in this window reuses it without another probe.
         cache.at = nowMs;
       } else {
-        const payload = await broadQuery(channel, env);
+        const built = await broadQuery(channel, env);
+        const payload = stampNewIds(cache ? cache.payload : null, built);
         cache = {
           at: nowMs,
           payload,
@@ -247,7 +289,10 @@ async function handleSSE(request, env, channel, auth) {
           const r = await tickChannel(channel, env, client);
           if (!r.keepaliveOnly && r.sig !== client.lastSig) {
             client.lastSig = r.sig;
-            safe(() => controller.enqueue(sseEvent(EVENT_NAMES[channel], r.view)));
+            // The kitchen channel earns its event name: a board that gained
+            // tickets announces them; everything else is a quiet refresh.
+            const evName = channel === 'kitchen' ? kitchenEventName(r.view) : EVENT_NAMES[channel];
+            safe(() => controller.enqueue(sseEvent(evName, r.view)));
           }
         } catch (e) {}
         safe(() => controller.enqueue(encoder.encode(': keepalive\n\n')));
@@ -285,4 +330,4 @@ async function handleSSE(request, env, channel, auth) {
   });
 }
 
-export { sseEvent, handleSSE, PAYLOAD_FRESH_MS, TICK_MS, clearChannelCacheForTest };
+export { sseEvent, handleSSE, PAYLOAD_FRESH_MS, TICK_MS, clearChannelCacheForTest, kitchenEventName };

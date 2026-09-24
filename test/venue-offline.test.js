@@ -53,6 +53,13 @@ function heartbeat(agoMs) {
 beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fufut-venue-'));
   ({ env, db } = createLocalEnv({ dir, quiet: true }));
+  // Service laws (2026-09): ordering and settlement need an open till.
+  // These tests exercise the order lifecycle, not the till gate, so the
+  // drawer starts open here; test/service-laws.test.js owns the closed-till
+  // cases.
+  db.prepare(
+    "INSERT INTO cashdrawers (id, opened_at, opening_balance, cash_sales, status, created) VALUES ('till-open-1', ?, 0, 0, 'open', ?)"
+  ).run(new Date().toISOString(), new Date().toISOString());
   env.SITE_ID = 'cloud';
 
   // Guest orders are priced from the menu now, so the menu has to exist.

@@ -44,6 +44,13 @@ async function call(method, url, body) {
 beforeAll(async () => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fufut-runtime-'));
   ({ env, db } = createLocalEnv({ dir, quiet: true }));
+  // Service laws (2026-09): ordering and settlement need an open till.
+  // These tests exercise the order lifecycle, not the till gate, so the
+  // drawer starts open here; test/service-laws.test.js owns the closed-till
+  // cases.
+  db.prepare(
+    "INSERT INTO cashdrawers (id, opened_at, opening_balance, cash_sales, status, created) VALUES ('till-open-1', ?, 0, 0, 'open', ?)"
+  ).run(new Date().toISOString(), new Date().toISOString());
 
   db.prepare(
     `INSERT INTO staff (id, firstName, lastName, email, role, status, password_hash, must_change_password, created)

@@ -27,6 +27,7 @@ function makeEnv({ orderRows = [], itemRows = [], maxLineNo = null, overrides = 
             }
             if (/MAX\(line_no\)/.test(sql)) return { results: [{ maxLineNo }] };
             if (/FROM orders WHERE id/.test(sql)) return { results: orderRows };
+            if (/FROM cashdrawers WHERE status = 'open'/.test(sql)) return { results: [{ id: 'Dtill01' }] };
             if (/PRAGMA table_info\(order_items\)/.test(sql)) {
               return { results: [{ name: 'course' }, { name: 'id' }] };
             }

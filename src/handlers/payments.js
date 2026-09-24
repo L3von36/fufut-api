@@ -27,7 +27,7 @@
 import { d1Query, d1Run, json, readBody, fireAndForget } from '../lib/db.js';
 import { writeAudit } from '../lib/audit.js';
 import { actorName, isManager } from '../auth.js';
-import { addToOpenDrawerCash } from '../lib/drawer.js';
+import { addToOpenDrawerCash, isTillOpen } from '../lib/drawer.js';
 import { normaliseTableId } from '../lib/staleness.js';
 
 /** Methods the business accepts. Anything else is refused rather than stored. */
@@ -170,6 +170,16 @@ async function recordPayment(request, env, ctx, auth) {
   const method = String(data.method || '').toLowerCase();
   if (!METHODS.has(method)) {
     return json({ ok: false, error: `Unknown payment method "${data.method}"` }, 400);
+  }
+
+  // Service law 2 — money needs an open till (mirrors the settlement gate on
+  // PUT /api/orders): a payment recorded against a closed drawer never lands
+  // on a shift's Z-report, so the till must be open for money to move.
+  if (!(await isTillOpen(env))) {
+    return json(
+      { ok: false, error: 'The till is closed — open the till (Cash Drawer) before taking payments.', reason: 'till-closed' },
+      409
+    );
   }
 
   const amount = round2(data.amount);

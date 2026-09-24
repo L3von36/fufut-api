@@ -80,6 +80,27 @@ export function nameIsDrink(name) {
 }
 
 /**
+ * Which station owns ONE tracked line (an order_items row).
+ *
+ * The tracked rows carry the menu category they were written with — that is
+ * the primary signal ("Ginger with Honey" is a drink only through its HOT
+ * DRINKS category) — and the name regex is the fallback for rows written
+ * before categories were stamped. Unclassifiable lines fail OPEN to the
+ * kitchen, exactly like the boards: nobody's work silently disappears
+ * because a row could not be read.
+ *
+ * The station-scoped status writes hang off this classifier: a barista's
+ * whole-ticket "picked up" may move drink lines only, and a chef's "ready"
+ * may move food lines only — the two stations share a ticket, never a
+ * status.
+ */
+export function lineStation(category, name) {
+  const cat = String(category || '');
+  if (cat.trim()) return nameIsDrink(cat) ? 'bar' : 'kitchen';
+  return nameIsDrink(name) ? 'bar' : 'kitchen';
+}
+
+/**
  * Which station(s) own the work on this order.
  *
  * Reads whatever item summary the row carries — the JSON line array the POS

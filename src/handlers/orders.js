@@ -2,7 +2,7 @@ import { d1Query, d1Run, d1Batch, json, readBody, fireAndForget, now, vid } from
 import { writeAudit } from '../lib/audit.js';
 import { actorName, isManager } from '../auth.js';
 import { refreshPaymentStatus } from './payments.js';
-import { addToOpenDrawerCash } from '../lib/drawer.js';
+import { addToOpenDrawerCash, isTillOpen } from '../lib/drawer.js';
 import { alertsHaveStationColumns } from './alerts.js';
 import { syncDeliveryToOrderStatus } from './delivery.js';
 import { consumeForOrder, reverseOrderConsumption } from '../lib/ledger.js';
@@ -15,7 +15,7 @@ import {
   DEFAULT_KITCHEN_STALE_HOURS,
   DEFAULT_TABLE_MAX_HOURS,
 } from '../lib/staleness.js';
-import { RULE_IDS, orderLabel, orderStation } from '../lib/rules.js';
+import { RULE_IDS, orderLabel, orderStation, lineStation } from '../lib/rules.js';
 
 const ACTIVE_LIST = ACTIVE_STATUSES.map((s) => `'${s}'`).join(', ');
 
@@ -1163,6 +1163,38 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
     if (!data) return json({ ok: false, error: "Invalid JSON body" }, 400);
 
     /**
+     * Service law 1 — the till opens the day (owner's 2026-09 brief, the
+     * standard POS register rule): no new orders while the drawer is closed.
+     * A ticket accepted into a closed session is work nobody can hand over
+     * and money nobody can count; the first act of service is opening the
+     * till, and everything else follows from it.
+     *
+     * Staff get the actionable message (open the till); guests from the QR
+     * code get the counter message — a stranger cannot open a drawer, and
+     * the honest answer is that the cafe is not serving yet.
+     */
+    if (!(await isTillOpen(env))) {
+      if (!actor) {
+        return json(
+          {
+            ok: false,
+            error: 'The cafe is not taking orders right now — please order at the counter.',
+            reason: 'till-closed',
+          },
+          503
+        );
+      }
+      return json(
+        {
+          ok: false,
+          error: 'The till is closed — open the till (Cash Drawer) before taking orders.',
+          reason: 'till-closed',
+        },
+        409
+      );
+    }
+
+    /**
      * An order placed by a guest from the code on their table.
      *
      * Present only when the request carries a `table_key`, so nothing that
@@ -1900,6 +1932,34 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
       return json({ ok: false, error: `Unknown item status "${data.status}"` }, 400);
     }
 
+    // Law 4 at the line level: a station role may only advance lines that
+    // belong to its own station. The boards never offer foreign lines, but a
+    // replayed request or a hand-built call would — this is the same fence
+    // the whole-ticket PUT has, one line at a time.
+    {
+      const role = String((auth && (auth.sessionRole || auth.role)) || '').toLowerCase();
+      const forced = { barista: 'bar', 'head-chef': 'kitchen', 'assistant-chef': 'kitchen' }[role];
+      if (forced) {
+        const { results: line } = await d1Query(
+          env,
+          "SELECT category, name FROM order_items WHERE id = ? AND order_id = ?",
+          [itemId, orderId]
+        );
+        const row = line && line[0];
+        if (row && lineStation(row.category, row.name) !== forced) {
+          return json(
+            {
+              ok: false,
+              error: forced === 'bar'
+                ? 'That line is food — it belongs to the kitchen station.'
+                : 'That line is a drink — it belongs to the bar station.',
+            },
+            403
+          );
+        }
+      }
+    }
+
     const nowIso = new Date().toISOString();
     const stamp = stampColumnFor(status);
     // The timestamp is only written the first time a line enters a state, so
@@ -1973,14 +2033,44 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
     if (before && before.voided_at) {
       return json({ ok: false, error: "Order has been voided and cannot be changed" }, 409);
     }
-    if (data.status !== void 0) {
+
+    // ── Who is writing, and what are they allowed to write? ───────────────
+    const role = String((auth && (auth.sessionRole || auth.role)) || '').toLowerCase();
+    const wantedStatus = data.status !== void 0 ? String(data.status).toLowerCase() : null;
+
+    // Service law 3 — the floor serves (owner's 2026-09 brief): the kitchen
+    // hands food over with "picked up" (fulfilled); the word "served" belongs
+    // to the manager, the head waiter and the till. The role matrix hides the
+    // button on every screen; this closes the back door.
+    if (wantedStatus === 'served' && !['manager', 'head-waiter', 'cashier'].includes(role)) {
+      return json(
+        { ok: false, error: "Only the floor can mark an order served — the kitchen hands off with 'picked up'." },
+        403
+      );
+    }
+
+    // Service law 4 — each station owns its own lines (the KDS standard:
+    // "send each item only where it's prepped"). A barista bumping drinks
+    // must never move the kitchen's food and the other way round, even when
+    // both share one ticket. Station roles are FORCED into their own scope
+    // regardless of what the client sends; the floor roles may pass an
+    // explicit station, and without one they act on the whole ticket exactly
+    // as before (a head-waiter marking served serves everything).
+    const FORCED_STATION = { barista: 'bar', 'head-chef': 'kitchen', 'assistant-chef': 'kitchen' };
+    const askedStation = typeof data.station === 'string' ? data.station.trim().toLowerCase() : '';
+    const stationScope = FORCED_STATION[role] || (['bar', 'kitchen'].includes(askedStation) ? askedStation : null);
+
+    // With a station scope the order's own status is DERIVED after the scoped
+    // line update (a bar handoff cannot "fulfil" a ticket whose food is still
+    // cooking) — so the verbatim status write is skipped here.
+    if (data.status !== void 0 && !stationScope) {
       fields.push("status = ?");
       values.push(data.status);
       // Stamp the moment this order reached the state, first time only, so a
       // second tap on "Mark Ready" cannot rewind the recorded duration.
       // KitchenView has always rendered "ready for N min" from a column that
       // did not exist; updated_at below is what makes that figure real.
-      const stamp = stampColumnFor(String(data.status).toLowerCase());
+      const stamp = stampColumnFor(wantedStatus);
       if (stamp) {
         fields.push(`${stamp} = COALESCE(${stamp}, ?)`);
         values.push(nowIso);
@@ -2047,7 +2137,9 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
       fields.push("picked_up_at = COALESCE(picked_up_at, ?)");
       values.push(nowIso);
     }
-    if (fields.length === 0) return json({ ok: false, error: "No fields to update" }, 400);
+    if (fields.length === 0 && !(data.status !== void 0 && stationScope)) {
+      return json({ ok: false, error: "No fields to update" }, 400);
+    }
     fields.push("updated_at = ?");
     values.push(nowIso);
     values.push(id);
@@ -2059,20 +2151,70 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
     // per-item tap would recompute the order straight back to "preparing".
     // Only lines behind the new state move, so a line already served is never
     // dragged backwards.
+    //
+    // With a station scope, ONLY that station's lines move (law 4): the ids
+    // are picked in JS via the same classifier the boards render with, and the
+    // order's own status is then re-derived from ALL of its lines — a bar
+    // handoff on a mixed ticket leaves the order 'ready' at most, never
+    // 'fulfilled' while the kitchen is still cooking.
+    let effectiveStatus = wantedStatus;
     if (data.status !== void 0) {
-      const target = ORDER_TO_ITEM_STATUS[String(data.status).toLowerCase()];
+      const target = ORDER_TO_ITEM_STATUS[wantedStatus];
       if (target) {
-        const behind = ITEM_FLOW.slice(0, flowIndex(target)).map((s) => `'${s}'`).join(", ");
+        const behindList = ITEM_FLOW.slice(0, flowIndex(target));
         const stamp = stampColumnFor(target);
         const setClause = stamp
           ? `status = ?, ${stamp} = COALESCE(${stamp}, ?)`
           : `status = ?`;
-        const args = stamp ? [target, nowIso, id] : [target, id];
-        await d1Run(
-          env,
-          `UPDATE order_items SET ${setClause} WHERE order_id = ? AND status IN (${behind})`,
-          args
-        );
+        if (stationScope) {
+          const { results: lines } = await d1Query(
+            env,
+            "SELECT id, status, category, name FROM order_items WHERE order_id = ?",
+            [id]
+          );
+          const ids = (lines || [])
+            .filter(
+              (l) =>
+                lineStation(l.category, l.name) === stationScope &&
+                behindList.includes(String(l.status || '').toLowerCase())
+            )
+            .map((l) => l.id);
+          for (let i = 0; i < ids.length; i += 20) {
+            const chunk = ids.slice(i, i + 20);
+            const ph = chunk.map(() => '?').join(', ');
+            const args = stamp ? [target, nowIso, ...chunk] : [...chunk];
+            await d1Run(
+              env,
+              `UPDATE order_items SET ${setClause} WHERE id IN (${ph})`,
+              args
+            );
+          }
+          // Re-derive the order's status from every line, all stations.
+          const { results: after } = await d1Query(
+            env,
+            "SELECT status FROM order_items WHERE order_id = ?",
+            [id]
+          );
+          const derived = deriveOrderStatus((after || []).map((r) => r.status));
+          effectiveStatus = derived || wantedStatus;
+          const dStamp = stampColumnFor(effectiveStatus);
+          const dSql = dStamp
+            ? `UPDATE orders SET status = ?, updated_at = ?, ${dStamp} = COALESCE(${dStamp}, ?) WHERE id = ?`
+            : `UPDATE orders SET status = ?, updated_at = ? WHERE id = ?`;
+          await d1Run(
+            env,
+            dSql,
+            dStamp ? [effectiveStatus, nowIso, nowIso, id] : [effectiveStatus, nowIso, id]
+          );
+        } else {
+          const behind = behindList.map((s) => `'${s}'`).join(", ");
+          const args = stamp ? [target, nowIso, id] : [target, id];
+          await d1Run(
+            env,
+            `UPDATE order_items SET ${setClause} WHERE order_id = ? AND status IN (${behind})`,
+            args
+          );
+        }
       }
     }
 
@@ -2084,8 +2226,8 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
     // DB round-trip that will always be a no-op. The helper itself is also
     // fail-open: if it throws, the order status change has already happened
     // and the delivery sync is the only thing that did not.
-    if (data.status !== void 0 && before && String(before.type || '').toLowerCase() === 'delivery') {
-      try { await syncDeliveryToOrderStatus(env, id, data.status); } catch { /* delivery sync is best-effort */ }
+    if (effectiveStatus !== null && before && String(before.type || '').toLowerCase() === 'delivery') {
+      try { await syncDeliveryToOrderStatus(env, id, effectiveStatus); } catch { /* delivery sync is best-effort */ }
     }
 
     // Pickup ping on the whole-order path: a screen moving the ticket to
@@ -2093,8 +2235,7 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
     // Only on the transition into 'ready', and never for delivery — the job
     // rows speak for those.
     if (
-      data.status !== void 0 &&
-      String(data.status).toLowerCase() === 'ready' &&
+      effectiveStatus === 'ready' &&
       before && String(before.status || '').toLowerCase() !== 'ready' &&
       String(before.type || '').toLowerCase() !== 'delivery'
     ) {
@@ -2111,7 +2252,7 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
     //
     // Idempotent via orders.consumed_at, so a second tap on "Ready" cannot
     // deduct twice — the double-deduction failure in §56.
-    if (data.status !== void 0 && CONSUME_ON_STATUS.has(String(data.status).toLowerCase())) {
+    if (effectiveStatus !== null && CONSUME_ON_STATUS.has(effectiveStatus)) {
       const consumed = await consumeForOrder(env, auth, id);
       if (!consumed.ok) {
         // Never fails the status change. The kitchen must be able to say food
@@ -2149,13 +2290,23 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
     // Checkout button is hidden for head-waiter, and 'checkout' is no longer
     // in ROLE_PERMISSIONS for them) close the front door; this closes the
     // back door.
-    const role = String((auth && (auth.sessionRole || auth.role)) || '').toLowerCase();
     const canSettle = isManager(role) || role === 'cashier';
     if (!canSettle && (Array.isArray(data.paymentBreakdown) && data.paymentBreakdown.length || round2(data.tip) > 0)) {
       return json(
         { ok: false, error: 'Only a cashier or manager can settle a bill. Hand the table to the cashier.' },
         403
       );
+    }
+    // Service law 2 — money needs an open till: no settlement and no tip is
+    // posted against a closed drawer. The session is the unit of accounting;
+    // money taken outside it never appears on a Z-report.
+    if ((Array.isArray(data.paymentBreakdown) && data.paymentBreakdown.length) || round2(data.tip) > 0) {
+      if (!(await isTillOpen(env))) {
+        return json(
+          { ok: false, error: 'The till is closed — open the till (Cash Drawer) before taking payments.', reason: 'till-closed' },
+          409
+        );
+      }
     }
     if (Array.isArray(data.paymentBreakdown) && data.paymentBreakdown.length) {
       const settlement = await recordSubmittedPayments(env, auth, id, data);

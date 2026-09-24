@@ -36,6 +36,7 @@ import { handleContent, checkScheduledPublish } from './handlers/content.js';
 import { handleOrders, loadStaleHours, autoCompleteStaleOrders } from './handlers/orders.js';
 import { handleAlerts, runAlertSweep } from './handlers/alerts.js';
 import { handlePayments } from './handlers/payments.js';
+import { isTillOpen } from './lib/drawer.js';
 import { handleAudit } from './handlers/audit.js';
 import { handleDelivery } from './handlers/delivery.js';
 import { handleRecipes } from './handlers/recipes.js';
@@ -172,11 +173,17 @@ async function route(pathname, method, url, request, env, ctx, auth) {
    */
   if (pathname === '/api/venue/status' && upper === 'GET') {
     const venue = await venueStatus(env);
+    // till_open rides along so every signed-in device can honour the service
+    // laws without holding a cashdrawer grant (the floor needs to know WHY
+    // ordering is closed, and the QR menu can say "closed" honestly). The
+    // probe fails open, matching the gates that consume it.
+    const till = await isTillOpen(env);
     return json({
       ok: true,
       online_ordering: venue.online,
       venue_online: venue.online,
       last_seen: venue.lastSeen,
+      till_open: till,
     });
   }
 
