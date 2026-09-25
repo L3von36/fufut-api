@@ -1986,6 +1986,17 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
 
     const nowIso = new Date().toISOString();
     const stamp = stampColumnFor(status);
+    // The line's status before this PUT, so the audit row below can say the
+    // transition and not the tap — a re-tap on an already-advancing line is
+    // choreography, not work, and must not inflate the per-person numbers.
+    const { results: priorLineRows } = await d1Query(
+      env,
+      "SELECT status FROM order_items WHERE id = ? AND order_id = ?",
+      [itemId, orderId]
+    );
+    const lineBefore = String(
+      (priorLineRows && priorLineRows[0] && priorLineRows[0].status) || ""
+    ).toLowerCase();
     // The timestamp is only written the first time a line enters a state, so
     // re-tapping "ready" cannot quietly reset the clock and shorten the
     // recorded duration.
@@ -2031,6 +2042,22 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
           fireAndForget(ctx, raiseReadyNowPing(env, updated));
         }
       }
+    }
+
+    // The per-person trail. The boards advance tickets through THIS route,
+    // and until now it wrote nothing down — the order-level PUT audits
+    // itself, but every chef bump to preparing and every barista "ready"
+    // fired here and vanished, leaving the team's performance log unable to
+    // answer "who moved what, when". action 'status' (not 'update') keeps
+    // the stage transitions one filter away from the generic edits.
+    if (lineBefore && lineBefore !== status) {
+      fireAndForget(ctx, writeAudit(env, auth, {
+        action: "status",
+        entity: "orders",
+        entityId: orderId,
+        before: { lineStatus: lineBefore, orderStatus: statusBefore },
+        after: { itemId, lineStatus: status, orderStatus: rolled || null },
+      }));
     }
 
     return json({ ok: true, status, orderStatus: rolled });
@@ -2364,16 +2391,30 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
       if (tipResult.warning) followSettlementWarnings.push(tipResult.warning);
     }
 
+    // One row per PUT, and the action says what the PUT DID: a stage
+    // transition is a 'status' row — the same vocabulary the per-line route
+    // writes — so the team performance log reads one filter. Any other edit
+    // stays an 'update'.
+    //
+    // The station-scoped path derives the order's status from its lines and
+    // skips the verbatim write, which used to leave the diff empty — and
+    // writeAudit records nothing for an empty diff — so a barista's or
+    // chef's whole-ticket handoff vanished from the trail entirely. The
+    // outcome (and, when one was in play, the station) is merged here.
+    const afterFields = Object.fromEntries(
+      fields
+        .map((f, i) => [f.split(" ")[0], values[i]])
+        .filter(([c]) => c !== "updated_at")
+    );
+    if (effectiveStatus && afterFields.status === void 0) afterFields.status = effectiveStatus;
+    if (stationScope && afterFields.station === void 0) afterFields.station = stationScope;
+
     fireAndForget(ctx, writeAudit(env, auth, {
-      action: "update",
+      action: effectiveStatus ? "status" : "update",
       entity: "orders",
       entityId: id,
       before,
-      after: Object.fromEntries(
-        fields
-          .map((f, i) => [f.split(" ")[0], values[i]])
-          .filter(([c]) => c !== "updated_at")
-      ),
+      after: afterFields,
     }));
 
     const warnings = [consumptionWarning, ...followSettlementWarnings].filter(Boolean);
