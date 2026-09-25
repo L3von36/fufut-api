@@ -51,6 +51,30 @@ const ORDER_TO_ITEM_STATUS = {
   completed: 'served',
 };
 
+/**
+ * Order-level stage stamps — the column that records when the ORDER reached
+ * a state, first time only.
+ *
+ * Deliberately NOT the line-level map: a line has no 'picked up' word (the
+ * dish that left the pass has reached its carrier, which is 'served'), but
+ * the order does. 'fulfilled' is the kitchen's handoff and stamps
+ * picked_up_at; the floor's later 'served' stamps served_at. Collapsing the
+ * two — stamping served_at on the handoff — is what erased the waiter's
+ * serve step and made every order read 'served' the moment it was picked up
+ * (owner's report, 2026-09).
+ */
+const ORDER_STAMP_COLUMN = {
+  preparing: 'preparing_at',
+  ready: 'ready_at',
+  fulfilled: 'picked_up_at',
+  served: 'served_at',
+  completed: 'served_at',
+};
+
+function orderStampFor(status) {
+  return ORDER_STAMP_COLUMN[String(status || '').toLowerCase()] || null;
+}
+
 function mapOrderRow(o) {
   const tn = o.table_id || o.table_number || o.tableNum || null;
   return Object.assign({}, o, { tableNum: tn, table_number: tn });
@@ -2070,7 +2094,9 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
       // second tap on "Mark Ready" cannot rewind the recorded duration.
       // KitchenView has always rendered "ready for N min" from a column that
       // did not exist; updated_at below is what makes that figure real.
-      const stamp = stampColumnFor(wantedStatus);
+      // Order-level map: a whole-ticket handoff stamps picked_up_at, keeping
+      // served_at for the floor's actual serve.
+      const stamp = orderStampFor(wantedStatus);
       if (stamp) {
         fields.push(`${stamp} = COALESCE(${stamp}, ?)`);
         values.push(nowIso);
@@ -2205,7 +2231,19 @@ async function handleOrders(pathname, method, url, request, env, ctx, auth) {
           );
           const derived = deriveOrderStatus((after || []).map((r) => r.status));
           effectiveStatus = derived || wantedStatus;
-          const dStamp = stampColumnFor(effectiveStatus);
+          // A pickup that finds EVERY line done means the whole ticket left
+          // the pass — the order reads 'fulfilled', not 'served'. The lines
+          // say 'served' because a line has no richer word, but deriving
+          // 'served' here collapsed the handoff and the serve into one step:
+          // the order showed 'served' the second the kitchen handed it off
+          // and the floor's Mark-served button never appeared (owner's
+          // report, 2026-09). The guard above it is untouched — a handoff
+          // while the other station still cooks keeps the derived (lower)
+          // state, and only the floor may write 'served' (law 3).
+          if (effectiveStatus === 'served' && wantedStatus === 'fulfilled') {
+            effectiveStatus = 'fulfilled';
+          }
+          const dStamp = orderStampFor(effectiveStatus);
           const dSql = dStamp
             ? `UPDATE orders SET status = ?, updated_at = ?, ${dStamp} = COALESCE(${dStamp}, ?) WHERE id = ?`
             : `UPDATE orders SET status = ?, updated_at = ? WHERE id = ?`;

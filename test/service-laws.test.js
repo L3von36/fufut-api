@@ -229,6 +229,53 @@ describe('Law 4 — each station owns its lines', () => {
       expect(u.params).not.toContain('LI-food');
     }
   });
+
+  // The owner's report, 2026-09: the second the kitchen tapped "Picked up by
+  // waiter" the order read 'served' and the floor's Mark-served button never
+  // appeared — the station-scoped pickup derived its status from lines whose
+  // only word beyond ready is 'served'. The handoff must leave the order at
+  // 'fulfilled', with picked_up_at stamped, so the floor still owns 'served'.
+  it('a pickup that completes the whole ticket leaves the order fulfilled', async () => {
+    // The line states as the re-derive SELECT sees them: the pickup's own
+    // line UPDATE has already moved every line past ready (a line's only
+    // word beyond ready is 'served').
+    const allServed = MIXED_LINES.map((l) => ({ ...l, status: 'served' }));
+    const { env, boundParams } = makeEnv({ orderRows: [ORDER], itemRows: allServed });
+    // A chef write is forced into the kitchen scope — the derivation reads
+    // every line, so this handoff completes the ticket.
+    const { pathname, method, url, request } = makeRequest('/api/orders/Olaw01', 'PUT', { status: 'fulfilled' });
+    const res = await handleOrders(pathname, method, url, request, env, CTX, { staff_id: 'S1', role: 'head-chef' });
+    expect(res.status).toBe(200);
+
+    const orderUpdate = boundParams.find((b) => /UPDATE orders SET status/.test(b.sql));
+    expect(orderUpdate).toBeTruthy();
+    expect(orderUpdate.params[0]).toBe('fulfilled');
+    // The handoff stamps picked_up_at — served_at stays with the floor.
+    expect(orderUpdate.sql).toMatch(/picked_up_at = COALESCE\(picked_up_at/);
+    expect(orderUpdate.sql).not.toMatch(/served_at/);
+  });
+
+  it('a whole-ticket handoff from the floor stamps picked_up_at too', async () => {
+    const { env, boundParams } = makeEnv({ orderRows: [ORDER], itemRows: MIXED_LINES });
+    // No station on the request — the verbatim write path.
+    const { pathname, method, url, request } = makeRequest('/api/orders/Olaw01', 'PUT', { status: 'fulfilled' });
+    const res = await handleOrders(pathname, method, url, request, env, CTX, { staff_id: 'S1', role: 'manager' });
+    expect(res.status).toBe(200);
+    const orderUpdate = boundParams.find((b) => /UPDATE orders SET/.test(b.sql));
+    expect(orderUpdate).toBeTruthy();
+    expect(orderUpdate.params[0]).toBe('fulfilled');
+    expect(orderUpdate.sql).toMatch(/picked_up_at = COALESCE\(picked_up_at/);
+  });
+
+  it('the floor serve still stamps served_at', async () => {
+    const { env, boundParams } = makeEnv({ orderRows: [ORDER], itemRows: MIXED_LINES });
+    const { pathname, method, url, request } = makeRequest('/api/orders/Olaw01', 'PUT', { status: 'served' });
+    const res = await handleOrders(pathname, method, url, request, env, CTX, { staff_id: 'S1', role: 'head-waiter' });
+    expect(res.status).toBe(200);
+    const orderUpdate = boundParams.find((b) => /UPDATE orders SET/.test(b.sql));
+    expect(orderUpdate).toBeTruthy();
+    expect(orderUpdate.sql).toMatch(/served_at = COALESCE\(served_at/);
+  });
 });
 
 describe('the kitchen channel earns its event name', () => {
