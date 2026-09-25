@@ -8,6 +8,57 @@ import { generateTableKey, tableOrderUrl } from '../lib/tablekey.js';
 const ACTIVE_LIST = ACTIVE_STATUSES.map((s) => `'${s}'`).join(', ');
 
 /**
+ * The guest's intended payment method at bill time — the same set the till
+ * accepts (payments.js METHODS). A transfer intent (telebirr / cbe / bank /
+ * mobile) tells the cashier a verification will be needed; cash says the
+ * guest is waiting with the money.
+ */
+const BILL_METHODS = new Set(['cash', 'telebirr', 'cbe', 'bank', 'card', 'mobile', 'other']);
+
+/**
+ * Stamp the bill-request method on the table and on its OPEN CHECKS.
+ *
+ * The order rows are the durable record: the table's own stamp is wiped the
+ * moment the party ends, but the Order Log reads the checks forever after.
+ * First-time COALESCE on the timestamp (a re-request never moves the moment
+ * the cashier first saw), last-write on the method (the guest may change
+ * their mind between the request and the cashier arriving).
+ *
+ * Best-effort by design: a pre-migration-028 schema (no columns) or a
+ * missing table number degrades to "no method", never blocks the request.
+ * Returns { checksStamped } for the reply.
+ */
+async function stampBillMethod(env, tableKey, method, atIso) {
+  let checksStamped = 0;
+  if (!tableKey) return { checksStamped };
+  const wanted = normaliseTableId(tableKey) || String(tableKey);
+  try {
+    const { results: open } = await d1Query(
+      env,
+      "SELECT id, table_id FROM orders WHERE table_id IS NOT NULL " +
+        "AND COALESCE(voided_at, '') = '' " +
+        "AND status IN ('new','confirmed','preparing','ready','served','fulfilled')"
+    );
+    const ids = (open || [])
+      .filter((o) => (normaliseTableId(o.table_id) || String(o.table_id || '')) === wanted)
+      .map((o) => o.id);
+    for (let i = 0; i < ids.length; i += 20) {
+      const chunk = ids.slice(i, i + 20);
+      const ph = chunk.map(() => '?').join(', ');
+      const { meta } = await d1Run(
+        env,
+        "UPDATE orders SET " +
+          (atIso ? "bill_requested_at = COALESCE(bill_requested_at, ?), " : "") +
+          "bill_method = ? WHERE id IN (" + ph + ")",
+        atIso ? [atIso, method || null, ...chunk] : [method || null, ...chunk]
+      );
+      checksStamped += (meta && meta.changes) || 0;
+    }
+  } catch { /* pre-migration schema: the method lives on the table only */ }
+  return { checksStamped };
+}
+
+/**
  * Statuses that mean "a party is at this table". Reserving is not seating, and
  * cleaning is not seating, so only these are gated.
  */
@@ -726,6 +777,20 @@ async function handleTables(pathname, method, url, request, env, auth) {
     if (String(table.status || '').toLowerCase() !== 'occupied') {
       return json({ ok: false, error: `Table ${table.number} has no party to bill.` }, 409);
     }
+    // The guest's intended payment method — the answer to "how does the
+    // cashier know it is cash and not a telebirr transfer before walking
+    // over?" (owner's friend, 2026-09-25). Optional and validated against
+    // the same method set the till accepts, so the stamped value is always
+    // one the settle sheet can pre-select.
+    let method = '';
+    try {
+      const body = await readBody(request.clone());
+      method = String(body?.method || '').trim().toLowerCase();
+    } catch { /* body optional — the request stands without a method */ }
+    if (method && !BILL_METHODS.has(method)) {
+      return json({ ok: false, error: `Unknown payment method "${method}"` }, 400);
+    }
+    const tableKey = normaliseTableId(table.number) || String(table.number || '');
     // The till gate: a bill nobody can take payment for is a promise the
     // floor cannot keep — after Z-count the request would sit on the
     // dashboard until tomorrow. Refuse with the reason instead. The manager
@@ -751,25 +816,38 @@ async function handleTables(pathname, method, url, request, env, auth) {
       existingStamp = String((cur || [])[0]?.bill_requested_at || '').trim();
     } catch { existingStamp = ''; }
     if (existingStamp) {
-      return json({ ok: true, alreadyRequested: true, requestedAt: existingStamp });
+      // The request already stands; a method supplied on a second tap still
+      // lands — the first tap may have skipped it, and the cashier reads the
+      // method off the check, not off this reply.
+      const late = await stampBillMethod(env, tableKey, method);
+      return json({ ok: true, alreadyRequested: true, requestedAt: existingStamp, ...late });
     }
     const stampIso = new Date().toISOString();
     try {
       await d1Run(
         env,
-        "UPDATE tables SET bill_requested_at = ?, bill_requested_by = ? WHERE id = ?",
-        [stampIso, actorName(auth), tableId]
+        "UPDATE tables SET bill_requested_at = ?, bill_requested_by = ?, bill_method = ? WHERE id = ?",
+        [stampIso, actorName(auth), method || '', tableId]
       );
     } catch {
       return json({ ok: false, error: 'Bill requests are not live yet — apply migration 026 (POST /api/migrate/alerts-026)' }, 503);
     }
+    // The stamp rides the table's OPEN CHECKS too — the table row's own
+    // stamp is wiped the moment the party ends, which left the Order Log's
+    // "Bill asked for" leg pending forever on every settled check (owner's
+    // report, 2026-09-25). The order row keeps the moment after the sitting
+    // is gone. bill_method rides along so the cashier knows whether the
+    // guest plans to hand over cash or send a transfer — and the settle
+    // sheet opens on that method. Best-effort: a pre-migration schema never
+    // blocks the request itself.
+    const stamped = await stampBillMethod(env, tableKey, method, stampIso);
     await writeAudit(env, auth, {
       action: 'update',
       entity: 'tables',
       entityId: tableId,
-      reason: `Bill requested for table ${table.number}`,
+      reason: `Bill requested for table ${table.number}${method ? ` — ${method}` : ''}`,
     });
-    return json({ ok: true, requestedAt: stampIso });
+    return json({ ok: true, requestedAt: stampIso, ...stamped });
   }
 
   /**
@@ -798,7 +876,7 @@ async function handleTables(pathname, method, url, request, env, auth) {
     try {
       await d1Run(
         env,
-        "UPDATE tables SET bill_requested_at = '', bill_requested_by = '' WHERE id = ?",
+        "UPDATE tables SET bill_requested_at = '', bill_requested_by = '', bill_method = '' WHERE id = ?",
         [tableId]
       );
     } catch {
@@ -845,9 +923,10 @@ async function handleTables(pathname, method, url, request, env, auth) {
       );
     }
     const tableId = parts[2];
-    const { results } = await d1Query(env, 'SELECT id, number, status FROM tables WHERE id = ?', [tableId]);
+    const { results } = await d1Query(env, 'SELECT id, number, status, seated_at FROM tables WHERE id = ?', [tableId]);
     const table = (results || [])[0];
     if (!table) return json({ ok: false, error: 'Table not found' }, 404);
+    const seatedAt = String(table.seated_at || '').trim();
     if (String(table.status || '').toLowerCase() !== 'occupied') {
       return json({ ok: true, alreadyFree: true });
     }
@@ -892,10 +971,48 @@ async function handleTables(pathname, method, url, request, env, auth) {
     try {
       await d1Run(
         env,
-        "UPDATE tables SET bill_requested_at = '', bill_requested_by = '' WHERE id = ? AND COALESCE(bill_requested_at, '') <> ''",
+        "UPDATE tables SET bill_requested_at = '', bill_requested_by = '', bill_method = '' WHERE id = ? AND COALESCE(bill_requested_at, '') <> ''",
         [tableId]
       );
     } catch { /* pre-migration schema: nothing to clear */ }
+    // The sitting is over: stamp cleared_at on the checks that lived it, so
+    // "Table cleared" resolves on every device's Order Log instead of only
+    // the one that tapped Free. The ids are picked in JS through the same
+    // normaliseTableId the money guard uses (a table is filed as "T-01",
+    // "Table 1" and "1" across screens), scoped to this party's checks —
+    // created no earlier than the seating, else the last 24h — so a stamp
+    // the table never earned never appears. Best-effort.
+    try {
+      const nowIso = new Date().toISOString();
+      const parseMs = (s) => {
+        const t = Date.parse(String(s || '').trim().replace(' ', 'T'));
+        return Number.isFinite(t) ? t : null;
+      };
+      const seatedMs = parseMs(seatedAt);
+      const cutoffMs = seatedMs ?? Date.now() - 24 * 3600 * 1000;
+      const { results: candidates } = await d1Query(
+        env,
+        "SELECT id, table_id, created FROM orders " +
+          "WHERE COALESCE(cleared_at, '') = '' AND COALESCE(voided_at, '') = '' " +
+          "AND table_id IS NOT NULL"
+      );
+      const ids = (candidates || [])
+        .filter((o) => (normaliseTableId(o.table_id) || String(o.table_id || '')) === tableKey)
+        .filter((o) => {
+          const createdMs = parseMs(o.created);
+          return createdMs == null || createdMs >= cutoffMs;
+        })
+        .map((o) => o.id);
+      for (let i = 0; i < ids.length; i += 20) {
+        const chunk = ids.slice(i, i + 20);
+        const ph = chunk.map(() => '?').join(', ');
+        await d1Run(
+          env,
+          "UPDATE orders SET cleared_at = COALESCE(cleared_at, ?) WHERE id IN (" + ph + ")",
+          [nowIso, ...chunk]
+        );
+      }
+    } catch { /* pre-migration schema: the leg stays journal-only */ }
     await writeAudit(env, auth, {
       action: 'update',
       entity: 'tables',
@@ -977,7 +1094,7 @@ async function handleTables(pathname, method, url, request, env, auth) {
       try {
         const { meta: cleared } = await d1Run(
           env,
-          "UPDATE tables SET bill_requested_at = '', bill_requested_by = '' WHERE id = ? AND COALESCE(bill_requested_at, '') <> ''",
+          "UPDATE tables SET bill_requested_at = '', bill_requested_by = '', bill_method = '' WHERE id = ? AND (COALESCE(bill_requested_at, '') <> '' OR COALESCE(bill_method, '') <> '')",
           [tableId]
         );
         if (cleared && cleared.changes) {
@@ -989,6 +1106,36 @@ async function handleTables(pathname, method, url, request, env, auth) {
           });
         }
       } catch { /* pre-migration schema: nothing to clear */ }
+      // The party ends through this write too (checkout free, sweep to
+      // cleaning): the same cleared_at stamp the /free endpoint applies, so
+      // every path out of a sitting records the moment on the checks. The
+      // checkout flow resets the row wholesale through the generic handler,
+      // which is why the stamp rides here and not only on /free. Best-effort.
+      try {
+        const tableNumber = current?.number ?? null;
+        if (tableNumber != null) {
+          const wantKey = normaliseTableId(tableNumber) || String(tableNumber);
+          const { results: candidates } = await d1Query(
+            env,
+            "SELECT id, table_id, created FROM orders " +
+              "WHERE COALESCE(cleared_at, '') = '' AND COALESCE(voided_at, '') = '' " +
+              "AND table_id IS NOT NULL"
+          );
+          const nowIso = new Date().toISOString();
+          const ids = (candidates || [])
+            .filter((o) => (normaliseTableId(o.table_id) || String(o.table_id || '')) === wantKey)
+            .map((o) => o.id);
+          for (let i = 0; i < ids.length; i += 20) {
+            const chunk = ids.slice(i, i + 20);
+            const ph = chunk.map(() => '?').join(', ');
+            await d1Run(
+              env,
+              "UPDATE orders SET cleared_at = COALESCE(cleared_at, ?) WHERE id IN (" + ph + ")",
+              [nowIso, ...chunk]
+            );
+          }
+        }
+      } catch { /* pre-migration schema: the leg stays journal-only */ }
     }
 
     if (!SEATING_STATUSES.includes(nextStatus)) return null; // not a seating change

@@ -81,6 +81,41 @@ async function handleMigration(request, env) {
     return json({ ok: true, applied, skipped });
   }
 
+  // One-shot: apply migration 028 — the bill-timing legs on the ORDER row
+  // (bill_requested_at / bill_method / cleared_at), the table's bill_method,
+  // and the payments.channels settings seed. The table-only bill stamp was
+  // wiped the moment the party ended, leaving the Order Log's "Bill asked
+  // for" leg pending forever on settled checks; the stamp now also lands on
+  // the table's open checks so it survives the sitting. Idempotent like its
+  // siblings: repeats report "duplicate column name" as skipped.
+  // Manager-only via the /api/migrate/ prefix rule in auth.js.
+  if (path === "/api/migrate/order-legs-028" && m === "POST") {
+    const statements = [
+      "ALTER TABLE orders ADD COLUMN bill_requested_at TEXT",
+      "ALTER TABLE orders ADD COLUMN bill_method TEXT",
+      "ALTER TABLE orders ADD COLUMN cleared_at TEXT",
+      "ALTER TABLE tables ADD COLUMN bill_method TEXT DEFAULT ''",
+      `INSERT OR IGNORE INTO settings (key, value, category, label, description, updated_at) VALUES
+         ('payments.channels',
+          '[{"method":"telebirr","label":"Telebirr","account":"","holder":""},{"method":"cbe","label":"CBE Birr","account":"","holder":""},{"method":"bank","label":"Bank transfer","account":"","holder":""},{"method":"card","label":"Card","account":"","holder":""}]',
+          'operations',
+          'Receiving accounts for digital payments',
+          'Shown to the floor when a guest asks where to send the money.',
+          datetime('now'))`,
+    ];
+    const applied = [];
+    const skipped = [];
+    for (const sql of statements) {
+      try {
+        await d1Run(env, sql);
+        applied.push(sql);
+      } catch (e) {
+        skipped.push({ sql, reason: String(e.message || e) });
+      }
+    }
+    return json({ ok: true, applied, skipped });
+  }
+
   // One-time repair: give every stored menu item a stable id.
   //
   // The KV blob was saved without per-item ids, so /api/menu served all 45 items

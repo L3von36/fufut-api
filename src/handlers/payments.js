@@ -133,7 +133,7 @@ export async function refreshPaymentStatus(env, orderId) {
           if (match) {
             await d1Run(
               env,
-              "UPDATE tables SET bill_requested_at = '', bill_requested_by = '' WHERE id = ? AND COALESCE(bill_requested_at, '') <> ''",
+              "UPDATE tables SET bill_requested_at = '', bill_requested_by = '', bill_method = '' WHERE id = ? AND COALESCE(bill_requested_at, '') <> ''",
               [match.id]
             );
           }
